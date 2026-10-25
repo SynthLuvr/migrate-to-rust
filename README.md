@@ -23,4 +23,8 @@ Successful AI-driven ports (Volatility3: 29k LOC in 68 h for ~$3k of tokens at 6
 - **Formal equivalence checking** — not practical for dynamic languages today; differential testing is the state of practice.
 - **"Cloudflare migrated PyPy to Rust"** — unverifiable retelling; the real stories are tsrs (TypeScript→Rust by agents), Pingora/FL2 (nginx→Rust), and Pyodide-in-workerd (interop, not translation).
 
+## License
+
+[MIT](LICENSE) — free to use, adapt, and redistribute, provided the license notice is retained. The research digests and the framework artifacts (recipe, prompts, stage checklists, schema) are all covered.
+
 *Compiled 2026-10-25. Research method: 5 parallel research agents, ~120 live web searches, full-text extraction of ~45 primary sources, plus GitHub/crates.io/PyPI API verification of tool maintenance status.*
