@@ -1,0 +1,50 @@
+{
+  "$comment": "Machine-readable crate substitution table for the translator/reviewer roles. Verified active 2026-10-25 (research/3, research/5). RE-VERIFY before each migration - crate maintenance moves. 'alternatives' are ranked preferences.",
+  "version": "2026-10-25",
+  "substitutions": [
+    { "python": "requests", "rust": ["reqwest"] },
+    { "python": "numpy", "rust": ["ndarray", "nalgebra"], "warning": "numpy's full breadth has no Rust equivalent; port only the used subset" },
+    { "python": "pandas", "rust": ["polars"] },
+    { "python": "pydantic", "rust": ["serde", "garde", "validator"] },
+    { "python": "sqlalchemy", "rust": ["sqlx", "sea-orm"], "warning": "no Alembic-parity migration story; schema-change workflows need a human plan" },
+    { "python": "flask", "rust": ["axum"] },
+    { "python": "fastapi", "rust": ["axum"] },
+    { "python": "pytest", "rust": ["cargo-test", "rstest"] },
+    { "python": "hypothesis", "rust": ["proptest"] },
+    { "python": "logging", "rust": ["tracing"] },
+    { "python": "dataclasses", "rust": ["serde structs"] },
+    { "python": "celery", "rust": ["apalis"], "warning": "NO maintained Celery-wire-compatible crate exists - broker/protocol lock-in; surface for human decision" },
+    { "python": "asyncio", "rust": ["tokio", "pyo3-async-runtimes"], "warning": "bridge crate is pyo3-async-runtimes; the abandoned pyo3-asyncio must not be used" }
+  ],
+  "no_equivalent_zones": [
+    "SQLAlchemy/Alembic parity",
+    "numpy full breadth",
+    "scikit-learn",
+    "matplotlib",
+    "Celery-wire-compatible distributed task queues"
+  ],
+  "pyo3_api_generations": {
+    "0.21": "Bound API introduced",
+    "0.23": "gil-refs feature removed",
+    "0.28+": "attach/detach rename; thread-safe by default",
+    "rule": "pin one generation per crate; never mix"
+  },
+  "packaging": {
+    "builder": "maturin",
+    "abi3_note": "free-threaded CPython 3.14 needs cp314t wheels; abi3t arrives with 3.15",
+    "dev_loop": "rustimport"
+  },
+  "knowledge_pack_tier1_embeds": [
+    "PyO3 user guide: error handling, detach/parallelism, free-threading, migration guide",
+    "maturin bindings page: abi3/version wheel decision tree",
+    "corrode.dev Migrating from Python to Rust",
+    "BurntSushi: Error Handling in Rust",
+    "PEP 703 / PEP 779",
+    "polars: Coming from Pandas"
+  ],
+  "knowledge_pack_tier2_on_demand": [
+    "TLBORM (metaclass/reflection -> macros)",
+    "rust-unofficial patterns (builders, registries)",
+    "exemplar codebases: pydantic-core, orjson, ruff, polars"
+  ]
+}

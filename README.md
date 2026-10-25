@@ -1,0 +1,26 @@
+# migrate-to-rust
+
+A research-grounded design for a framework that helps **AI agents migrate Python projects to Rust** — built from verified case studies of real AI-driven and human-driven Rust migrations (2024–2026), the academic literature on LLM code translation, and a live-verified survey of ~80 existing tools.
+
+## Documents
+
+| Document | What it gives you |
+|---|---|
+| **[SUMMARY.md](SUMMARY.md)** | The research synthesis: verified case studies with numbers, the 10 evidence-backed requirements, the framework architecture, honest caveats |
+| **[TOOLCHAIN.md](TOOLCHAIN.md)** | The tool list, organized by pipeline stage — what to adopt off-the-shelf vs what the framework must build |
+| **[research/](research/)** | 6 source files (~1,100 lines): case studies, manual-migration lessons, tool catalog with maintenance verification, academic literature, idiom/ecosystem mapping — every quantitative claim carries its source URL; unverifiable claims are flagged |
+| **[framework/](framework/)** | The executable packaging of the research: agent prompt, goose orchestrator recipe, 8 stage checklists, translator/reviewer roles, 8 gap-tool specs, crate-substitution knowledge, and the migration state schema |
+
+## The one-paragraph thesis
+
+Successful AI-driven ports (Volatility3: 29k LOC in 68 h for ~$3k of tokens at 68.9% exact parity; Microsoft's Copilot runtime: 430k→800k LOC for ~$120k; Cloudflare's tsrs: written by 20+ Claude subagents with zero human code) all share one shape: **a stable API, a strong test suite used as the specification, and a harness that loops the model through compile→test→fix against an equivalence oracle until parity or an explained divergence.** The framework *is* the harness: select hot paths by profiling evidence, decompose with static analysis into a dependency-ordered backlog, judge-first, gate on the full test suite, preserve license attribution mechanically, ship as a drop-in PyO3 wheel, and keep an upstream-tracking maintenance mode afterward. Everything else in the pipeline exists as maintained tooling today (PyO3, maturin, py-spy, Scalene, tree-sitter, LibCST, Hypothesis, miri, clippy, Criterion, OpenHands/Aider/goose); the eight components no tool provides are listed at the end of [TOOLCHAIN.md](TOOLCHAIN.md) — that's the build surface.
+
+## What the evidence flatly rules out
+
+- **Whole-program, one-shot translation** — fails to compile at repo scale (AlphaTrans), succeeds only 21–47% single-shot on real code (Pan et al.).
+- **Trusting benchmarks without parity checks** — the ScanCode Rust port claimed 10–100× and was *wrong*; the original Python matched it once given similar optimization effort.
+- **Deterministic transpilation as a strategy** — every prior Python→Rust transpiler is dead or archived; the field converged on LLM + harness.
+- **Formal equivalence checking** — not practical for dynamic languages today; differential testing is the state of practice.
+- **"Cloudflare migrated PyPy to Rust"** — unverifiable retelling; the real stories are tsrs (TypeScript→Rust by agents), Pingora/FL2 (nginx→Rust), and Pyodide-in-workerd (interop, not translation).
+
+*Compiled 2026-10-25. Research method: 5 parallel research agents, ~120 live web searches, full-text extraction of ~45 primary sources, plus GitHub/crates.io/PyPI API verification of tool maintenance status.*

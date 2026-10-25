@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MigrationState",
+  "$comment": "Dual-build state manager: the resumable, per-unit-reversible record. The agent updates it after every unit; tools/state.py validates it.",
+  "type": "object",
+  "required": ["project", "stage", "units"],
+  "properties": {
+    "project": {
+      "type": "object",
+      "required": ["name", "python_path"],
+      "properties": {
+        "name": { "type": "string" },
+        "python_path": { "type": "string" },
+        "workload": { "type": "string", "$comment": "representative workload used for profiling" }
+      }
+    },
+    "stage": { "type": "integer", "minimum": 0, "maximum": 7 },
+    "go_no_go": {
+      "type": "object",
+      "properties": {
+        "decision": { "enum": ["pending", "go", "no-go"] },
+        "scope": { "type": "array", "items": { "type": "string" } },
+        "projection": {
+          "type": "object",
+          "properties": {
+            "scoped_loc": { "type": "integer" },
+            "token_cost_usd": { "type": "number" },
+            "end_to_end_saving_pct": { "type": "number", "$comment": "bar: >= 50" }
+          }
+        },
+        "no_equivalent_deps": { "type": "array", "items": { "type": "string" } },
+        "approved_by": { "type": "string" }
+      }
+    },
+    "judge_validation": {
+      "type": "object",
+      "$comment": "Stage 2 hard gate: judge-first results before any translation",
+      "properties": {
+        "injected_bugs": { "type": "integer" },
+        "caught": { "type": "integer" },
+        "mutation_sample_killed": { "type": "integer" },
+        "normalization_rules": { "type": "string" },
+        "date": { "type": "string" }
+      }
+    },
+    "units": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "python_path", "deps", "order", "status"],
+        "properties": {
+          "id": { "type": "string" },
+          "python_path": { "type": "string" },
+          "rust_path": { "type": ["string", "null"] },
+          "deps": { "type": "array", "items": { "type": "string" }, "$comment": "unit ids, leaf-first" },
+          "order": { "type": "integer" },
+          "contract": {
+            "type": "object",
+            "properties": {
+              "covering_tests": { "type": "array", "items": { "type": "string" } },
+              "type_signature": { "type": "string" },
+              "invariants": { "type": "array", "items": { "type": "string" } },
+              "golden_corpus": { "type": "string" }
+            }
+          },
+          "risk_flags": { "type": "array", "items": { "type": "string" } },
+          "status": {
+            "enum": ["pending", "ported", "divergent_explained", "escalated", "fallback_python", "retired"],
+            "$comment": "ported/escalated etc. always keep python fallback until 'retired' in Stage 7"
+          },
+          "parity": {
+            "type": "object",
+            "properties": {
+              "runs": { "type": "integer" },
+              "equivalent": { "type": "integer" },
+              "divergent": { "type": "integer" },
+              "incomparable": { "type": "integer" },
+              "last_verdict": { "enum": ["equivalent", "divergent", "incomparable", "unjudged"] },
+              "divergence_note": { "type": "string", "$comment": "required when last_verdict=divergent" }
+            }
+          },
+          "attempts": { "type": "integer", "minimum": 0 },
+          "budget": {
+            "type": "object",
+            "properties": {
+              "max_rounds": { "type": "integer", "default": 5 },
+              "tokens_spent": { "type": "integer" },
+              "exhausted": { "type": "boolean" }
+            }
+          },
+          "attribution": {
+            "type": "object",
+            "properties": {
+              "header_preserved": { "type": "boolean" },
+              "notice_ok": { "type": "boolean" }
+            }
+          },
+          "review_verdict": { "enum": ["pending", "approve", "fix", "escalate"] }
+        }
+      }
+    },
+    "human_gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["gate", "state"],
+        "properties": {
+          "gate": { "enum": ["go_no_go", "redesign_approval", "unit_escalation", "cutover", "crate_substitution"] },
+          "state": { "enum": ["open", "approved", "rejected"] },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "budget_ledger": {
+      "type": "object",
+      "$comment": "running totals vs the Stage 0 projection; deviations reported to human",
+      "properties": {
+        "tokens_total": { "type": "integer" },
+        "hours_human_total": { "type": "number" },
+        "regression_triage_hours": { "type": "number", "$comment": "Stage 7, budgeted >= migration effort" }
+      }
+    }
+  }
+}
