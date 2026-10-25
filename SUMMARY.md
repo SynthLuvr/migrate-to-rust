@@ -1,6 +1,6 @@
 # Python → Rust AI Migration Framework — Research Summary
 
-*Compiled 2026-10-25 from live web research (5 parallel research agents + primary-source verification). All quantitative claims cite sources; claims that could not be verified are marked ⚠️UNVERIFIED. Full detail in [`research/`](research/).*
+*All quantitative claims cite sources; claims that could not be verified are marked ⚠️UNVERIFIED. Full detail in [`research/`](research/).*
 
 ---
 
@@ -16,7 +16,7 @@
 | **ScanCode Toolkit (⚠️ cautionary)** | Mature Python scanner ported by an LLM agent harness (OpenCode + plugin) | Agent-driven, months | Claimed 10–100×; re-testing showed **wrong results + skipped files**; optimization of the original Python made it "as fast or faster" with correct output | [AboutCode post](https://aboutcode.org/blog/agentic-scancode-port-case-study) |
 | **Cloudflare Python Workers** | *Not* a code port: CPython (Pyodide/WASM) embedded **inside** the Rust `workerd` runtime with Rust-side syscall shims | — | "Language parity" without translation; ⚠️ the popular "PyPy → Rust" retelling is **unverifiable** (zero "PyPy" mentions in the primary post) | [CF blog](https://blog.cloudflare.com/python-workers) |
 
-### 1.2 Agentic Rust ports from other languages (the playbook the user cited)
+### 1.2 Agentic Rust ports from other languages
 
 - **Cloudflare `tsrs`** (TypeScript compiler → Rust, Oct 2026): started at Owner.com — **37k-file TS backend**, TS 7.0 Go compiler took **80 s / 19 GiB**; Max Schwenk used **Claude Opus 5.5 with 20+ parallel subagents and wrote zero code himself**; a working typechecker existed the next morning. Result: **up to 8× faster, 70% less memory** than TS 7.0. Validation = **upstream conformance tests + deliberate error injection + Miri** ("a faster compiler that finds fewer errors is a broken compiler with good marketing"). Maintenance = agents that **watch upstream, run compatibility tests, propose fixes** (the Vinext process). ([The New Stack](https://thenewstack.io/cloudflare-rust-typescript-tsrs), [CF blog](https://blog.cloudflare.com/typescript-rust-port))
 - **Microsoft Copilot runtime** (TS → Rust): **430k → 800k LOC** via agents across **135 releases / 14.5 weeks** (~1.3 PRs/day); cost "**~$120,000 in tokens + 3 dev-weeks**"; **15.9× throughput**, **1,383 MB → 126 MB**; paid for it with "**a few dozen regressions**". ([The Register](https://www.theregister.com/devops/2026/09/18/microsoft-agentically-ports-copilot-runtime-to-rust-for-120k/5297549))
@@ -112,7 +112,7 @@
 - **"Cloudflare migrated Python (PyPy) to Rust" is not verifiable.** The verified Cloudflare stories are: `tsrs` (TypeScript→Rust, agent-written), Pingora (nginx→Rust), FL2 (NGINX+Lua→Rust), and Python Workers = CPython-in-WASM *inside* their Rust runtime — an interop story, not a translation story.
 - The IBM `watsonx-code-migration-poc` GitHub repo now returns 404; its methodology survives only in product docs. Presidio's Apex→Rust repos don't exist as remembered; their verified products are HAI Build/Modernize with webinar-grade figures.
 - Benchmark claims in vendor posts are frequently flawed (see the ScanCode case: a port can be faster *and wrong*). Any framework output should ship with a reproduction-ready benchmark, not a number.
-- Several widely-repeated stories failed verification this session (InfinyOn "From Python to Rust", Dropbox "Open Sourcing Our Rust Libraries", Google's "32,000 migrations", Figma's 2022 update post). The research files flag each one.
+- Several widely-repeated stories failed verification against primary sources (InfinyOn "From Python to Rust", Dropbox "Open Sourcing Our Rust Libraries", Google's "32,000 migrations", Figma's 2022 update post). The research files flag each one.
 
 ## Research files
 

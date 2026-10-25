@@ -1,7 +1,7 @@
 # Catalog — Code Migration / Transformation Tools & the Python↔Rust Interop Ecosystem
 
 **Purpose:** Inventory of existing tools an AI-agent framework could orchestrate to port Python code to Rust incrementally and verifiably.
-**Compiled:** 2026-10-25. **Method:** Web search (Tavily) + direct verification against the GitHub REST API (archived flag, last push, license, stars), crates.io (version + last update), PyPI JSON API (latest version + upload date), and Tavily page extraction for ambiguous cases. "Pushed" = last repo activity observed 2026-10-25. Anything that could not be confirmed is marked **UNVERIFIED**.
+*Tool maintenance status verified 2026-10-25 against the GitHub/crates.io/PyPI APIs. "Pushed" = last repo activity observed 2026-10-25. Anything that could not be confirmed is marked **UNVERIFIED**.
 
 Legend for maturity: **active** = releases/pushes within ~12 months of 2026-10 · **slow** = maintained but release cadence > 12 months · **stale** = no activity ≥ 2 years · **dead/archived** = repo archived, removed, or abandoned.
 

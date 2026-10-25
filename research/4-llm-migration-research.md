@@ -1,6 +1,6 @@
 # LLM & Agentic Code Migration / Transpilation — What Generalizes to Python→Rust
 
-**Date:** 2026-10-25 · **Method:** Live web search (Tavily, ~35 queries) + full-text extraction of 14 authoritative sources (arXiv, Google Research, Anthropic, AWS, IBM, MDPI). Every quantitative claim below was verified against the cited page unless explicitly marked **UNVERIFIED**.
+*2026-10-25. Every quantitative claim below was verified against the cited page unless explicitly marked **UNVERIFIED**.*
 
 ---
 
@@ -18,7 +18,7 @@
 
 ### 1.3 TransCoder-ST (Meta, ICLR 2022) — automated unit tests in the loop
 - **Source:** Roziere et al., "Leveraging Automated Unit Tests for Unsupervised Code Translation," ICLR 2022 — https://mlanthology.org/iclr/2022/roziere2022iclr-leveraging
-- **Key claim:** Filters and self-trains on unit-test-validated pseudo-parallel data; abstract states this "significantly improves" TransCoder's computational accuracy (exact per-direction deltas **UNVERIFIED** — not extracted).
+- **Key claim:** Filters and self-trains on unit-test-validated pseudo-parallel data; abstract states this "significantly improves" TransCoder's computational accuracy (exact per-direction deltas **UNVERIFIED**).
 - **Implication:** Unit-test validation is not just an acceptance gate — it is signal for improving the translation process itself (fine-tuning / few-shot exemplar mining).
 
 ### 1.4 MultiPL-E (Stevens/Northeastern/Microsoft Research, 2022)
@@ -165,7 +165,7 @@
 
 ### 4.6 Academic-adjacent industry: "alchemize" LLM transpiler (PyMC→Rust, 2026)
 - **Source:** blog summary surfaced in search ("The LLM Transpiler: 3–7× Faster PyMC Models with Rust") — a "write–compile–validate loop" delivering 3–7× speedups on compute-heavy Python.
-  (**UNVERIFIED details** — blog post not extracted; treat as anecdotal evidence that compile-validate loops ship in production transpiler tools.)
+  (**UNVERIFIED details**; treat as anecdotal evidence that compile-validate loops ship in production transpiler tools.)
 
 ---
 

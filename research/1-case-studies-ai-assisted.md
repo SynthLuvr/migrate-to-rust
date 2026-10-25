@@ -1,6 +1,6 @@
 # Case Studies: AI-Assisted Python → Rust Migrations
 
-**Research agent:** subagent 20261025_13 · **Compiled:** 2026-10-25 · **Method:** Live web search (Tavily) + full-text extraction of 10+ primary sources (vendor engineering blogs, GitHub repos/orgs, a DFRWS camera-ready paper PDF, arXiv HTML, PyPI). Every number below carries its source URL. Claims from the original research brief that could **not** be verified are explicitly marked **UNVERIFIED** — no numbers were invented.
+*2026-10-25. Every number below carries its source URL. Claims that could not be verified are explicitly marked **UNVERIFIED**.*
 
 ---
 
@@ -9,7 +9,7 @@
 ### What
 In April 2024, Cloudflare launched Python Workers in open beta. This was **not** a Python→Rust code translation: Cloudflare embedded **CPython (via Pyodide, compiled to WebAssembly)** directly into `workerd`, their open-source, Rust-based Workers runtime — "we have directly integrated a Python implementation into workerd, the open-source Workers runtime. All bindings, including bindings to Vectorize, Workers AI, R2, Durable Objects, and more are supported on day one." ([blog.cloudflare.com/python-workers](https://blog.cloudflare.com/python-workers))
 
-> **Brief's premise "PyPy-based implementation migrated to Rust": UNVERIFIED.** A full-text fetch of the April 2024 post (72,927 characters) contains **zero** occurrences of "PyPy", and site-restricted searches of `blog.cloudflare.com` surfaced no "PyPy → Rust" migration post. The verifiable story is: Pyodide/CPython chosen over other WASM Python options and integrated into a Rust runtime with custom Rust-side shims (e.g., the socket bridge below).
+> **"PyPy-based implementation migrated to Rust": UNVERIFIED.** The April 2024 post contains **zero** occurrences of "PyPy", and site-restricted searches of `blog.cloudflare.com` surfaced no "PyPy → Rust" migration post. The verifiable story is: Pyodide/CPython chosen over other WASM Python options and integrated into a Rust runtime with custom Rust-side shims (e.g., the socket bridge below).
 
 ### Why
 - **Deployment/footprint economics, not raw speed:** "Pyodide struck us as the perfect fit for Workers… the core interpreter and each native Python module [built] as separate WebAssembly modules, dynamically linked at runtime. This allows the code footprint… to be shared among all Workers running on the same machine… where we often run thousands of Workers per machine." (same URL)
@@ -122,7 +122,7 @@ They note the earlier Rust→Wasm attempt "fizzled out" because the **WebAssembl
 
 - **What/How:** orjson ships a pure-Rust extension built with **maturin** ("requires at least Rust 1.95, a C compiler, and the maturin build tool") exposing a drop-in-JSON API for Python. ([github.com/ijl/orjson](https://github.com/ijl/orjson))
 - **Results (quantified, README benchmark tables, Python 3.11.10):** serialization of `citm_catalog.json`: orjson **0.3 ms** vs stdlib json **3 ms** (**11.8×**); `canada.json` serialization **2.5 ms vs 29.8 ms** (**11.9×**); deserialization 3.1×–6× faster. (same URL)
-- **The widely-repeated claim that orjson 1.x was Cython and was rewritten in Rust for 2.0 (2019): UNVERIFIED from a primary source** in this session (changelog extraction failed; PyPI 2.0.x pages do show Rust release files — [pypi.org/project/orjson/2.0.1](https://pypi.org/project/orjson/2.0.1); secondary echo on [Reddit](https://www.reddit.com/r/Python/comments/1ii64gp/how_rust_is_quietly_taking_over_the_python)). Treat as plausible-but-uncited.
+- **The widely-repeated claim that orjson 1.x was Cython and was rewritten in Rust for 2.0 (2019): UNVERIFIED from a primary source** (PyPI 2.0.x pages do show Rust release files — [pypi.org/project/orjson/2.0.1](https://pypi.org/project/orjson/2.0.1); secondary echo on [Reddit](https://www.reddit.com/r/Python/comments/1ii64gp/how_rust_is_quietly_taking_over_the_python)). Treat as plausible-but-uncited.
 - **Lessons:** serializers/parsers are ideal Rust targets — tight hot loop, easy golden-file equivalence testing, no GIL contention.
 
 ### Checked, not applicable

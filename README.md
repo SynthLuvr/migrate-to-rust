@@ -27,4 +27,3 @@ Successful AI-driven ports (Volatility3: 29k LOC in 68 h for ~$3k of tokens at 6
 
 [MIT](LICENSE) — free to use, adapt, and redistribute, provided the license notice is retained. The research digests and the framework artifacts (recipe, prompts, stage checklists, schema) are all covered.
 
-*Compiled 2026-10-25. Research method: 5 parallel research agents, ~120 live web searches, full-text extraction of ~45 primary sources, plus GitHub/crates.io/PyPI API verification of tool maintenance status.*

@@ -1,9 +1,9 @@
 # Practical Rust Idioms & Python→Rust Ecosystem Mapping
 
-**Date:** 2026-10-25 · **Method:** Live web search + page extraction (Tavily) against crates.io / lib.rs / docs.rs / pyo3.rs / maturin.rs / peps.python.org / GitHub / CPython docs.
-**Verification legend:** ✅ **V** = fetched/verified live this run · ◐ **C** = canonical/stable authoritative URL, well-known but not re-fetched this run · ⚠️ **U** = UNVERIFIED (do not trust without checking).
+*2026-10-25.*
+**Verification legend:** ✅ **V** = verified live 2026-10-25 · ◐ **C** = canonical/stable authoritative URL, well-known but not re-fetched · ⚠️ **U** = UNVERIFIED (do not trust without checking).
 
-> **Era note (verified this run):** the `pyo3` crate was last updated 2026-10-14 with maturin docs referencing `pyo3 = "0.29.0"`; free-threading guidance in pyo3.rs "main" docs describes PyO3 ≥ 0.28 behavior. All version claims below were checked against live pages on 2026-10-25.
+> **Era note:** the `pyo3` crate was last updated 2026-10-14 with maturin docs referencing `pyo3 = "0.29.0"`; free-threading guidance in pyo3.rs "main" docs describes PyO3 ≥ 0.28 behavior. All version claims below were checked against live pages on 2026-10-25.
 
 ---
 
@@ -41,8 +41,8 @@
 | `numpy` | **`ndarray`** · **`nalgebra`** | ndarray 2026-01-10 ✅V · nalgebra 2026-05-24 ✅V | ndarray = N-dim arrays (+ optional BLAS); nalgebra = linear algebra/graphics. ⚠️ **Neither matches numpy's full breadth** (ufuncs ecosystem, broadcasting ergonomics, np.fft breadth); numeric/scientific port is a design decision, not a drop-in |
 | `pandas` | **`polars`** | crate 2026-08-06 ✅V; official "Coming from Pandas" guide ✅V [15]; pola.rs migration-strategies post (Aug 2026) ✅V [16] | Best-documented migration path of any pair (see [15]/[16]); Apache Arrow memory model, no indexes by design |
 | `pydantic` | **`serde`** (deserialize+validate types) + **`garde`** or **`validator`** (field validation) | garde 0.23.0, 2026-05-23, ~1.14M dl/month, 253 dependents ✅V [17]; validator updated 2026-07-27 ✅V [12] | serde replaces pydantic's *type coercion* (compiler does it); garde/validator cover *value rules* via derive macros. Rust needs no runtime type validation [18] ✅V |
-| `sqlalchemy` | **`sqlx`** · **`diesel`** · **`sea-orm`** | sqlx 2026-05-21 ✅V · sea-orm 2026-09-27 ✅V · diesel ◐C (not re-fetched) | sqlx = async, compile-time-checked SQL; diesel = type-safe ORM; sea-orm = dynamic async ORM. ⚠️ **No Rust ORM matches SQLAlchemy's maturity or has an Alembic-grade migrations story** — expect friction |
-| `flask` / `fastapi` | **`axum`** (tokio ecosystem) · **`actix-web`** | axum 2026-04-14 ✅V · actix-web ◐C | axum+serde+tower is the current default stack. ⚠️ No FastAPI-native equivalent of auto pydantic OpenAPI docs; `utoipa` exists (◐C, unverified this run) |
+| `sqlalchemy` | **`sqlx`** · **`diesel`** · **`sea-orm`** | sqlx 2026-05-21 ✅V · sea-orm 2026-09-27 ✅V · diesel ◐C | sqlx = async, compile-time-checked SQL; diesel = type-safe ORM; sea-orm = dynamic async ORM. ⚠️ **No Rust ORM matches SQLAlchemy's maturity or has an Alembic-grade migrations story** — expect friction |
+| `flask` / `fastapi` | **`axum`** (tokio ecosystem) · **`actix-web`** | axum 2026-04-14 ✅V · actix-web ◐C | axum+serde+tower is the current default stack. ⚠️ No FastAPI-native equivalent of auto pydantic OpenAPI docs; `utoipa` exists (◐C) |
 | `pytest` | **built-in `cargo test`** + **`rstest`** (parametrize/fixtures) | rstest 2026-10-18 ✅V | cargo test gives parallel test harness; rstest covers fixtures/parametrization |
 | `hypothesis` | **`proptest`** | 2026-10-10 ✅V | Property-based testing with shrinking |
 | `celery` | **`apalis`** (active) · **`rusty-sidekiq`** (Sidekiq protocol) | apalis 2026-10-12 ✅V; rusty-sidekiq 2026-09-28 ✅V | ⚠️ **HONESTY FLAG: no maintained, Celery-wire-protocol-compatible Rust library.** The `celery` crate (rusty-celery) has been **stale since 2023-09-25** ✅V [12] — mixing Rust workers into an existing Celery deployment is therefore NOT safe today; a "CeleRS" repo exists but is new/unproven ⚠️U [19]. Choose apalis/rusty-sidekiq only for green-field queues |
@@ -51,7 +51,7 @@
 | `json` | **`serde_json`** | ◐C (canonical; part of serde suite) | |
 | `asyncio` | **`tokio`** | 2026-10-21 ✅V | Ecosystem default; smol/async-std exist ◐C |
 | `boto3` | **AWS SDK for Rust** (`aws-sdk-s3`, …) | aws-sdk-s3 updated **2026-10-22** ✅V (near-daily releases) | Officially generated & maintained by AWS |
-| `unittest.mock` / reflection-heavy tests | **`mockall`** ◐C (not re-fetched) | — | Compile-time mock generation |
+| `unittest.mock` / reflection-heavy tests | **`mockall`** ◐C | — | Compile-time mock generation |
 | Monkey-patch/registry needs | **`inventory`** | 2026-10-07 ✅V | Compile-time-collected runtime registries |
 
 ### No-good-equivalent honesty list (⚠️ verified gaps)
@@ -59,7 +59,7 @@
 2. **numpy/pandas "interactive breadth"** — polars/ndarray are excellent for pipelines but nothing replicates the notebook-interactive numpy+pandas ecosystem ergonomics 1:1.
 3. **SQLAlchemy ORM + Alembic** — sea-orm/diesel are younger; migrations tooling is weaker.
 4. **Python stdlib breadth** (email parsing, `re` behaviors, text encodings, batteries-included modules) — Rust stdlib is minimal; each subsystem needs a crate, and edge behaviors (e.g., email/URL parsing quirks) may differ. Verify crate-by-crate during translation.
-5. **scikit-learn / matplotlib** — `linfa`/`plotters` ◐C exist but are far smaller ecosystems (unverified this run ⚠️U) — treat ML/plotting ports as high-risk.
+5. **scikit-learn / matplotlib** — `linfa`/`plotters` ◐C exist but are far smaller ecosystems (⚠️U) — treat ML/plotting ports as high-risk.
 
 ---
 
@@ -115,7 +115,7 @@ An AI framework generating PyO3 code must emit the **current API generation** (B
 1. **GIL release is mandatory for CPU-parallel Rust work.** Verified PyO3 guidance: wrap worker-thread code in `Python::detach` (ex-`allow_threads`) — otherwise rayon/threads **deadlock or gain nothing**: "you will not see any speedups … using `rayon` to parallelize code that acquires and holds the GIL" ✅V [21]. Spawning GIL-requiring workers while holding the GIL can deadlock the interpreter ✅V [21].
 2. **On free-threaded builds, detach is still correct** — long-running non-Python work should still detach so other threads can attach ✅V [26].
 3. **I/O-bound code: rewriting does NOT help.** Python's stdlib already releases the GIL around blocking I/O, so "the GIL has no consequence for performance of I/O-bound servers" (S.E. discussion ✅V [30]); practitioner post-rewrite retrospective: Rust rewrites pay off only when "CPU or memory bound (not I/O bound)" ✅V [31]. Reddit case discussion of AI-gateway migration notes the same ✅V [32].
-4. **Boundary crossing costs.** Every call crosses Python↔Rust with argument conversion (`FromPyObject`/`IntoPyObject`) and exception marshalling; the batch-the-loop rule: keep inner loops in Rust, cross the boundary once per batch, not per element. (Cost magnitudes **⚠️U** — no authoritative number found this run; design guidance follows from PyO3's conversion model ✅V [14][3].)
+4. **Boundary crossing costs.** Every call crosses Python↔Rust with argument conversion (`FromPyObject`/`IntoPyObject`) and exception marshalling; the batch-the-loop rule: keep inner loops in Rust, cross the boundary once per batch, not per element. (Cost magnitudes **⚠️U** — design guidance follows from PyO3's conversion model ✅V [14][3].)
 5. **`#[pyclass]` mutability is borrow-checked at runtime** (RefCell-like): concurrent/aliasing mutation raises Python exceptions instead of UB ✅V [26] — a silent performance trap if Python code holds references across calls.
 6. **Async bridging cost.** asyncio↔tokio translation via `pyo3-async-runtimes`/PyO3 async functions copies futures across event loops ✅V [13]; for I/O-heavy services this overhead plus re-plumbing rarely beats staying in Python (see #3). Exact overhead numbers **⚠️U**.
 7. **Profiling-first port selection.** Precedent successes are CPU-bound hot spots: **pydantic-core** ("Core validation logic for pydantic written in rust" ✅V [33]) and **orjson** (PyO3-based; 3.13.0, supports dataclasses/datetimes/numpy ✅V [34]) exist to accelerate hot paths while keeping Python APIs; **ruff** ("An extremely fast Python linter and code formatter, written in Rust" ✅V [35]) shows CLI/dev-tools gains of 10–100x (Charlie Marsh PyCon talk ✅V [36]). pola.rs's migration-strategies post (Aug 2026) is directly applicable to AI-driven translation: **make input/output fixtures the spec, scope the model to one segment at a time, give Polars-specific API guidance** ✅V [16] — i.e., profile → pick hot segment → golden tests → translate bounded scope.
@@ -170,7 +170,7 @@ An AI framework generating PyO3 code must emit the **current API generation** (B
 | 22 | PEP 703 — Making the Global Interpreter Lock Optional — https://peps.python.org/pep-0703/ | ✅V |
 | 23 | PEP 779 — Criteria for supported status for free-threaded Python — https://peps.python.org/pep-0779/ | ✅V |
 | 24 | Python 3.14 free-threaded mode improvements (CPython release-notes mirror) — https://gdevops.frama.io/python/versions/_sources/3.14.0/free-threaded-mode-improvements/free-threaded-mode-improvements.rst.txt | ✅V (mirror of CPython whatsnew; canonical: docs.python.org/3.14) |
-| 25 | CPython — free-threading HOWTO source — https://github.com/python/cpython/blob/main/Doc/howto/free-threading-python.rst (rendered: docs.python.org/3.13/howto/free_threading.html — extraction blocked) | ✅V source / ◐C rendering |
+| 25 | CPython — free-threading HOWTO source — https://github.com/python/cpython/blob/main/Doc/howto/free-threading-python.rst (rendered: docs.python.org/3.13/howto/free_threading.html) | ✅V source / ◐C rendering |
 | 26 | PyO3 v0.24 free-threading guide — https://pyo3.rs/v0.24.0/free-threading.html | ✅V |
 | 27 | PyO3 0.26.0 release notes — https://github.com/PyO3/pyo3/releases/tag/v0.26.0 | ✅V |
 | 28 | PyO3 0.27.0 release notes — https://github.com/PyO3/pyo3/releases/tag/v0.27.0 | ✅V |
@@ -182,7 +182,7 @@ An AI framework generating PyO3 code must emit the **current API generation** (B
 | 34 | ijl/orjson (Cargo.toml: PyO3-based, v3.13.0) — https://github.com/ijl/orjson | ✅V |
 | 35 | astral-sh/ruff — https://github.com/astral-sh/ruff · docs: https://docs.astral.sh/ruff/ | ✅V repo / ◐C docs |
 | 36 | Charlie Marsh — *Ruff: An Extremely Fast Python Linter…* (PyCon talk) — https://www.youtube.com/watch?v=r1EZ3GXuwBA | ✅V |
-| 37 | "Snek in Rust" (Carl Meyer, pypackers.org) — https://www.pypackers.org/p/snek-in-rust | ⚠️U (extraction blocked twice this run; treat as secondary) |
-| 38 | astral.sh/blog/ruff announcement | ⚠️U (extraction failed; use [35]/[36] instead) |
+| 37 | "Snek in Rust" (Carl Meyer, pypackers.org) — https://www.pypackers.org/p/snek-in-rust | ⚠️U (treat as secondary) |
+| 38 | astral.sh/blog/ruff announcement | ⚠️U (use [35]/[36] instead) |
 
 *Legend: ✅V = verified live 2026-10-25 · ◐C = canonical stable reference, not re-fetched · ⚠️U = unverified/flagged.*

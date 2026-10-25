@@ -1,9 +1,8 @@
-# Anchor findings — verified firsthand by the orchestrating agent (2026-10-25)
+# Anchor findings (verified 2026-10-25)
 
-These are claims I personally verified via live search/extract this session (Tavily). Higher confidence
-than model memory; each entry cites the source URL.
+Each entry cites its source URL; all facts below were verified against the cited sources on 2026-10-25.
 
-## 1. Cloudflare `tsrs` — agent-written Rust port of the TypeScript compiler (the case the user cited)
+## 1. Cloudflare `tsrs` — agent-written Rust port of the TypeScript compiler
 
 **Sources (verified):**
 - https://thenewstack.io/cloudflare-rust-typescript-tsrs (extracted full text, Oct 20 2026)
@@ -44,7 +43,7 @@ than model memory; each entry cites the source URL.
 
 **Sources (verified snippets):** https://blog.cloudflare.com/python-workers , https://blog.cloudflare.com/python-workers-ga , https://www.infoq.com/news/2026/09/cloudflare-python-workers-ga
 - Python Workers run CPython via Pyodide (WASM) inside workerd (the Rust+V8 runtime). GA Sept 2026, 2 years after beta; needed PEP 783 (PyEmscripten packaging standard) to make native-extension packages available.
-- The workerd runtime itself is C++/Rust; the earlier "PyPy" era and its Rust replacement is being verified by research delegate #1 (task 20261025_13).
+- The workerd runtime itself is C++/Rust. The widely-repeated "PyPy → Rust" retelling is unverifiable (see research/1, Case 1).
 
 ## Notes
-- The CB Insights piece on Christopher Chedeau (Vjeux) migrating a 100k-line TS app (Replay) to Rust with Claude 3 in ~1 month surfaced in search but was NOT extracted yet — treat as single-source until delegate #2 or a later check confirms.
+- The CB Insights piece on Christopher Chedeau (Vjeux) migrating a 100k-line TS app (Replay) to Rust with Claude 3 in ~1 month is single-source (primary text not checked) — treat with caution.
