@@ -1,5 +1,5 @@
 {
-  "$comment": "Machine-readable crate substitution table for the translator/reviewer roles. Synced 2026-10-27 from research/5 section (b) (source table maintenance-verified 2026-10-25 via crates.io/lib.rs API). RE-VERIFY before each migration - crate maintenance moves. 'rust' lists ranked preferences. 'verified' records per-crate maintenance evidence from research/5: an ISO date = crates.io/lib.rs last-release/verification check; 'canonical' = well-known stable crate, not re-fetched (re-verify at translation time).",
+  "$comment": "Machine-readable crate substitution table for the translator/reviewer roles, synced 2026-10-27 from research/5 section (b) (maintenance dates checked 2026-10-25 via crates.io/lib.rs). One entry per Python name so exact lookup works; 'rust' lists ranked preferences. 'verified' carries per-crate maintenance evidence: an ISO date = last crates.io/lib.rs release/verification check, 'canonical' = well-known stable crate, not re-fetched, 'builtin' = ships with cargo (not a crate); non-crate mappings such as 'serde structs' have no entry. RE-VERIFY before each migration - crate maintenance moves.",
   "version": "2026-10-27",
   "substitutions": [
     { "python": "requests", "rust": ["reqwest"], "verified": { "reqwest": "2026-09-08" } },
@@ -8,8 +8,8 @@
     { "python": "pandas", "rust": ["polars"], "verified": { "polars": "2026-08-06" } },
     { "python": "pydantic", "rust": ["serde", "garde", "validator"], "verified": { "serde": "canonical", "garde": "2026-05-23", "validator": "2026-07-27" }, "warning": "serde replaces pydantic's type coercion (the compiler does it); garde/validator cover value rules via derive macros - Rust needs no runtime type validation" },
     { "python": "sqlalchemy", "rust": ["sqlx", "diesel", "sea-orm"], "verified": { "sqlx": "2026-05-21", "diesel": "canonical", "sea-orm": "2026-09-27" }, "warning": "no Rust ORM matches SQLAlchemy's maturity and there is no Alembic-parity migration story; schema-change workflows need a human plan" },
-    { "python": "flask", "rust": ["axum", "actix-web"], "verified": { "axum": "2026-04-14", "actix-web": "canonical" }, "warning": "no FastAPI-native equivalent of auto-generated pydantic OpenAPI docs; utoipa exists (canonical)" },
-    { "python": "fastapi", "rust": ["axum", "actix-web"], "verified": { "axum": "2026-04-14", "actix-web": "canonical" }, "warning": "no FastAPI-native equivalent of auto-generated pydantic OpenAPI docs; utoipa exists (canonical)" },
+    { "python": "flask", "rust": ["axum", "actix-web"], "verified": { "axum": "2026-04-14", "actix-web": "canonical" }, "warning": "no FastAPI-native equivalent of auto-generated pydantic OpenAPI docs; utoipa exists" },
+    { "python": "fastapi", "rust": ["axum", "actix-web"], "verified": { "axum": "2026-04-14", "actix-web": "canonical" }, "warning": "no FastAPI-native equivalent of auto-generated pydantic OpenAPI docs; utoipa exists" },
     { "python": "pytest", "rust": ["cargo-test", "rstest"], "verified": { "cargo-test": "builtin", "rstest": "2026-10-18" } },
     { "python": "hypothesis", "rust": ["proptest"], "verified": { "proptest": "2026-10-10" } },
     { "python": "celery", "rust": ["apalis", "rusty-sidekiq"], "verified": { "apalis": "2026-10-12", "rusty-sidekiq": "2026-09-28" }, "warning": "NO maintained Celery-wire-protocol-compatible crate exists (rusty-celery stale since 2023-09-25) - broker/protocol lock-in; surface for human decision. Choose apalis/rusty-sidekiq only for green-field queues" },
