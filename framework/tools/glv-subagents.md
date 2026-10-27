@@ -66,7 +66,8 @@ Quick human lookups without HTTP: `glv sessions`, `glv view <id>`,
 - **Name deterministically.** `unit-<unit-id>-translator-c<k>` and
   `unit-<unit-id>-reviewer-r<n>` (retries get a `-retry` suffix). The
   names surface in `GET /api/sessions` listings and go into the state
-  file's per-unit notes as the audit trail.
+  file's per-unit `sessions[]` (with `notes` for prose) as the audit
+  trail — both defined in `../state/migration-state.schema.json`.
 - **`working_dir` is the isolation unit.** Point each concurrent
   translator at its own checkout — `git worktree add`, one per in-flight
   unit — because delegates write files. Reviewers only read and may

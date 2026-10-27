@@ -1,0 +1,219 @@
+{
+  "$comment": "Example instance of migration-state.schema.json: a mid-Stage-4 migration exercising the journal[], human_gates.gate=scope_change, and per-unit notes/sessions fields. CI (framework/state/check_examples.py) validates every examples/*.json against the schema.",
+  "project": {
+    "name": "datamill",
+    "python_path": "src/datamill",
+    "workload": "etl_nightly corpus (2.1 GB)"
+  },
+  "stage": 4,
+  "go_no_go": {
+    "decision": "go",
+    "scope": ["datamill.parse", "datamill.index", "datamill.rank"],
+    "projection": {
+      "scoped_loc": 18400,
+      "token_cost_usd": 4200.0,
+      "end_to_end_saving_pct": 63.5
+    },
+    "no_equivalent_deps": [],
+    "approved_by": "rpatel"
+  },
+  "judge_validation": {
+    "injected_bugs": 5,
+    "caught": 5,
+    "mutation_sample_killed": 91,
+    "normalization_rules": "contracts/normalization.md",
+    "date": "2026-10-11"
+  },
+  "units": [
+    {
+      "id": "u-parse-1",
+      "python_path": "src/datamill/parse.py",
+      "rust_path": "crates/datamill-core/src/units/u_parse_1.rs",
+      "deps": [],
+      "order": 1,
+      "contract": {
+        "covering_tests": [
+          "tests/test_parse.py::test_roundtrip",
+          "tests/test_parse.py::test_nesting_depth"
+        ],
+        "type_signature": "contracts/u-parse-1.types.md",
+        "invariants": ["len(out.chunks) == len(in.chunks)"],
+        "golden_corpus": "corpora/parse-golden.jsonl"
+      },
+      "risk_flags": ["regex translation"],
+      "status": "ported",
+      "parity": {
+        "runs": 250,
+        "equivalent": 250,
+        "divergent": 0,
+        "incomparable": 0,
+        "last_verdict": "equivalent"
+      },
+      "attempts": 1,
+      "budget": { "max_rounds": 5, "tokens_spent": 41000, "exhausted": false },
+      "attribution": { "header_preserved": true, "notice_ok": true },
+      "review_verdict": "approve",
+      "notes": "Candidate c2 won on first oracle pass; reviewer r1 asked one FIX round (doc comment drift), then approved. Python fallback still live until Stage 7 retirement.",
+      "sessions": [
+        {
+          "id": "sess_01hazr4q8m",
+          "name": "unit-u-parse-1-translator-c1",
+          "role": "translator",
+          "outcome": "candidate submitted, 2/250 divergent"
+        },
+        {
+          "id": "sess_01hazt2v3p",
+          "name": "unit-u-parse-1-translator-c2",
+          "role": "translator",
+          "outcome": "candidate submitted, 0/250 divergent"
+        },
+        {
+          "id": "sess_01hb0k7w1d",
+          "name": "unit-u-parse-1-reviewer-r1",
+          "role": "reviewer",
+          "outcome": "FIX then APPROVE"
+        }
+      ]
+    },
+    {
+      "id": "u-index-2",
+      "python_path": "src/datamill/index.py",
+      "rust_path": "crates/datamill-core/src/units/u_index_2.rs",
+      "deps": ["u-parse-1"],
+      "order": 2,
+      "contract": {
+        "covering_tests": ["tests/test_index.py::test_incremental"],
+        "type_signature": "contracts/u-index-2.types.md",
+        "invariants": ["index.get(k) is total over emitted keys"],
+        "golden_corpus": "corpora/index-golden.jsonl"
+      },
+      "risk_flags": ["dict-ordering dependence"],
+      "status": "escalated",
+      "parity": {
+        "runs": 180,
+        "equivalent": 160,
+        "divergent": 20,
+        "incomparable": 0,
+        "last_verdict": "divergent",
+        "divergence_note": "BTreeMap iteration order vs CPython dict insertion order on re-inserted keys; minimal repro in escalations/u-index-2.md"
+      },
+      "attempts": 5,
+      "budget": { "max_rounds": 5, "tokens_spent": 118000, "exhausted": true },
+      "attribution": { "header_preserved": true, "notice_ok": true },
+      "review_verdict": "escalate",
+      "notes": "Budget exhausted at round 5. Divergence is ordering-only and may qualify for a normalization rule; needs human call — data-structure redesign proposal drafted (arena-keyed vecdeque) rather than improvised.",
+      "sessions": [
+        {
+          "id": "sess_01hb1c9z4r",
+          "name": "unit-u-index-2-translator-c1",
+          "role": "translator",
+          "outcome": "candidate submitted, 20/180 divergent"
+        },
+        {
+          "id": "sess_01hb2f3n7x",
+          "name": "unit-u-index-2-translator-c1-retry",
+          "role": "translator",
+          "outcome": "requeue after error; still 20/180 divergent"
+        },
+        {
+          "id": "sess_01hb3g8p2t",
+          "name": "unit-u-index-2-reviewer-r1",
+          "role": "reviewer",
+          "outcome": "ESCALATE"
+        }
+      ]
+    },
+    {
+      "id": "u-rank-3",
+      "python_path": "src/datamill/rank.py",
+      "rust_path": null,
+      "deps": ["u-index-2"],
+      "order": 3,
+      "contract": {
+        "covering_tests": ["tests/test_rank.py::test_ties"],
+        "type_signature": "contracts/u-rank-3.types.md",
+        "invariants": ["stable sort on ties"],
+        "golden_corpus": "corpora/rank-golden.jsonl"
+      },
+      "risk_flags": [],
+      "status": "pending"
+    }
+  ],
+  "human_gates": [
+    {
+      "gate": "go_no_go",
+      "state": "approved",
+      "note": "Stage 0: go, scope = parse/index/rank (63.5% projected e2e saving)"
+    },
+    {
+      "gate": "redesign_approval",
+      "state": "approved",
+      "note": "Stage 1: arena-keyed store for datamill.index"
+    },
+    {
+      "gate": "scope_change",
+      "state": "open",
+      "note": "Post-Stage-4 request to add datamill.io to scope; awaiting human decision"
+    },
+    {
+      "gate": "unit_escalation",
+      "state": "open",
+      "note": "u-index-2 divergent after 5 rounds; repro + report attached"
+    }
+  ],
+  "journal": [
+    {
+      "timestamp": "2026-10-02T09:14:00Z",
+      "unit": null,
+      "field": "stage",
+      "from": 3,
+      "to": 4,
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-10-02T09:15:00Z",
+      "unit": "u-parse-1",
+      "field": "units[u-parse-1].status",
+      "from": "pending",
+      "to": "ported",
+      "actor": "state.py"
+    },
+    {
+      "timestamp": "2026-10-02T09:15:00Z",
+      "unit": "u-parse-1",
+      "field": "units[u-parse-1].parity.last_verdict",
+      "from": "unjudged",
+      "to": "equivalent",
+      "actor": "state.py"
+    },
+    {
+      "timestamp": "2026-10-09T18:22:00Z",
+      "unit": "u-index-2",
+      "field": "units[u-index-2].status",
+      "from": "pending",
+      "to": "escalated",
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-10-09T18:23:00Z",
+      "unit": null,
+      "field": "human_gates[gate=unit_escalation].state",
+      "from": null,
+      "to": "open",
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-10-12T11:05:00Z",
+      "unit": null,
+      "field": "human_gates[gate=scope_change].state",
+      "from": null,
+      "to": "open",
+      "actor": "orchestrator"
+    }
+  ],
+  "budget_ledger": {
+    "tokens_total": 2100000,
+    "hours_human_total": 11.5,
+    "regression_triage_hours": 0
+  }
+}
