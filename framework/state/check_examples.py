@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """Validate state-file examples against migration-state.schema.json.
 
-Every ``examples/*.json`` instance must validate against the schema
-(draft 2020-12), at least one instance must exercise ``journal[]``, the
-``scope_change`` gate, and per-unit ``notes``/``sessions[]`` together, and
-the schema must *constrain* those fields — malformed journal entries,
-session entries, and gate values are rejected rather than merely tolerated
-by the schema's permissive default of allowing unspecified properties.
+Every example instance must validate against the schema (draft 2020-12).
+Across the corpus, at least one instance must exercise ``journal[]``, the
+``scope_change`` gate, and per-unit ``notes``/``sessions[]`` together; at
+least one unit in each of the six statuses must appear (the worked example,
+``framework/examples/migration-state.json``, exists precisely to cover
+them); and the schema must *constrain* those fields — malformed journal
+entries, session entries, and gate values are rejected rather than merely
+tolerated by the schema's permissive default of allowing unspecified
+properties.
 
 Non-zero exit on any failure, so CI fails loudly.
 
 Run locally:  pip install jsonschema && python framework/state/check_examples.py
+
+Optional arguments override the default instance set (files or directories):
+    python framework/state/check_examples.py framework/examples/migration-state.json
 """
 
 import json
@@ -22,6 +28,8 @@ from jsonschema import Draft202012Validator
 HERE = Path(__file__).resolve().parent
 SCHEMA_PATH = HERE / "migration-state.schema.json"
 EXAMPLES_DIR = HERE / "examples"
+WORKED_EXAMPLE = HERE.parent / "examples" / "migration-state.json"
+DEFAULT_INSTANCE_PATHS = [EXAMPLES_DIR, WORKED_EXAMPLE]
 
 
 def fail(msg: str) -> None:
@@ -29,10 +37,29 @@ def fail(msg: str) -> None:
     sys.exit(1)
 
 
-def validate_examples(validator: Draft202012Validator) -> list[dict]:
-    paths = sorted(EXAMPLES_DIR.glob("*.json"))
+def resolve_instance_paths(args: list[str]) -> list[Path]:
+    """CLI args (files or dirs) override the defaults; dirs expand to *.json."""
+    if not args:
+        paths = DEFAULT_INSTANCE_PATHS
+    else:
+        paths = [Path(arg) for arg in args]
+    expanded: list[Path] = []
+    for p in paths:
+        if p.is_dir():
+            expanded.extend(sorted(p.glob("*.json")))
+        else:
+            expanded.append(p)
+    for p in expanded:
+        if not p.is_file():
+            fail(f"example instance {p} not found")
+    if not expanded and args:
+        fail("no example instances matched the given paths")
+    return expanded
+
+
+def validate_examples(validator: Draft202012Validator, paths: list[Path]) -> list[dict]:
     if not paths:
-        fail(f"no example instances in {EXAMPLES_DIR}")
+        fail("no example instances to validate")
 
     instances = []
     for path in paths:
@@ -64,6 +91,21 @@ def require_fields_exercised(instances: list[dict]) -> None:
             "unit notes/sessions together"
         )
     print("ok: an example instance exercises journal[], scope_change, and unit notes/sessions")
+
+
+def require_all_statuses_exercised(instances: list[dict], schema: dict) -> None:
+    """Every status the schema's enum permits must appear on some unit in
+    the example corpus (the worked example exists to cover them all)."""
+    statuses = schema["properties"]["units"]["items"]["properties"]["status"]["enum"]
+    seen = {u.get("status") for inst in instances for u in inst.get("units", [])}
+    missing = [s for s in statuses if s not in seen]
+    if missing:
+        fail(
+            "no example instance shows a unit with status: "
+            + ", ".join(missing)
+            + " (see framework/examples/migration-state.json)"
+        )
+    print(f"ok: example instances show a unit in each of the {len(statuses)} statuses")
 
 
 def must_accept(label: str, subschema: dict, fragment: object) -> None:
@@ -118,13 +160,15 @@ def require_fields_constrained(schema: dict) -> None:
     print("ok: journal/sessions required fields and gate enum are enforced")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    args = sys.argv[1:] if argv is None else argv
     schema = json.loads(SCHEMA_PATH.read_text())
     Draft202012Validator.check_schema(schema)
     validator = Draft202012Validator(schema)
 
-    instances = validate_examples(validator)
+    instances = validate_examples(validator, resolve_instance_paths(args))
     require_fields_exercised(instances)
+    require_all_statuses_exercised(instances, schema)
     require_fields_constrained(schema)
     print(f"validated {len(instances)} example instance(s) against the schema")
 

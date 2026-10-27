@@ -1,0 +1,75 @@
+{
+  "tool": "oracle.py",
+  "version": 1,
+  "unit": "u-tokenize-1",
+  "verdict": "divergent",
+  "counts": {
+    "equivalent": 1,
+    "divergent": 1,
+    "incomparable": 1
+  },
+  "total": 3,
+  "runs": [
+    {
+      "run": 0,
+      "verdict": "equivalent",
+      "diffs": [],
+      "detail": null
+    },
+    {
+      "run": 1,
+      "verdict": "divergent",
+      "diffs": [
+        {
+          "path": "$",
+          "kind": "swallowed-error",
+          "detail": "reference raises but candidate returns a value (error path dropped?)",
+          "ref": {
+            "error": {
+              "type": "ValueError",
+              "message": "empty input"
+            }
+          },
+          "cand": []
+        }
+      ],
+      "detail": null
+    },
+    {
+      "run": 2,
+      "verdict": "incomparable",
+      "diffs": [],
+      "detail": "reference output is not JSON-serializable"
+    }
+  ],
+  "diff_kind_histogram": {
+    "swallowed-error": 1
+  },
+  "verdicts_digest": "c17b3f2f4feb6613",
+  "normalization": {
+    "float_abs_tol": 1e-09,
+    "float_rel_tol": 1e-09,
+    "int_float_distinct": true,
+    "nan_equal": true,
+    "dict_order_insensitive": true,
+    "set_order_insensitive": true,
+    "unicode_nfc": true,
+    "strip_fields": [],
+    "error_compare": "type-and-message",
+    "error_message_ignore_patterns": []
+  },
+  "summary": {
+    "exit_code": 2,
+    "human": "unit=u-tokenize-1: 1/3 equivalent, 1 divergent, 1 incomparable -> DIVERGENT; top diff kinds: ['swallowed-error']"
+  },
+  "runs_requested": 3,
+  "corpus": {
+    "path": "framework/examples/oracle/corpora/tokenize-probe.jsonl",
+    "lines": 3,
+    "sha256": "2cf6b7d6284dcd526439ef1864e4ad20afa0889e4b5c5bbf6183612f6cbe885f"
+  },
+  "manifest": "framework/examples/oracle/manifests/u-tokenize-1.json",
+  "reference_entry": "reference_tokenizer:run",
+  "candidate_entry": "candidate_wheel:run",
+  "generated_at": "2026-10-27T19:16:16Z"
+}

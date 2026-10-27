@@ -1,0 +1,25 @@
+{
+  "$comment": "Worked example (issue #7): the Stage-2 per-unit contract for u-tokenize-1. This is the exact shape contract_extract.py writes per unit (one <unit-id>.contract.json under --out); see 'python framework/tools/contract_extract.py extract --help'. The tool EXTRACTS from pytest collection + AST + docstring tags — an LLM may enrich invariants later, but that is an edit, not a check.",
+  "unit": "u-tokenize-1",
+  "python_path": "src/duplifind/tokenize.py",
+  "module": "duplifind.tokenize",
+  "covering_tests": [
+    "tests/test_tokenize.py::test_ascii_basic",
+    "tests/test_tokenize.py::test_case_fold",
+    "tests/test_tokenize.py::test_empty_raises",
+    "tests/test_tokenize.py::test_legacy_set_api"
+  ],
+  "type_signatures": [
+    "tokenize(text: str) -> list[str]",
+    "legacy_tokens(text: str) -> set[str]",
+    "mypy: tokenize(text: str) -> list[str]",
+    "mypy: legacy_tokens(text: str) -> set[str]"
+  ],
+  "invariants": [
+    "Invariant: empty input raises ValueError (never returns [])",
+    "Invariant: tokens are lowercased, NFC-normalized, split on whitespace",
+    "Postcondition: duplicates and input order are preserved — dedupe is a separate unit"
+  ],
+  "golden_corpus": "corpora/tokenize-golden.jsonl",
+  "untyped": false
+}
