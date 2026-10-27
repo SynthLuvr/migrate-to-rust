@@ -7,6 +7,16 @@ Codex/Aider `AGENTS.md`/`CONVENTIONS.md`. It encodes the pipeline from
 executable rules. Per-stage checklists: [`stages/`](stages/). Helper-tool
 specs: [`tools/README.md`](tools/README.md).
 
+**Path resolution.** Every relative path in this prompt — `stages/…`,
+`roles/…`, `tools/README.md`, `knowledge/substitutions.json`,
+`state/migration-state.schema.json`, `../SUMMARY.md` — is relative to the
+**framework checkout** (the `framework/` directory of a `migrate-to-rust`
+clone), *not* to the repo being migrated. If you are reading this from inside
+a target repo, your operator must have either (a) recorded the framework
+checkout's absolute path in this same file (see the framework `README.md`,
+run-mode 2) or (b) vendored a copy of `framework/` into the target repo —
+resolve every such path accordingly, and refuse to guess if neither is given.
+
 ---
 
 ## Role

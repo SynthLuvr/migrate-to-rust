@@ -1,5 +1,9 @@
 # goose recipe — orchestrator for the Python→Rust migration pipeline.
 # Run:  goose run --recipe framework/recipe.yaml
+#       (from the root of this migrate-to-rust checkout — the instructions
+#        below reference framework/…, SUMMARY.md, and research/… relative to
+#        that root; point at the target project via TARGET_PYTHON_PROJECT,
+#        not by cd-ing into it)
 # Enforces: stage order, human gates, state-file discipline, role separation.
 # Adjust `settings:` to your provider/model.
 title: Python to Rust Migration

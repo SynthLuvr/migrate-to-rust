@@ -5,14 +5,50 @@ agent can execute directly, rather than merely read.
 
 ## Run it one of three ways
 
+All relative paths in these artifacts — `stages/<n>-*.md`, `roles/*.md`,
+`tools/README.md`, `knowledge/substitutions.json`,
+`state/migration-state.schema.json` — live in **this framework checkout**,
+not in the repo being migrated. Each run-mode below says where the checkout
+must sit for those references to resolve.
+
 1. **goose (recommended)** — `goose run --recipe framework/recipe.yaml`
    The recipe is the orchestrator; it enforces stage order, human gates, and
    the state file. Adjust `settings:` to your provider/model.
+   **Run this from the root of this `migrate-to-rust` checkout.** The recipe's
+   instructions and prompt reference `framework/...`, `SUMMARY.md`,
+   `TOOLCHAIN.md`, and `research/...` relative to that root — from any other
+   CWD the agent cannot find them. To point goose at a target project
+   elsewhere on disk, use the recipe's `TARGET_PYTHON_PROJECT` parameter
+   (absolute path); don't `cd` into the target repo.
 2. **Any CLI agent** (Claude Code, Codex, Aider) — paste
    [`MIGRATION_PROMPT.md`](MIGRATION_PROMPT.md) as the agent's system context
    (`CLAUDE.md` / `AGENTS.md` / `CONVENTIONS.md` in the target repo), and tell
    the agent to load the current `stages/<n>-*.md` checklist when it enters a
-   stage.
+   stage. The prompt's references (`stages/`, `roles/`, `tools/README.md`,
+   `knowledge/substitutions.json`, `state/migration-state.schema.json`)
+   resolve only inside this framework checkout, so pick **one**:
+   - **(a) Tell the agent where the checkout is.** Keep the framework
+     checkout where it is and append its absolute path to the same
+     `CLAUDE.md`/`AGENTS.md` file you pasted the prompt into, e.g.:
+
+     ```markdown
+     ---
+     ## Framework checkout
+     Every framework-relative path in the prompt above (`stages/…`, `roles/…`,
+     `tools/…`, `knowledge/…`, `state/…`, `../SUMMARY.md`) resolves against:
+     `/abs/path/to/migrate-to-rust/framework`
+     ```
+
+     The agent must read those files from that path; the target repo itself
+     is only for the code under migration.
+   - **(b) Copy `framework/` into the target repo** —
+     `cp -r /abs/path/to/migrate-to-rust/framework ./framework/` (or vendor
+     it as a git subtree). The prompt's relative references then resolve
+     as-is; keep the copy in sync when the framework changes.
+
+   Without (a) or (b) the agent is pasted a prompt full of paths that don't
+   exist in the target repo — the checklists, roles, knowledge pack, and
+   state schema are simply unreachable.
 3. **Manual / hybrid** — a human orchestrates stage-by-stage using the same
    checklists, with the agent doing stages 3–4 under supervision.
 
