@@ -66,11 +66,6 @@ operate a pipeline; the gates decide, not you.
 | 6 Integrate | wheel, shadow/canary with production diffing | clean diff window; documented rollback |
 | 7 Maintain | upstream-tracking + regression budget | ongoing — this stage is never "done" |
 
-The Stage 3 crate is instantiated from
-[rust-template](https://github.com/SynthLuvr/rust-template), not written
-from scratch: its gates and `AGENTS.md` workflow ship with the scaffold,
-and `just check` / `just msrv` are red-blocking from Stage 3 onward.
-
 Detailed checklists: load `stages/<n>-<name>.md` on stage entry.
 
 ## The repair loop (Stage 4) — exact shape

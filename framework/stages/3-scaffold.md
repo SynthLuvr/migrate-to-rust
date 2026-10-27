@@ -12,7 +12,7 @@ is instant and trustworthy.
 
        git clone --depth 1 https://github.com/SynthLuvr/rust-template <tmp>
        cp -a <tmp>/. rust/ && rm -rf rust/.git
-       git -C <tmp> rev-parse HEAD   # record SHA with the port's provenance
+       git -C <tmp> rev-parse HEAD   # record the SHA for provenance
 
    The template pre-wires the gate stack Stage 4 depends on: `rustfmt`,
    `clippy` (`-D warnings`; `unwrap_used`/`expect_used`/`unsafe_code`
@@ -49,13 +49,12 @@ is instant and trustworthy.
    never bare gates", so a gate without a task doesn't exist for the agent
    loop. These gates exist so Stage 4 failure feedback is mechanical.
 5. Dev loop: `rustimport` for per-unit iteration. Error policy: Rust errors →
-   `PyErr` at the boundary; no `unwrap()`/`expect()` in exported functions
-   (the template's clippy policy already denies these); panics caught and
-   converted, never raised across the FFI.
+   `PyErr` at the boundary; no `unwrap()`/`expect()` in exported functions;
+   panics caught and converted, never raised across the FFI.
 6. End-to-end dry run: empty-crate parity harness executes (stub → stub).
 
 ## Exit criteria
-- [ ] Scaffold based on rust-template; its full gate suite (`just check`) green
+- [ ] Scaffold based on rust-template; `just check` green
 - [ ] `maturin develop && pytest -k smoke` green
 - [ ] CI red-blocking on fmt/clippy; miri scheduled
 - [ ] Wheels build for target platforms incl. free-threaded variant if needed

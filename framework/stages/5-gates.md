@@ -9,9 +9,8 @@ documented way to ship a broken port.
    corpus; `cargo-fuzz` at the FFI boundary (untrusted input shapes).
 3. `miri` over the test surface (tsrs caught a bug present **only** in
    optimized builds); `clippy` pedantic; `rustfmt` clean.
-4. Template gate floor: `just check` (fmt + clippy `-D warnings` + docs +
-   Markdown + 80% llvm-cov + cargo-deny + cargo-shear) and `just msrv`
-   green — the scaffold's own CI is part of the port's definition of done.
+4. Template gate floor: `just check` + `just msrv` green — the scaffold's
+   own CI is part of the port's definition of done.
 5. Mutation spot-check with `cargo-mutants` on sampled units — proves the
    gates can still detect wrongness after translation.
 6. Benchmarks: matched corpora through the same entry points, Criterion vs
