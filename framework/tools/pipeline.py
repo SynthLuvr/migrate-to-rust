@@ -61,6 +61,7 @@ import shlex
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 
@@ -86,28 +87,35 @@ STAGE_GATES = {0: ["go_no_go"], 6: ["cutover"]}
 # evaluation order: descoping (DEP-1) must clear the scope before GO-1 reads it
 GATE_ORDER = {"no_equivalent_dependency": 0, "go_no_go": 1}
 UNDECIDABLE = "undecidable"
-POLICY_LEVELS = ("L0", "L1", "L2", "L3")
 
 
 # --------------------------------------------------------------- policy ----
 
-def load_policy(path: Path | None = None) -> dict:
-    """Load + structurally validate autonomy/policy.json. Every gate in the
-    schema's enum must be covered by exactly one rule id — an uncovered gate
-    would reintroduce a blocking stop at L2+."""
-    p = path or DEFAULT_POLICY
+def load_policy(path: str | Path | None = None) -> dict:
+    """Load autonomy/policy.json and structurally validate it. Every gate in
+    the schema's enum must be covered by exactly one rule id — an uncovered
+    gate would reintroduce a blocking stop at L2+."""
+    p = Path(path) if path else DEFAULT_POLICY
     try:
         policy = json.loads(p.read_text(encoding="utf-8"))
     except OSError as e:
         raise ToolError(f"policy {p}: {e}", kind="io") from e
     except json.JSONDecodeError as e:
         raise ToolError(f"policy {p}: invalid JSON: {e}", kind="usage") from e
+    errors = _policy_structure_errors(policy)
+    if errors:
+        raise ToolError(f"invalid policy {p}:\n  " + "\n  ".join(errors), kind="usage")
+    return policy
+
+
+def _policy_structure_errors(policy: dict) -> list[str]:
     errors: list[str] = []
     if not isinstance(policy.get("version"), str) or not policy["version"]:
         errors.append("version: required (every decision journals it)")
     levels = policy.get("levels")
-    if not isinstance(levels, dict) or set(levels) != set(POLICY_LEVELS):
-        errors.append(f"levels: must define exactly {', '.join(POLICY_LEVELS)}")
+    if not isinstance(levels, dict) or set(levels) != state_tool.POLICY_LEVELS:
+        errors.append(f"levels: must define exactly "
+                      f"{', '.join(sorted(state_tool.POLICY_LEVELS))}")
     elif not all(isinstance(lv.get("publish_allowed"), bool)
                  for lv in levels.values() if isinstance(lv, dict)):
         errors.append("levels.*: publish_allowed (bool) required on every level")
@@ -142,13 +150,11 @@ def load_policy(path: Path | None = None) -> dict:
     if (not isinstance(budget, dict)
             or "max_tokens" not in budget or "max_wall_clock_minutes" not in budget):
         errors.append("budget: max_tokens and max_wall_clock_minutes required")
-    if errors:
-        raise ToolError(f"invalid policy {p}:\n  " + "\n  ".join(errors), kind="usage")
-    return policy
+    return errors
 
 
-def load_substitutions(path: Path | None = None) -> dict:
-    p = path or DEFAULT_SUBSTITUTIONS
+def load_substitutions(path: str | Path | None = None) -> dict:
+    p = Path(path) if path else DEFAULT_SUBSTITUTIONS
     try:
         subs = json.loads(p.read_text(encoding="utf-8"))
     except OSError as e:
@@ -299,20 +305,20 @@ def _eval_redesign(state, gate, rule, ctx):
                float) or 10.0
     ev = parse_evidence(gate.get("evidence"))
     spike = ev.get("spike_verdict")
-    bench = _num(ev.get("bench_improvement_pct"))
-    evidence = [f"spike_verdict={spike or 'unrecorded'}",
-                f"bench_improvement_pct={ev.get('bench_improvement_pct', 'unrecorded')} "
-                f"(bar >= {bar:g})"]
-    if spike == "equivalent" and bench is not None and bench >= bar:
+    bench = ev.get("bench_improvement_pct", "unrecorded")
+    bench_num = _num(ev.get("bench_improvement_pct"))
+    spike_txt = f"spike_verdict={spike or 'unrecorded'}"
+    bench_txt = f"bench_improvement_pct={bench}"
+    evidence = [spike_txt, f"{bench_txt} (bar >= {bar:g})"]
+    if spike == "equivalent" and bench_num is not None and bench_num >= bar:
         return _decision("redesign_approval", rule, "approved",
                          f"spike passes the oracle and the benchmark clears the "
-                         f"bar (+{bench:g}% >= {bar:g}%)", evidence)
+                         f"bar (+{bench_num:g}% >= {bar:g}%)", evidence)
     why = []
     if spike != "equivalent":
-        why.append(f"spike_verdict={spike or 'unrecorded'} (needs equivalent)")
-    if bench is None or bench < bar:
-        why.append(f"bench_improvement_pct={ev.get('bench_improvement_pct', 'unrecorded')} "
-                   f"(needs >= {bar:g})")
+        why.append(f"{spike_txt} (needs equivalent)")
+    if bench_num is None or bench_num < bar:
+        why.append(f"{bench_txt} (needs >= {bar:g})")
     return _decision("redesign_approval", rule, "rejected",
                      "keep the literal shape (safe default): " + "; ".join(why)
                      + " — correctness gates apply either way", evidence)
@@ -353,7 +359,7 @@ def _eval_cutover(state, gate, rule, ctx):
     params = rule.get("params", {})
     level = state_tool.autonomy_level(state)
     publish_allowed = (state.get("autonomy") or {}).get("publish_allowed") is True
-    if level != "L3" or not publish_allowed:
+    if not state_tool.publish_preauthorized(state):
         return _decision("cutover", rule, "rejected",
                          f"publish disabled at {level} — the run completes without "
                          f"cutover; the dual-build stays intact (publish is an "
@@ -416,19 +422,6 @@ def evaluate_gate(state: dict, gate: dict, policy: dict, ctx: dict) -> dict:
 
 # ------------------------------------------------------------- applying ----
 
-def _find_gate(state: dict, name: str, only_open: bool = False) -> dict | None:
-    gate = None
-    for g in state.get("human_gates", []):
-        if g.get("gate") != name:
-            continue
-        gate = g
-        if g.get("state") == "open":
-            break
-    if only_open and gate is not None and gate.get("state") != "open":
-        return None
-    return gate
-
-
 def _open_gate(state: dict, name: str, note: str, changes: list) -> dict:
     gate = {"gate": name, "state": "open", "note": note}
     state.setdefault("human_gates", []).append(gate)
@@ -477,52 +470,44 @@ def apply_gate_decision(state: dict, decision: dict, policy: dict,
     """Record one policy decision on its gate (and its side effects) as
     journaled field changes; the caller persists via state_tool.save_validated."""
     name = decision["gate"]
-    gate = _find_gate(state, name)
+    gate = state_tool.find_gate(state, name)
     if gate is None:
         gate = _open_gate(state, name,
                           f"{name}: opened by the driver for policy resolution",
                           changes)
-    gpath = f"human_gates[gate={name}]"
-
-    def set_field(path: str, old, new, unit=None) -> None:
-        if old != new:
-            changes.append((unit, path, old, new))
-
-    old_state = gate.get("state")
-    gate["state"] = decision["decision"]
-    set_field(f"{gpath}.state", old_state, decision["decision"])
-    decided_by = f"policy:{decision['rule']}"
-    set_field(f"{gpath}.decided_by", gate.get("decided_by"), decided_by)
-    gate["decided_by"] = decided_by
-    set_field(f"{gpath}.policy_version", gate.get("policy_version"),
-              policy.get("version"))
-    gate["policy_version"] = policy.get("version")
-    merged = list(gate.get("evidence") or [])
-    merged.extend(e for e in decision.get("evidence", []) if e not in merged)
-    set_field(f"{gpath}.evidence", gate.get("evidence"), merged)
-    gate["evidence"] = merged
     note = (gate.get("note") + " | " if gate.get("note") else "") + decision["note"]
-    set_field(f"{gpath}.note", gate.get("note"), note)
-    gate["note"] = note
+    state_tool.record_gate_fields(gate, {
+        "state": decision["decision"],
+        "decided_by": f"policy:{decision['rule']}",
+        "policy_version": policy.get("version"),
+        "evidence": state_tool.merge_evidence(gate.get("evidence"),
+                                              decision.get("evidence")),
+        "note": note,
+    }, changes)
 
     if name == "no_equivalent_dependency" and decision["decision"] == "approved":
         module = parse_evidence(decision.get("evidence")).get("module")
         if module:
             dropped = _descope_module(state, module, changes)
             if dropped:
-                set_field(f"{gpath}.note", gate.get("note"),
-                          gate["note"] + f" [descoped units: {', '.join(dropped)}]")
+                state_tool.record_gate_fields(gate, {
+                    "note": gate["note"] + f" [descoped units: {', '.join(dropped)}]",
+                }, changes)
     if name == "go_no_go":
         gng = state.get("go_no_go")
         if isinstance(gng, dict) and decision.get("go_decision"):
-            set_field("go_no_go.decision", gng.get("decision"),
-                      decision["go_decision"])
-            gng["decision"] = decision["go_decision"]
-            set_field("go_no_go.approved_by", gng.get("approved_by"),
-                      f"policy:{decision['rule']}")
-            gng["approved_by"] = f"policy:{decision['rule']}"
-    if decision.get("run_status"):
-        set_field("run_status", state.get("run_status"), decision["run_status"])
+            approver = f"policy:{decision['rule']}"
+            if gng.get("decision") != decision["go_decision"]:
+                changes.append((None, "go_no_go.decision", gng.get("decision"),
+                                decision["go_decision"]))
+                gng["decision"] = decision["go_decision"]
+            if gng.get("approved_by") != approver:
+                changes.append((None, "go_no_go.approved_by",
+                                gng.get("approved_by"), approver))
+                gng["approved_by"] = approver
+    if decision.get("run_status") and state.get("run_status") != decision["run_status"]:
+        changes.append((None, "run_status", state.get("run_status"),
+                        decision["run_status"]))
         state["run_status"] = decision["run_status"]
 
 
@@ -622,7 +607,7 @@ def verify_stage_exit(state: dict, stage: int, *, run_selftest: bool = True) -> 
         if bad:
             failures.append(f"attribution gate not green for: {bad}")
     elif stage == 6:
-        if _find_gate(state, "cutover") is None:
+        if state_tool.find_gate(state, "cutover") is None:
             failures.append("cutover gate absent — Stage 6 must surface the "
                             "cutover decision (approved OR rejected; either is "
                             "a decision, open is not)")
@@ -631,15 +616,19 @@ def verify_stage_exit(state: dict, stage: int, *, run_selftest: bool = True) -> 
 
 # ----------------------------------------------------------------- report --
 
+def _tokens_spent(state: dict) -> int:
+    """Run-level budget usage: the ledger plus every unit's spend."""
+    ledger = (state.get("budget_ledger") or {}).get("tokens_total") or 0
+    per_unit = sum((u.get("budget") or {}).get("tokens_spent", 0) or 0
+                   for u in state.get("units", []))
+    return ledger + per_unit
+
+
 def build_report(state: dict, policy: dict) -> str:
     level = state_tool.autonomy_level(state)
-    tokens = ((state.get("budget_ledger") or {}).get("tokens_total") or 0) + sum(
-        (u.get("budget") or {}).get("tokens_spent", 0) or 0
-        for u in state.get("units", []))
+    tokens = _tokens_spent(state)
     ceiling = ((state.get("autonomy") or {}).get("budget") or {}).get("max_tokens")
-    counts: dict[str, int] = {}
-    for u in state.get("units", []):
-        counts[u.get("status", "?")] = counts.get(u.get("status", "?"), 0) + 1
+    counts = Counter(u.get("status", "?") for u in state.get("units", []))
     lines = [
         f"# Run report — {state.get('project', {}).get('name', '?')}",
         "",
@@ -708,12 +697,15 @@ def _emit_refusal(reason: str, human_flag: bool, **extra) -> int:
 
 
 class _Terminal(Exception):
-    """Raised inside cmd_run to jump to the terminal-state exit path."""
+    """Raised inside the run loop to jump to the terminal-state exit path,
+    carrying the working state snapshot to journal (driver-opened gates live
+    in memory until a stage verifies, so the snapshot must travel)."""
 
-    def __init__(self, run_status: str, reason: str):
+    def __init__(self, run_status: str, reason: str, state: dict | None = None):
         super().__init__(reason)
         self.run_status = run_status
         self.reason = reason
+        self.state = state
 
 
 def _invoke_agent(cmd_template: str, stage: int, state_path: Path) -> tuple[int, str]:
@@ -732,8 +724,87 @@ def _invoke_agent(cmd_template: str, stage: int, state_path: Path) -> tuple[int,
     return proc.returncode, tail
 
 
+def _open_stage_gates(state: dict, stage: int, only: str | None = None) -> list:
+    """Gate ownership at L2+: the driver (not the worker) surfaces this
+    stage's decision gates — before verification, so the checklist can rely
+    on them existing (in-memory until the stage verifies)."""
+    changes: list = []
+    for name in STAGE_GATES.get(stage, []):
+        if only is not None and name != only:
+            continue
+        if state_tool.find_gate(state, name) is None:
+            _open_gate(state, name,
+                       f"{name}: opened by the driver at stage {stage} boundary",
+                       changes)
+    return changes
+
+
+def _execute_stage(args, path: Path, stage: int, events: list,
+                   max_retries: int) -> tuple[dict, list]:
+    """Run the stage worker (any CLI agent), then verify the stage's exit
+    criteria, retrying within max_retries. Returns (state, changes for gates
+    the driver opened); raises _Terminal when attempts run out."""
+    attempts = 0
+    state: dict | None = None
+    while True:
+        if not args.dry_run:
+            rc, tail = _invoke_agent(args.agent_cmd, stage, path)
+            if rc != 0:
+                attempts += 1
+                events.append({"stage": stage, "event": "agent-failed",
+                               "rc": rc, "tail": tail[-400:]})
+                if attempts > max_retries:
+                    raise _Terminal("failed_safely",
+                                    f"stage {stage}: agent exited {rc} after "
+                                    f"{attempts} attempt(s): {tail[-400:]}",
+                                    state=state)
+                continue
+        try:
+            state = _load_state(path)
+        except ToolError as e:
+            raise _Terminal("failed_safely",
+                            f"stage {stage}: state unreadable after agent run "
+                            f"({e.detail}); file left as-is", state=state) from e
+        open_changes = _open_stage_gates(state, stage)
+        failures = _validate_state(state) + verify_stage_exit(
+            state, stage, run_selftest=not args.no_selftest)
+        if not failures:
+            events.append({"stage": stage, "event": "verified"})
+            return state, open_changes
+        if args.dry_run:
+            raise _Terminal("failed_safely",
+                            f"stage {stage} exit criteria unmet (dry-run, no "
+                            f"agent to repair): {failures}", state=state)
+        attempts += 1
+        events.append({"stage": stage, "event": "verify-failed",
+                       "failures": failures})
+        if attempts > max_retries:
+            raise _Terminal("failed_safely",
+                            f"stage {stage}: exit criteria unmet after "
+                            f"{attempts} attempt(s): {failures}", state=state)
+
+
+def _enter_terminal_status(state: dict, path: Path, terminal: _Terminal,
+                           events: list) -> dict:
+    """Journal the terminal run_status; on an invalid resulting state keep
+    the file as-is and record the failure (the report still goes out)."""
+    old = state.get("run_status")
+    state["run_status"] = terminal.run_status  # mutate BEFORE journaling:
+    try:                                       # save_validated writes `state`
+        state_tool.save_validated(state, path, actor=TOOL,
+                                  changes=[(None, "run_status", old,
+                                            terminal.run_status)])
+    except (ValueError, ToolError):
+        state["run_status"] = old
+        events.append({"event": "terminal-journal-failed",
+                       "detail": terminal.reason})
+    else:
+        state = _load_state(path)
+    return state
+
+
 def cmd_run(args) -> int:
-    policy = load_policy(Path(args.policy) if args.policy else None)
+    policy = load_policy(args.policy)
     path = Path(args.state)
     state = _load_state(path)
     if args.autonomy:
@@ -770,9 +841,7 @@ def cmd_run(args) -> int:
     max_minutes = ceilings.get("max_wall_clock_minutes")
     max_retries = int((policy.get("budget") or {})
                       .get("max_agent_retries_per_stage", 2))
-    ctx = {"today": date.today(),
-           "substitutions": load_substitutions(
-               Path(args.substitutions) if args.substitutions else None)}
+    ctx = {"today": date.today(), "substitutions": load_substitutions(args.substitutions)}
 
     if run_status in (None, "pending", "budget_exhausted", "failed_safely"):
         changes = [(None, "run_status", run_status, "running")]
@@ -789,9 +858,7 @@ def cmd_run(args) -> int:
     try:
         while True:
             state = _load_state(path)
-            tokens = ((state.get("budget_ledger") or {}).get("tokens_total") or 0) + sum(
-                (u.get("budget") or {}).get("tokens_spent", 0) or 0
-                for u in state.get("units", []))
+            tokens = _tokens_spent(state)
             elapsed = (time.monotonic() - started) / 60
             if max_tokens is not None and tokens > max_tokens:
                 raise _Terminal("budget_exhausted",
@@ -804,55 +871,11 @@ def cmd_run(args) -> int:
             if stage > LAST_STAGE:
                 raise _Terminal("complete", f"stage {stage} beyond {LAST_STAGE}")
 
-            # 1. stage worker (any CLI agent) — with bounded retries
-            attempts = 0
-            while True:
-                if not args.dry_run:
-                    rc, tail = _invoke_agent(args.agent_cmd, stage, path)
-                    if rc != 0:
-                        attempts += 1
-                        events.append({"stage": stage, "event": "agent-failed",
-                                       "rc": rc, "tail": tail[-400:]})
-                        if attempts > max_retries:
-                            raise _Terminal("failed_safely",
-                                            f"stage {stage}: agent exited {rc} after "
-                                            f"{attempts} attempt(s): {tail[-400:]}")
-                        continue
-                try:
-                    state = _load_state(path)
-                except ToolError as e:
-                    raise _Terminal("failed_safely",
-                                    f"stage {stage}: state unreadable after agent "
-                                    f"run ({e.detail}); file left as-is") from e
-                # 2. gate ownership at L2+: the driver (not the worker)
-                # surfaces this stage's decision gates — before verification,
-                # so the checklist can rely on them existing (in-memory until
-                # the stage verifies)
-                open_changes = []
-                for gate_name in STAGE_GATES.get(stage, []):
-                    if _find_gate(state, gate_name) is None:
-                        _open_gate(state, gate_name,
-                                   f"{gate_name}: opened by the driver at stage "
-                                   f"{stage} boundary", open_changes)
-                invalid = _validate_state(state)
-                failures = invalid + verify_stage_exit(
-                    state, stage, run_selftest=not args.no_selftest)
-                if not failures:
-                    events.append({"stage": stage, "event": "verified"})
-                    break
-                if args.dry_run:
-                    raise _Terminal("failed_safely",
-                                    f"stage {stage} exit criteria unmet (dry-run, "
-                                    f"no agent to repair): {failures}")
-                attempts += 1
-                events.append({"stage": stage, "event": "verify-failed",
-                               "failures": failures})
-                if attempts > max_retries:
-                    raise _Terminal("failed_safely",
-                                    f"stage {stage}: exit criteria unmet after "
-                                    f"{attempts} attempt(s): {failures}")
+            # 1. stage worker (any CLI agent), verified, with bounded retries
+            state, open_changes = _execute_stage(args, path, stage, events,
+                                                 max_retries)
 
-            # 3. resolve open gates via policy (defer/conservative-default)
+            # 2. resolve open gates via policy (defer/conservative-default)
             decisions, changes = resolve_open_gates(state, policy, ctx)
             changes = open_changes + changes
             if decisions or changes:
@@ -873,7 +896,7 @@ def cmd_run(args) -> int:
                                     f"{d['decision']} by policy:{d['rule']} — "
                                     f"{d['note']}")
 
-            # 4. advance or finish
+            # 3. advance or finish
             if stage == LAST_STAGE:
                 raise _Terminal("complete",
                                 f"stages 0->{LAST_STAGE} done; Stage 7 maintenance "
@@ -885,18 +908,11 @@ def cmd_run(args) -> int:
                 break
     except _Terminal as t:
         terminal = t
+        if t.state is not None:
+            state = t.state
 
     if terminal is not None and state.get("run_status") != terminal.run_status:
-        old_status = state.get("run_status")
-        state["run_status"] = terminal.run_status  # mutate BEFORE journaling:
-        try:                                       # save_validated writes `state`
-            journal([(None, "run_status", old_status, terminal.run_status)])
-        except (ValueError, ToolError):
-            state["run_status"] = old_status
-            events.append({"event": "terminal-journal-failed",
-                           "detail": terminal.reason})
-        else:
-            state = _load_state(path)
+        state = _enter_terminal_status(state, path, terminal, events)
     report = build_report(state, policy)
     rp = report_path_for(path)
     rp.write_text(report, encoding="utf-8")
@@ -920,7 +936,7 @@ def cmd_run(args) -> int:
 
 
 def cmd_resolve_gates(args) -> int:
-    policy = load_policy(Path(args.policy) if args.policy else None)
+    policy = load_policy(args.policy)
     path = Path(args.state)
     state = _load_state(path)
     level = state_tool.autonomy_level(state)
@@ -931,18 +947,10 @@ def cmd_resolve_gates(args) -> int:
             f"`state.py resolve-gate --by human` (--human-override forces "
             f"evaluation here; the decision is still journaled policy:<rule>)",
             args.human, file=str(path))
-    ctx = {"today": date.today(),
-           "substitutions": load_substitutions(
-               Path(args.substitutions) if args.substitutions else None)}
-    # gate ownership at L2+: the driver (not the stage worker) surfaces the
-    # gates the current stage must decide — same rule the run loop uses
-    open_changes: list[tuple] = []
-    for gate_name in STAGE_GATES.get(state.get("stage", 0), []):
-        if (_find_gate(state, gate_name) is None
-                and (args.gate is None or args.gate == gate_name)):
-            _open_gate(state, gate_name,
-                       f"{gate_name}: opened by the driver at stage "
-                       f"{state.get('stage', 0)} boundary", open_changes)
+    ctx = {"today": date.today(), "substitutions": load_substitutions(args.substitutions)}
+    # the driver, not the stage worker, surfaces the gates the current stage
+    # must decide — same rule the run loop uses
+    open_changes = _open_stage_gates(state, state.get("stage", 0), only=args.gate)
     decisions, changes = resolve_open_gates(state, policy, ctx, only=args.gate)
     changes = open_changes + changes
     if not decisions:
@@ -971,7 +979,7 @@ def cmd_resolve_gates(args) -> int:
 
 
 def cmd_report(args) -> int:
-    policy = load_policy(Path(args.policy) if args.policy else None)
+    policy = load_policy(args.policy)
     path = Path(args.state)
     state = _load_state(path)
     report = build_report(state, policy)
@@ -985,11 +993,9 @@ def cmd_report(args) -> int:
 
 
 def cmd_status(args) -> int:
-    policy = load_policy(Path(args.policy) if args.policy else None)
+    load_policy(args.policy)  # validate --policy even though status needs no rules
     state = _load_state(Path(args.state))
-    tokens = ((state.get("budget_ledger") or {}).get("tokens_total") or 0) + sum(
-        (u.get("budget") or {}).get("tokens_spent", 0) or 0
-        for u in state.get("units", []))
+    tokens = _tokens_spent(state)
     ceiling = ((state.get("autonomy") or {}).get("budget") or {}).get("max_tokens")
     open_gates = [g for g in state.get("human_gates", []) if g.get("state") == "open"]
     human = (f"run={state.get('run_status', 'pending')} stage={state.get('stage')}/"
@@ -1016,7 +1022,7 @@ def main(argv=None) -> int:
                    help="CLI agent invoked per stage; placeholders {stage} {state} "
                         "{stage_file} {framework}, e.g. "
                         "'goose run --recipe {framework}/recipe.yaml'")
-    p.add_argument("--autonomy", choices=list(POLICY_LEVELS),
+    p.add_argument("--autonomy", choices=sorted(state_tool.POLICY_LEVELS),
                    help="set the pre-authorized level before starting (journaled)")
     p.add_argument("--policy", help="override autonomy/policy.json")
     p.add_argument("--substitutions", help="override knowledge/substitutions.json")
