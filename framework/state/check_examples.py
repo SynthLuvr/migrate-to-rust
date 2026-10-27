@@ -167,16 +167,12 @@ def require_units_constrained(schema: dict) -> None:
         "status": "pending",
     }
     must_accept("a minimal well-formed unit", unit_schema, minimal_unit)
-    must_reject(
-        "a deliberately incomplete unit (missing 'status')",
-        unit_schema,
-        {k: v for k, v in minimal_unit.items() if k != "status"},
-    )
-    must_reject(
-        "a unit missing 'deps'",
-        unit_schema,
-        {k: v for k, v in minimal_unit.items() if k != "deps"},
-    )
+    for key in ("status", "deps"):
+        must_reject(
+            f"a unit missing '{key}'",
+            unit_schema,
+            {k: v for k, v in minimal_unit.items() if k != key},
+        )
     must_reject(
         "a unit with a bogus status ('done')",
         unit_schema,

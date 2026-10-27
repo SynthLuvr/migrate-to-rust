@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install pinned goose (GOOSE_VERSION in ci.yml)
+      - name: Install pinned goose
         run: |
           mkdir -p "$HOME/.local/bin"
           curl -fsSL \
@@ -26,14 +26,14 @@ jobs:
           tar -xzf goose.tgz
           install -m 0755 goose "$HOME/.local/bin/goose"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: goose version (pinned via GOOSE_VERSION, echoed to the log)
+      - name: Verify goose version matches the pin
         run: |
           version="$(goose --version | tr -d '[:space:]')"
           echo "goose ${version} (pinned: ${GOOSE_VERSION})"
           test "$version" = "$GOOSE_VERSION"
       - name: Recipe validates
         run: goose recipe validate framework/recipe.yaml
-      - name: Render smoke test (params substituted, no leftover placeholders)
+      - name: Render smoke test
         run: |
           goose run --recipe framework/recipe.yaml \
             --params TARGET_PYTHON_PROJECT=/tmp/example-project \
@@ -42,9 +42,8 @@ jobs:
           echo "--- rendered recipe:"
           cat rendered.yaml
           echo "--- placeholder scan:"
-          # The param must have been substituted in ...
           grep -n '/tmp/example-project' rendered.yaml
-          # ... and nothing templated may remain ($VAR style or {{ mustache }}).
+          # no $VAR or {{ mustache }} template syntax may remain
           ! grep -nE '\{\{|[$][A-Za-z_][A-Za-z0-9_]*' rendered.yaml
 
   json-and-links:
@@ -55,15 +54,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Every JSON file parses (substitutions.json, schema, examples)
+      - name: Every JSON file parses
         run: python scripts/check_json.py
       - name: Internal markdown links resolve
         run: python scripts/check_links.py
 
   citation-spot-check:
     name: citation URL spot-check (optional, non-blocking)
-    # Optional per the CI issue: best-effort HEAD check of cited URLs.
-    # continue-on-error keeps bot-blocked/transient hosts from failing CI.
+    # Best-effort HEAD check per the CI issue; continue-on-error keeps
+    # bot-blocked/transient hosts from failing CI.
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
@@ -71,7 +70,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: HEAD-check cited URLs (bot-blocked hosts allowlisted)
+      - name: HEAD-check cited URLs
         # dfrws.org 403s automated checks (#10); reddit 403s datacenter IPs
         # (GitHub runners) while serving residential requests fine.
         run: python scripts/check_links.py --external --allow-host dfrws.org --allow-host www.reddit.com
