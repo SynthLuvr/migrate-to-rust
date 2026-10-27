@@ -5,7 +5,7 @@ Design contract (framework/tools/README.md "Anti-requirements"):
 - every tool prints machine-readable JSON on stdout and embeds a
   human-readable summary; ``--human`` additionally echoes it to stderr
 - stdout is ALWAYS a single JSON object — including error paths (a refusal
-  is a result, not a crash); emit_error()/run_cli() below provide the
+  is a result, not a crash); ToolError/run_cli() below provide the
   uniform error envelope
 - exit codes: 0 = clean verdict, 1 = usage/IO error, 2 = findings/divergence,
   3 = incomparable/warning-class outcome, 4 = setup/dependency failure
@@ -109,29 +109,24 @@ def emit(payload: dict, human: str | None = None, human_flag: bool = False) -> i
 class ToolError(Exception):
     """A refusal (usage/IO/setup problem) raised mid-command. The CLI
     boundary (``run_cli``) converts it into the JSON error envelope on
-    stdout instead of letting it escape as bare stderr text or a traceback.
-    ``kind`` ∈ io (filesystem/environment) · usage (bad/missing input
-    content) · setup (missing dependency, exit 4)."""
+    stdout instead of letting it escape as a traceback. ``kind`` ∈ io
+    (filesystem/environment) · usage (bad/missing input content) ·
+    setup (missing dependency, exit 4)."""
 
-    def __init__(self, detail: str, *, kind: str = "io", exit_code: int | None = None):
+    def __init__(self, detail: str, *, kind: str = "io"):
         super().__init__(detail)
         self.detail = detail
         self.kind = kind
-        if exit_code is None:
-            exit_code = EXIT_SETUP if kind == "setup" else EXIT_ERROR
-        self.exit_code = exit_code
 
 
-def emit_error(detail: str, *, kind: str = "io", exit_code: int | None = None,
-               tool: str | None = None, version: int | None = None,
-               human_flag: bool = False) -> int:
-    """The uniform JSON error envelope on stdout (README "Uniform
+def emit_error(detail: str, *, kind: str = "io", tool: str | None = None,
+               version: int | None = None, human_flag: bool = False) -> int:
+    """Emit the uniform JSON error envelope on stdout (README "Uniform
     conventions"): ``error.kind`` + ``error.detail``, and
     ``summary.exit_code`` mirroring the process exit code — so callers
-    parsing stdout always get JSON, even on failure. Returns the exit code
-    so command handlers can ``return emit_error(...)``."""
-    if exit_code is None:
-        exit_code = EXIT_SETUP if kind == "setup" else EXIT_ERROR
+    parsing stdout always get JSON, even on failure. Returns the exit
+    code."""
+    exit_code = EXIT_SETUP if kind == "setup" else EXIT_ERROR
     payload: dict = {}
     if tool is not None:
         payload["tool"] = tool
@@ -156,14 +151,12 @@ def run_cli(main_func, argv=None, *, tool: str | None = None,
     try:
         return main_func(argv)
     except ToolError as e:
-        return emit_error(e.detail, kind=e.kind, exit_code=e.exit_code,
-                          tool=tool, version=version, human_flag=human_flag)
-    except OSError as e:
-        return emit_error(f"{type(e).__name__}: {e}", kind="io",
-                          tool=tool, version=version, human_flag=human_flag)
-    except ValueError as e:
-        return emit_error(f"{type(e).__name__}: {e}", kind="usage",
-                          tool=tool, version=version, human_flag=human_flag)
+        return emit_error(e.detail, kind=e.kind, tool=tool, version=version,
+                          human_flag=human_flag)
+    except (OSError, ValueError) as e:
+        kind = "usage" if isinstance(e, ValueError) else "io"
+        return emit_error(f"{type(e).__name__}: {e}", kind=kind, tool=tool,
+                          version=version, human_flag=human_flag)
 
 
 def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,

@@ -29,8 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_FINDINGS, EXIT_OK, ToolError, emit, emit_error, read_json, run_child,
-    run_cli,
+    EXIT_FINDINGS, EXIT_OK, ToolError, emit, read_json, run_child, run_cli,
 )
 
 TOOL = "upstream_watch.py"
@@ -89,8 +88,7 @@ def cmd_watch(args) -> int:
     units = state.get("units", [])
     repo = Path(args.repo).resolve()
     if not (repo / ".git").exists():
-        return emit_error(f"{repo} is not a git repository",
-                          tool=TOOL, version=VERSION, human_flag=args.human)
+        raise ToolError(f"{repo} is not a git repository")
     base = args.base or "HEAD~1"
     head = args.head  # None -> working tree
     if head:

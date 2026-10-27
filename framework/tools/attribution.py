@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_FINDINGS, EXIT_OK, emit, emit_error, iter_tree_files,
+    EXIT_FINDINGS, EXIT_OK, ToolError, emit, iter_tree_files,
     read_json, run_cli, sha256_file,
 )
 
@@ -112,8 +112,7 @@ def cmd_check(args) -> int:
     port = Path(args.port).resolve()
     for label, p in (("original", original), ("port", port)):
         if not p.is_dir():
-            return emit_error(f"{label} tree {p} is not a directory",
-                              tool=TOOL, version=VERSION, human_flag=args.human)
+            raise ToolError(f"{label} tree {p} is not a directory")
     state = read_json(args.state)
     units = [u for u in state.get("units", []) if u.get("rust_path")]
     allowlist = _load_allowlist(args.allowlist)

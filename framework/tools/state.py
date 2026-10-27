@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_FINDINGS, EXIT_OK, emit, emit_error, module_name_of,
+    EXIT_FINDINGS, EXIT_OK, ToolError, emit, module_name_of,
     now_iso, run_cli, write_json_atomic,
 )
 
@@ -422,8 +422,7 @@ def cmd_validate(args) -> int:
 def cmd_init(args) -> int:
     path = Path(args.file)
     if path.exists() and not args.force:
-        return emit_error(f"{path} already exists (use --force to overwrite)",
-                          tool=TOOL, version=VERSION, human_flag=args.human)
+        raise ToolError(f"{path} already exists (use --force to overwrite)")
     state = {
         "project": {"name": args.name, "python_path": args.python_path},
         "stage": args.stage,

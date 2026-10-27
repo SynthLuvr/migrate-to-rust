@@ -13,6 +13,8 @@ TOOLS = Path(__file__).resolve().parent.parent
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
+from _common import run_cli  # noqa: E402
+
 REPO_ROOT = TOOLS.parent.parent
 
 
@@ -24,7 +26,6 @@ def run_tool(monkeypatch, capsys, script: str, argv: list[str]) -> tuple[int, di
     object' convention even on error paths."""
     mod = __import__(script[:-3])
     monkeypatch.setattr(sys, "argv", [script] + argv)
-    from _common import run_cli
     code = run_cli(mod.main, argv, tool=getattr(mod, "TOOL", script),
                    version=getattr(mod, "VERSION", None))
     out = capsys.readouterr().out

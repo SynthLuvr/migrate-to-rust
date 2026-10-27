@@ -1,8 +1,8 @@
 """Regression tests for issue #20: every IO/usage-error path must emit the
-uniform JSON error envelope on stdout (README "Uniform conventions" — a
-refusal is a result, not a crash), with ``summary.exit_code`` mirroring the
-process exit code. One representative failure per tool, plus subprocess-level
-reproductions of the two original repros to prove the ``__main__`` wiring."""
+uniform JSON error envelope on stdout (a refusal is a result, not a
+crash), with ``summary.exit_code`` mirroring the process exit code. One
+representative failure per tool, plus subprocess-level reproductions of
+the two original repros to prove the ``__main__`` wiring."""
 
 from __future__ import annotations
 
@@ -13,11 +13,13 @@ import sys
 import pytest
 
 import _common
+import port_plan
+from _common import run_cli
 from conftest import REPO_ROOT, TOOLS, run_tool
 
 
 def _assert_envelope(code: int, out: dict, *, kind: str, exit_code: int = 1) -> str:
-    """The envelope contract: error.kind/detail present, and the documented
+    """Assert the envelope contract: error.kind/detail present and
     summary.exit_code == actual exit code, so stdout parsers never crash."""
     assert code == exit_code
     assert out["error"]["kind"] == kind
@@ -28,7 +30,7 @@ def _assert_envelope(code: int, out: dict, *, kind: str, exit_code: int = 1) -> 
     return detail
 
 
-# ------------------------------------------------- helper shape (the spec) --
+# ------------------------------------------------------ helper shape (spec)
 
 def test_emit_error_envelope_shape(capsys):
     code = _common.emit_error("boom", tool="t.py", version=1)
@@ -49,7 +51,7 @@ def test_run_cli_genuine_bugs_still_crash():
         _common.run_cli(buggy, tool="t.py", version=1)
 
 
-# ---------------------------------------------------- the two issue repros --
+# --------------------------------------------------- the two issue #20 repros
 
 def test_issue20_repro_contract_extract_missing_python_file(monkeypatch, capsys, tmp_path):
     """Repro 1: unit's python file missing -> JSON envelope, not a bare
@@ -103,7 +105,7 @@ def test_issue20_subprocess_port_plan(tmp_path):
     assert proc.stderr == ""
 
 
-# --------------------------- one representative refusal per tool (8/8) ----
+# ------------------------- one representative refusal per tool (8/8)
 
 def test_port_plan_hotspot_path_not_found(monkeypatch, capsys, tmp_path):
     hotspots = tmp_path / "hotspots.json"
@@ -123,19 +125,6 @@ def test_port_plan_hotspots_not_a_list(monkeypatch, capsys, tmp_path):
                          ["plan", "--hotspots", str(hotspots),
                           "--project-root", str(tmp_path)])
     _assert_envelope(code, out, kind="usage")
-
-
-def test_contract_extract_missing_python_file(monkeypatch, capsys, tmp_path):
-    state = tmp_path / "state.json"
-    state.write_text(json.dumps({
-        "project": {"name": "demo", "python_path": "src/demo"}, "stage": 2,
-        "units": [{"id": "u1", "python_path": "src/demo/missing.py",
-                   "rust_path": None, "deps": [], "order": 1,
-                   "status": "pending"}]}))
-    code, out = run_tool(monkeypatch, capsys, "contract_extract.py",
-                         ["extract", "--state", str(state), "--root", str(tmp_path)])
-    detail = _assert_envelope(code, out, kind="io")
-    assert "u1" in detail and "src/demo/missing.py" in detail
 
 
 def test_contract_extract_state_has_no_units(monkeypatch, capsys, tmp_path):
@@ -221,7 +210,7 @@ def test_upstream_watch_not_a_git_repo(monkeypatch, capsys, tmp_path, mini_state
     assert "not a git repository" in detail
 
 
-# ---------------------------------------------------- malformed JSON input --
+# ------------------------------------------------------ malformed JSON input
 
 def test_malformed_json_input_is_a_refusal_not_a_crash(monkeypatch, capsys, tmp_path):
     """The boundary turns OSError/ValueError from input files (missing,
@@ -238,8 +227,6 @@ def test_malformed_json_input_is_a_refusal_not_a_crash(monkeypatch, capsys, tmp_
 def test_human_flag_echoes_error_summary_to_stderr(capsys, tmp_path):
     """--human must behave identically on error envelopes: JSON on stdout,
     the embedded summary echoed to stderr."""
-    import port_plan
-    from _common import run_cli
     code = run_cli(port_plan.main,
                    ["--human", "plan", "--hotspots", str(tmp_path / "no.json"),
                     "--project-root", str(tmp_path)],
