@@ -95,7 +95,25 @@
               "notice_ok": { "type": "boolean" }
             }
           },
-          "review_verdict": { "enum": ["pending", "approve", "fix", "escalate"] }
+          "review_verdict": { "enum": ["pending", "approve", "fix", "escalate"] },
+          "notes": {
+            "type": "string",
+            "$comment": "per-unit audit trail; prose for humans (tools/glv-subagents.md)"
+          },
+          "sessions": {
+            "type": "array",
+            "$comment": "per-unit session audit trail when delegates run as GLV sessions; the orchestrator, never a delegate, writes these",
+            "items": {
+              "type": "object",
+              "required": ["id", "name", "role"],
+              "properties": {
+                "id": { "type": "string", "$comment": "GLV session id" },
+                "name": { "type": "string", "$comment": "unit-<unit-id>-translator-c<k> / -reviewer-r<n>, -retry suffix on requeue" },
+                "role": { "enum": ["translator", "reviewer"] },
+                "outcome": { "type": "string" }
+              }
+            }
+          }
         }
       }
     },
@@ -105,9 +123,28 @@
         "type": "object",
         "required": ["gate", "state"],
         "properties": {
-          "gate": { "enum": ["go_no_go", "redesign_approval", "unit_escalation", "cutover", "crate_substitution"] },
+          "gate": {
+            "enum": ["go_no_go", "scope_change", "redesign_approval", "unit_escalation", "cutover", "crate_substitution"],
+            "$comment": "scope_change = MIGRATION_PROMPT.md mandatory gate 'any scope change later'"
+          },
           "state": { "enum": ["open", "approved", "rejected"] },
           "note": { "type": "string" }
+        }
+      }
+    },
+    "journal": {
+      "type": "array",
+      "$comment": "append-only transition log; every state.py write appends one entry — 'every state transition journaled' (tools/README.md #4)",
+      "items": {
+        "type": "object",
+        "required": ["timestamp", "unit", "field", "from", "to"],
+        "properties": {
+          "timestamp": { "type": "string", "format": "date-time" },
+          "unit": { "type": ["string", "null"], "$comment": "unit id, or null for project-level fields (e.g. stage)" },
+          "field": { "type": "string", "$comment": "dotted path to the changed field, e.g. stage or units[u3].status" },
+          "from": { "$comment": "any JSON value; null = previously unset" },
+          "to": { "$comment": "any JSON value; null = now unset" },
+          "actor": { "type": "string", "$comment": "who made the transition: orchestrator, state.py, or a GLV session id" }
         }
       }
     },
