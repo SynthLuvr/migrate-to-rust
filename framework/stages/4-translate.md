@@ -15,7 +15,8 @@ the agent spends most of its budget. Loop spec: `MIGRATION_PROMPT.md`.
    arXiv:2606.08444).
 4. Compile each candidate; feed compiler errors back as-is (strongest signal;
    explanation-only feedback is weak).
-5. Rank by the **oracle** (`oracle.py`), never by model confidence.
+5. Rank by the **oracle** (`python framework/tools/oracle.py judge
+   --manifest manifests/<unit>.json`), never by model confidence.
 6. Bounded fix loop on the best candidate: executable diffs from the oracle
    only; `MAX_ROUNDS` and token budget per unit enforced in the state file.
 7. On stall: record best candidate + exact failing diff → `status: escalated`.
