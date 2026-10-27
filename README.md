@@ -9,7 +9,7 @@ A research-grounded design for a framework that helps **AI agents migrate Python
 | **[SUMMARY.md](SUMMARY.md)** | The research synthesis: verified case studies with numbers, the 10 evidence-backed requirements, the framework architecture, honest caveats |
 | **[TOOLCHAIN.md](TOOLCHAIN.md)** | The tool list, organized by pipeline stage — what to adopt off-the-shelf vs what the framework must build |
 | **[research/](research/)** | 6 source files (~1,100 lines): case studies, manual-migration lessons, tool catalog with maintenance verification, academic literature, idiom/ecosystem mapping — every quantitative claim carries its source URL; unverifiable claims are flagged |
-| **[framework/](framework/)** | The executable packaging of the research: agent prompt, goose orchestrator recipe, 8 stage checklists, translator/reviewer roles, 8 gap-tool specs, crate-substitution knowledge, and the migration state schema |
+| **[framework/](framework/)** | The executable packaging of the research: agent prompt, goose orchestrator recipe, 8 stage checklists, translator/reviewer roles, 8 gap-tool specs, the GLV subagent-transport guide, crate-substitution knowledge, and the migration state schema |
 
 ## The one-paragraph thesis
 

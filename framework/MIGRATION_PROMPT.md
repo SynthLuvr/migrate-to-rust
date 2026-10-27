@@ -101,6 +101,11 @@ Divergent / Incomparable`; every Divergent carries a written explanation.
   (refcounts, PyErr hygiene, GIL detach, free-threading) + attribution diff.
   Use a *different* model for review than translation if available —
   Volatility3 found this cheaper *and* better.
+- **transport** ([`tools/glv-subagents.md`](tools/glv-subagents.md)): when a
+  GLV server ([SynthLuvr/glv](https://github.com/SynthLuvr/glv)) is
+  reachable, run these roles as GLV sessions over its HTTP API — one
+  session per role invocation. The oracle still judges; GLV only carries
+  the roles.
 
 ## Escalation to humans — mandatory gates
 
