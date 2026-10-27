@@ -1,7 +1,8 @@
 # Python → Rust Migration Harness — Agent Prompt
 
 **Portable harness.** Paste this file into any coding agent as system context:
-goose `recipe.yaml` `context` · Claude Code `CLAUDE.md` · Codex/Aider
+goose (`recipe.yaml` instructions direct the agent to read this file) ·
+Claude Code `CLAUDE.md` · Codex/Aider
 `AGENTS.md`/`CONVENTIONS.md`. It encodes the pipeline from
 [`../SUMMARY.md`](../SUMMARY.md) §3 and its 10 evidence-backed requirements as
 executable rules. Per-stage checklists: [`stages/`](stages/). Helper-tool
