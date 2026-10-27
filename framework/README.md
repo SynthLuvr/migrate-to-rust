@@ -25,7 +25,7 @@ agent can execute directly, rather than merely read.
 | `stages/0..7-*.md` | Per-stage checklists: purpose, steps, **exit criteria**, escalation triggers |
 | `roles/translator.md` | Subagent instructions for mechanical per-unit translation |
 | `roles/reviewer.md` | Subagent instructions for adversarial parity + PyO3-FFI review |
-| `tools/README.md` | Build specs for the 8 verified gaps — deterministic helpers to build **before** migrating |
+| `tools/*.py` + `tools/README.md` | The 8 deterministic helpers — implemented, stdlib-only, JSON-in/JSON-out, acceptance-tested in `tools/tests/` (specs, conventions, and quick reference in `tools/README.md`) |
 | `knowledge/substitutions.json` | Machine-readable crate mapping + no-equivalent zones (from `research/5`) |
 | `state/migration-state.schema.json` | The dual-build state manager schema — the resumable, per-unit-reversible record |
 
@@ -51,8 +51,11 @@ agent can execute directly, rather than merely read.
 - [ ] Confirm rust-template is reachable — `git clone
       https://github.com/SynthLuvr/rust-template` must work (Stage 3
       instantiates the crate from it; see `stages/3-scaffold.md`)
-- [ ] Build or stub the `tools/*.py` helpers to their acceptance criteria —
-      the parity oracle (gap #1) is non-negotiable before any translation
+- [x] The `tools/*.py` helpers are implemented and acceptance-tested
+      (`python -m pytest framework/tools/tests/`); verify your environment
+      runs them (Python ≥ 3.10, stdlib only) and re-run
+      `python framework/tools/oracle.py self-test` — the parity oracle
+      (gap #1) is non-negotiable before any translation
 - [ ] Point `recipe.yaml` at your target project and provider/model
 - [ ] Confirm the target's test suite is green and substantive enough to act
       as the spec (Stage 2 will stop you if not)
