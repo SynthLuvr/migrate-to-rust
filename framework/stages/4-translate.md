@@ -9,8 +9,7 @@ the agent spends most of its budget. Loop spec: `MIGRATION_PROMPT.md`.
    K = 3 candidates. Strict file partitioning: a delegate touches only its
    assigned files and never the state file. Different units may proceed in
    parallel; shared parents wait for all children. With a reachable GLV
-   server, run each delegate as a GLV session per `tools/glv-subagents.md`
-   — one worktree per in-flight unit, `-c<k>` session names.
+   server, run each delegate as a GLV session per `tools/glv-subagents.md`.
 3. Run the mechanical import fixer first — most compile failures are
    mis-imported *real* modules, not hallucinated crates (>50% per
    arXiv:2606.08444).
@@ -22,8 +21,7 @@ the agent spends most of its budget. Loop spec: `MIGRATION_PROMPT.md`.
 7. On stall: record best candidate + exact failing diff → `status: escalated`.
 8. Reviewer subagent (`roles/reviewer.md`) re-runs the oracle on **fresh
    inputs** and checks FFI/attribution before any verdict is recorded —
-   on a different model pin, over the GLV transport when in use
-   (`tools/glv-subagents.md`).
+   over the GLV transport when in use (`tools/glv-subagents.md`).
 9. Update state after every unit; Python fallback stays live for unported units.
 
 ## Exit criteria

@@ -20,13 +20,10 @@ stateless and JSON-in/JSON-out so the agent can compose them.
 
 ## External helper — GLV subagent transport
 
-GLV ([SynthLuvr/glv](https://github.com/SynthLuvr/glv)) is **not** one of
-the eight scripts above — it is the transport this framework's *role
-separation* runs on when a GLV server is reachable: the orchestrator
-launches translator and reviewer subagents as GLV sessions over its JSON
-API, parks on the `/wait` long-poll, and reads their reports back as
-transcripts. Spec, cheat sheet, and the delegation loop:
-[`glv-subagents.md`](glv-subagents.md).
+GLV ([SynthLuvr/glv](https://github.com/SynthLuvr/glv)) is not one of the
+eight scripts — it is the transport the framework's *role separation* runs
+on when a GLV server is reachable. Spec, API cheat sheet, and delegation
+loop: [`glv-subagents.md`](glv-subagents.md).
 
 ## Minimal viable subset
 If you only build three things before starting: **#1 oracle**, **#4 state**,

@@ -25,9 +25,7 @@ instructions: |
      same file to two delegates. Review every unit with
      framework/roles/reviewer.md before recording a verdict. If a GLV
      server (SynthLuvr/glv) is reachable, run the delegates as GLV
-     sessions per framework/tools/glv-subagents.md — one session per role
-     invocation, a distinct model pin for the reviewer, and one git
-     worktree per concurrent translator unit.
+     sessions per framework/tools/glv-subagents.md.
   5. Update the state file after every unit. It is the resumable,
      per-unit-reversible record; the Python implementation remains the live
      fallback for any unit not marked "ported".

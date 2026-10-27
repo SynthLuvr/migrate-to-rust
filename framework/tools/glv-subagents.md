@@ -9,8 +9,7 @@ pass is a GLV session the orchestrator starts, waits on, and reads back.
 The oracle still decides — GLV only carries the roles.
 
 Source of truth for every path and field below: `GET /api/openapi.json`
-on the running server. This file describes the delegation surface and
-the pipeline discipline that binds over it.
+on the running server.
 
 ## Prerequisites
 
@@ -20,8 +19,8 @@ the pipeline discipline that binds over it.
 
    ```bash
    glv token create migrate-orchestrator
-   # raw token on stdout (pipe-capture friendly); expires in 30 days,
-   # only its SHA-256 hash is stored
+   # raw token on stdout; expires in 30 days; only its SHA-256
+   # hash is stored
    ```
 
    No filesystem access to the GLV data dir (SSH port-forward, sibling
@@ -40,7 +39,7 @@ the pipeline discipline that binds over it.
    accepts the bearer only, GET also accepts a browser session cookie.
    `/api/*` answers 401 as JSON — never an HTML login redirect.
 
-## API cheat sheet — the delegation surface
+## API cheat sheet
 
 | Purpose | Call | Notes |
 |---|---|---|
@@ -81,9 +80,9 @@ Quick human lookups without HTTP: `glv sessions`, `glv view <id>`,
 - **The prompt is the role sheet + the assignment.** Compose
   `roles/translator.md` (or `roles/reviewer.md`) verbatim, then the
   unit id, the contract path, the Python source paths, the worktree
-  path, and the exact reporting format the role demands. Files outside
-  `working_dir` ride as `uploads`; GLV saves them and appends their
-  paths to the prompt. Delegates read what they need from disk.
+  path, and the exact reporting format the role demands. Delegates read
+  what they need from disk; files outside `working_dir` ride as
+  `uploads` (GLV saves them and appends their paths to the prompt).
 - **Repair rounds are follow-ups on the same session.** Feed the
   oracle's failing diff back with `POST /api/sessions/:id/prompt` — the
   candidate's history is the context. Every follow-up counts against
@@ -119,7 +118,8 @@ Per unit, in leaf-first dependency order:
    `completed`, page the transcript with `after=` and extract the best
    candidate + the reported per-run verdicts. On `error`/`stopped`,
    read the transcript tail for the failure, requeue **once** (fresh
-   session, `-retry` name), then mark `escalated` per hard rule 6.
+   session, `-retry` name), then mark `escalated` per `MIGRATION_PROMPT.md`
+   hard rule 6.
 3. Reviewer pass on a different model pin. Verdicts are
    `APPROVE` / `FIX` / `ESCALATE`: `FIX` loops via `/prompt` (counted
    against `MAX_ROUNDS`); `ESCALATE` goes to the human queue with both
@@ -143,8 +143,8 @@ Per unit, in leaf-first dependency order:
   six-slot queue is pipeline throughput.
 - **Attribution survives the hop.** Code reaches the repo only through
   the orchestrator's commit discipline (provenance headers, checked by
-  `attribution.py`). Session transcripts are audit trail; the state
-  file's unit notes carry the session ids as provenance metadata.
+  `attribution.py`).
 - **Expired tokens.** Tokens live 30 days. A sudden run of 401s on a
-  long migration means mint a fresh one (`glv token create`) and update
-  `GLV_API_TOKEN` — never fall back to riding a browser cookie.
+  long migration means the token expired — mint a fresh one
+  (`glv token create`) and update `GLV_API_TOKEN`. Never fall back to
+  riding a browser cookie.
