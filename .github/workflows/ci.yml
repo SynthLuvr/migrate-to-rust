@@ -71,8 +71,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: HEAD-check cited URLs (dfrws.org 403s bots — allowlisted)
-        run: python scripts/check_links.py --external --allow-host dfrws.org
+      - name: HEAD-check cited URLs (bot-blocked hosts allowlisted)
+        # dfrws.org 403s automated checks (#10); reddit 403s datacenter IPs
+        # (GitHub runners) while serving residential requests fine.
+        run: python scripts/check_links.py --external --allow-host dfrws.org --allow-host www.reddit.com
 
   state-schema:
     name: state schema + examples
