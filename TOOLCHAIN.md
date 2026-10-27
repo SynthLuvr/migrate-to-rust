@@ -57,7 +57,7 @@
 
 | Tool | Role | Status |
 |---|---|---|
-| ★ **rust-template** | First-party scaffold ([SynthLuvr/rust-template](https://github.com/SynthLuvr/rust-template)): fmt/clippy/docs/coverage/deny/unused-deps gates + MSRV + CI pre-wired — Stage 3 scaffolds from it; add only nextest/miri/maturin on top | first-party (created 2026-10-27) |
+| ★ **rust-template** | First-party scaffold ([SynthLuvr/rust-template](https://github.com/SynthLuvr/rust-template)): fmt/clippy/docs/coverage/deny/unused-deps gates + MSRV + CI pre-wired — Stage 3 instantiates the crate from it (copy the tree; keep its gates and AGENTS.md workflow); its `just` tasks are the gate interface through Stage 5; add only nextest/miri/maturin on top | first-party (created 2026-10-27) |
 | ★ **clippy** + **rustfmt** | Non-negotiable hygiene gates in CI | active |
 | ★ **miri** | Undefined-behavior detector — caught a bug that appeared *only in optimized builds* in the tsrs project | active |
 | ★ **cargo-nextest** | Fast parallel test runner for the tight agent loop | active |

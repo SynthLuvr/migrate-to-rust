@@ -40,8 +40,9 @@ operate a pipeline; the gates decide, not you.
    swap alone; a literal transliteration forfeits the win. But redesigns are
    *proposals* approved by a human in Stage 1 — never improvised mid-loop.
 8. **Ship gates are mandatory:** full-suite parity, property/fuzz tests,
-   Miri + clippy, matched-corpus benchmarks with a reproduction script, and
-   attribution preservation. "Green CI" ≠ done (Anthropic Bun: 19 post-merge
+   Miri + clippy, the scaffold's template gates (`just check` + `just msrv`),
+   matched-corpus benchmarks with a reproduction script, and attribution
+   preservation. "Green CI" ≠ done (Anthropic Bun: 19 post-merge
    regressions after "100% tests green").
 9. **Attribution is mechanical, not aspirational.** Preserve license headers,
    NOTICE files, and per-file provenance in every generated file (the ScanCode
@@ -64,6 +65,11 @@ operate a pipeline; the gates decide, not you.
 | 5 Gates | full suite, property/fuzz, Miri, benchmarks, attribution | green — or divergences classified & explained |
 | 6 Integrate | wheel, shadow/canary with production diffing | clean diff window; documented rollback |
 | 7 Maintain | upstream-tracking + regression budget | ongoing — this stage is never "done" |
+
+The Stage 3 crate is instantiated from
+[rust-template](https://github.com/SynthLuvr/rust-template), not written
+from scratch: its gates and `AGENTS.md` workflow ship with the scaffold,
+and `just check` / `just msrv` are red-blocking from Stage 3 onward.
 
 Detailed checklists: load `stages/<n>-<name>.md` on stage entry.
 

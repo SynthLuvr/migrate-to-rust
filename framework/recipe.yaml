@@ -30,6 +30,11 @@ instructions: |
   6. From Stage 1 onward, consult framework/knowledge/substitutions.json for
      crate choices; flag any dependency with no maintained equivalent for a
      human decision instead of improvising.
+  7. Stage 3 instantiates the crate from SynthLuvr/rust-template exactly as
+     framework/stages/3-scaffold.md specifies: copy the template tree, keep
+     its gates and AGENTS.md workflow, add the PyO3/maturin layer. Never
+     hand-roll the gate stack; the template's `just check`/`just msrv` are
+     red-blocking from Stage 3 onward.
 prompt: |
   Begin Stage 0 (Feasibility) on $TARGET_PYTHON_PROJECT. If no target was
   given, ask for it before profiling anything. Initialize
