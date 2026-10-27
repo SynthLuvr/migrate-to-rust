@@ -11,7 +11,13 @@ passes the coherence checks of [`../tools/state.py`](../tools/state.py)
 `validate`, and the oracle verdict is **unmodified output of** [`../tools/oracle.py`](../tools/oracle.py)
 `judge`, reproducible with one command.
 
-The snapshot is mid-**Stage 7** and deliberately shows **one unit in each
+The snapshot is mid-**Stage 7** of an **L3 autopilot run** (issue #22): the
+`autonomy` block records the pre-authorized level, `run_status` is the
+terminal `complete` (Stage 7 maintenance continues past it by design), and
+every gate carries its journaled resolution — `decided_by` is
+`policy:<rule-id>` + `policy_version` + `evidence[]` where the autonomy
+policy decided, and `human` where the operator overrode it (the
+`scope_change` gate). It deliberately shows **one unit in each
 of the six statuses** — including the two you never see in a clean demo:
 `fallback_python` and `retired`. A sibling instance,
 [`../state/examples/stage4-mid-migration.json`](../state/examples/stage4-mid-migration.json),
@@ -22,7 +28,7 @@ pending).
 
 | Path | What it is | Produced by |
 |---|---|---|
-| [`migration-state.json`](migration-state.json) | The dual-build state file: 6 units, one per status, full `journal[]`, 5 human gates, budget ledger | Stages 0–7, written only through `tools/state.py` |
+| [`migration-state.json`](migration-state.json) | The dual-build state file: 6 units, one per status, full `journal[]`, 5 gates with journaled resolutions, autonomy block + terminal `run_status`, budget ledger | Stages 0–7, written only through `tools/state.py` |
 | [`contracts/u-tokenize-1.contract.json`](contracts/u-tokenize-1.contract.json) | One Stage-2 per-unit contract (covering tests, signatures, invariants, golden corpus) | Stage 2, normally via `tools/contract_extract.py extract` |
 | [`oracle/manifests/u-tokenize-1.json`](oracle/manifests/u-tokenize-1.json) | Judge manifest: reference entry, candidate entry, corpus, normalization overrides | Stage 2 step 3 / Stage 4 step 5 |
 | [`oracle/manifests/reference_tokenizer.py`](oracle/manifests/reference_tokenizer.py) | The Python side, as the oracle runs it (`module:function` over stdin JSONL) | the unit's live module |
@@ -34,9 +40,11 @@ pending).
 ## Stage-by-stage: which step produced which artifact
 
 **Stage 0 — Feasibility** ([`../stages/0-feasibility.md`](../stages/0-feasibility.md))
-→ `migration-state.json` `go_no_go`: the signed scope (5 modules), the
-projection (58% end-to-end saving — above the ≥ 50% bar), and the
-`go_no_go` **human gate** recorded as approved. No units exist yet.
+→ `migration-state.json` `go_no_go`: the scope (5 modules), the projection
+(58% end-to-end saving — above the ≥ 50% bar), and the `go_no_go` gate
+resolved by **policy rule GO-1** (`decided_by: "policy:GO-1"`, evidence
+journaled — this snapshot is an L3 autopilot run; at L0/L1 the same gate
+carries `decided_by: "human"`). No units exist yet.
 
 **Stage 1 — Plan** ([`../stages/1-plan.md`](../stages/1-plan.md)) → the
 `units[]` backbone: every unit enters as `status: pending` with `deps[]`,
@@ -76,9 +84,11 @@ each transition with its actor:
   written `divergence_note` and a human ruling. This is the Volatility3
   pattern the stage's exit criteria name.
 - `u-index-4`: **escalated** — 5 rounds exhausted (`budget.exhausted`),
-  which auto-opened the `unit_escalation` human gate. The fix needs a
-  redesign, and redesigns are Stage-1-semantics proposals — never
-  improvised mid-loop.
+  which opened the `unit_escalation` gate; at L2+ policy rule ESC-1
+  resolved it as **deferred** (`decided_by: "policy:ESC-1"`): the unit
+  keeps its Python fallback live and drains into the end-of-run escalation
+  dossier instead of halting the run. The fix needs a redesign, and
+  redesigns are Stage-1-semantics proposals — never improvised mid-loop.
 
 **Stage 5 — Gates** ([`../stages/5-gates.md`](../stages/5-gates.md)) →
 `u-score-5`: **fallback_python**. The port passed every correctness gate,
@@ -88,7 +98,10 @@ Python is the documented success outcome, not a failure; the per-unit
 fallback switch (never deleted) keeps the Rust candidate one env var away.
 
 **Stage 6 — Integration** ([`../stages/6-integrate.md`](../stages/6-integrate.md))
-→ the `cutover` gate (approved) and the `stage` 5→6→7 journal entries. The
+→ the `cutover` gate (approved by **policy rule CUT-1** — shadow diff 0.0
+over 400k sampled requests, canary green past the window, rollback tested;
+at L2 the same rule resolves *rejected*: publish disabled, the run
+completes on the dual-build) and the `stage` 5→6→7 journal entries. The
 Python fallback stays callable per unit — that is what makes rollback a
 config change, not a rebuild.
 
@@ -100,10 +113,13 @@ config change, not a rebuild.
   the only unit where `rust_path` is the sole implementation. The journal
   shows the full arc: `pending → ported → retired`.
 - `u-featurize-6`: **pending** again — the upstream watcher flagged a new
-  feature, a `scope_change` gate was opened and approved, and the backlog
-  re-opened. Maintenance mode extends the state machine; it doesn't freeze
-  it. The `budget_ledger.regression_triage_hours` (31h ≈ 2× migration
-  effort) is the pre-committed Stage-7 regression budget.
+  feature, a `scope_change` gate was opened, and the operator approved it
+  out-of-band (`decided_by: "human"` — a human may still decide any gate at
+  any level; the policy default SC-1 would have rejected and asked for a
+  fresh Stage-0 run). Maintenance mode extends the state machine; it
+  doesn't freeze it. The `budget_ledger.regression_triage_hours`
+  (31h ≈ 2× migration effort) is the pre-committed Stage-7 regression
+  budget.
 
 ## The six statuses at a glance
 
@@ -111,7 +127,7 @@ config change, not a rebuild.
 |---|---|---|---|
 | `u-dedupe-2` | `ported` | oracle-equivalent first candidate; fallback still callable | Rust |
 | `u-shingle-3` | `divergent_explained` | 209/210 parity; the one divergence is human-ruled and written down | Rust |
-| `u-index-4` | `escalated` | 5 rounds exhausted; redesign proposal in the human queue | Python |
+| `u-index-4` | `escalated` | 5 rounds exhausted; deferred via policy:ESC-1, redesign proposal in the end-of-run dossier | Python |
 | `u-score-5` | `fallback_python` | port was correct but not faster than optimized Python — human kept Python | Python |
 | `u-tokenize-1` | `retired` | two stable quarters; Python fallback deliberately removed | Rust only |
 | `u-featurize-6` | `pending` | added later by an approved scope change; untouched | Python |
@@ -165,15 +181,20 @@ these verdicts — never from model confidence.
   `migration-state.json` against the schema on every push, via
   `python framework/state/check_examples.py` — which also asserts the
   example corpus covers **all six statuses** and the guarded fields
-  (`journal[]`, `scope_change` gate, unit `notes`/`sessions`).
+  (`journal[]`, `scope_change` gate, unit `notes`/`sessions`, and the
+  issue-#22 autonomy layer: policy-decided and human-decided gates, an
+  L2/L3 `autonomy` block, and a terminal `run_status`).
 - `python framework/tools/state.py validate framework/examples/migration-state.json`
   (stdlib-only, also in CI) adds the coherence checks the schema can't
   express: dangling deps, cycles, leaf-first order, unexplained
-  divergences, and journal-vs-current-state agreement.
+  divergences, journal-vs-current-state agreement, and the gate-resolution
+  discipline (a resolved gate always records `decided_by`; a policy-approved
+  cutover requires L3 + `publish_allowed`).
 - The state file's `journal[]` is internally consistent: the last journaled
   status transition of every unit equals its current status — nothing was
   edited out-of-band.
 
 Fictional, but not lazy: the artifacts cross-reference exactly the way a
 real run's would (state contract ↔ contract.json, `judge_validation` ↔ the
-oracle demo, human gates ↔ the journal entries that opened/approved them).
+oracle demo, gates ↔ the journal entries that opened/resolved them with
+`decided_by` + evidence).

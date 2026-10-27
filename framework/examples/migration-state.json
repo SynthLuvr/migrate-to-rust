@@ -1,5 +1,5 @@
 {
-  "$comment": "Worked example (issue #7): a filled migration-state.json for the fictional project 'duplifind', snapshot mid-Stage 7, deliberately showing one unit in each of the six statuses. Validates against migration-state.schema.json (CI: framework/state/check_examples.py) and passes the coherence checks of tools/state.py validate. Walkthrough: README.md next to this file.",
+  "$comment": "Worked example (issue #7): a filled migration-state.json for the fictional project 'duplifind', snapshot mid-Stage 7 of an L3 autopilot run (issue #22), deliberately showing one unit in each of the six statuses. Validates against migration-state.schema.json (CI: framework/state/check_examples.py) and passes the coherence checks of tools/state.py validate. Walkthrough: README.md next to this file.",
   "project": {
     "name": "duplifind",
     "python_path": "src/duplifind",
@@ -21,7 +21,7 @@
       "end_to_end_saving_pct": 58.0
     },
     "no_equivalent_deps": [],
-    "approved_by": "mreyes"
+    "approved_by": "policy:GO-1"
   },
   "judge_validation": {
     "injected_bugs": 5,
@@ -48,7 +48,7 @@
         "invariants": [
           "Invariant: tokens are lowercased, NFC-normalized, split on whitespace",
           "Invariant: empty input raises ValueError (never returns [])",
-          "Postcondition: duplicates and input order are preserved — dedupe is a separate unit"
+          "Postcondition: duplicates and input order are preserved \u2014 dedupe is a separate unit"
         ],
         "golden_corpus": "corpora/tokenize-golden.jsonl"
       },
@@ -62,10 +62,17 @@
         "last_verdict": "equivalent"
       },
       "attempts": 2,
-      "budget": { "max_rounds": 5, "tokens_spent": 52000, "exhausted": false },
-      "attribution": { "header_preserved": true, "notice_ok": true },
+      "budget": {
+        "max_rounds": 5,
+        "tokens_spent": 52000,
+        "exhausted": false
+      },
+      "attribution": {
+        "header_preserved": true,
+        "notice_ok": true
+      },
       "review_verdict": "approve",
-      "notes": "First unit ported (Stage 4, candidate c2; c1 missed NFC normalization, 2/250 divergent). Stable in Rust since 2026-06-18; Python fallback retired 2026-10-15 after the agreed two-quarter stability window (Stage 7 step 4) — the rust side is now the only side. The Stage-2 judge-first demo for this unit is preserved in oracle/u-tokenize-1.verdict.json.",
+      "notes": "First unit ported (Stage 4, candidate c2; c1 missed NFC normalization, 2/250 divergent). Stable in Rust since 2026-06-18; Python fallback retired 2026-10-15 after the agreed two-quarter stability window (Stage 7 step 4) \u2014 the rust side is now the only side. The Stage-2 judge-first demo for this unit is preserved in oracle/u-tokenize-1.verdict.json.",
       "sessions": [
         {
           "id": "sess_01hwq0t5d2k",
@@ -91,7 +98,9 @@
       "id": "u-dedupe-2",
       "python_path": "src/duplifind/dedupe.py",
       "rust_path": "crates/duplifind-core/src/units/u_dedupe_2.rs",
-      "deps": ["u-tokenize-1"],
+      "deps": [
+        "u-tokenize-1"
+      ],
       "order": 2,
       "contract": {
         "covering_tests": [
@@ -105,7 +114,9 @@
         ],
         "golden_corpus": "corpora/dedupe-golden.jsonl"
       },
-      "risk_flags": ["dict-ordering dependence"],
+      "risk_flags": [
+        "dict-ordering dependence"
+      ],
       "status": "ported",
       "parity": {
         "runs": 240,
@@ -115,8 +126,15 @@
         "last_verdict": "equivalent"
       },
       "attempts": 1,
-      "budget": { "max_rounds": 5, "tokens_spent": 29000, "exhausted": false },
-      "attribution": { "header_preserved": true, "notice_ok": true },
+      "budget": {
+        "max_rounds": 5,
+        "tokens_spent": 29000,
+        "exhausted": false
+      },
+      "attribution": {
+        "header_preserved": true,
+        "notice_ok": true
+      },
       "review_verdict": "approve",
       "notes": "BTreeSet replaces the CPython dict used as an ordered set; first-occurrence order carried by an index vector, so dict-ordering risk never materialized. Oracle equivalent 240/240 on the first candidate. Python fallback still live (Stage 7 retires it deliberately, unit by unit)."
     },
@@ -124,7 +142,9 @@
       "id": "u-shingle-3",
       "python_path": "src/duplifind/shingle.py",
       "rust_path": "crates/duplifind-core/src/units/u_shingle_3.rs",
-      "deps": ["u-tokenize-1"],
+      "deps": [
+        "u-tokenize-1"
+      ],
       "order": 3,
       "contract": {
         "covering_tests": [
@@ -138,7 +158,9 @@
         ],
         "golden_corpus": "corpora/shingle-golden.jsonl"
       },
-      "risk_flags": ["float semantics"],
+      "risk_flags": [
+        "float semantics"
+      ],
       "status": "divergent_explained",
       "parity": {
         "runs": 210,
@@ -146,13 +168,20 @@
         "divergent": 1,
         "incomparable": 0,
         "last_verdict": "divergent",
-        "divergence_note": "Corpus run i=137 feeds a NaN shingle weight: the Python reference propagates it into a NaN-poisoned score, the Rust candidate raises ValueError (int/float semantics were not the issue; error-vs-value is). Human ruling 2026-07-21: rejecting non-finite weights is the contract going forward — reference updated after cutover planning, release note written. Divergence recorded, never normalized away."
+        "divergence_note": "Corpus run i=137 feeds a NaN shingle weight: the Python reference propagates it into a NaN-poisoned score, the Rust candidate raises ValueError (int/float semantics were not the issue; error-vs-value is). Human ruling 2026-07-21: rejecting non-finite weights is the contract going forward \u2014 reference updated after cutover planning, release note written. Divergence recorded, never normalized away."
       },
       "attempts": 3,
-      "budget": { "max_rounds": 5, "tokens_spent": 71000, "exhausted": false },
-      "attribution": { "header_preserved": true, "notice_ok": true },
+      "budget": {
+        "max_rounds": 5,
+        "tokens_spent": 71000,
+        "exhausted": false
+      },
+      "attribution": {
+        "header_preserved": true,
+        "notice_ok": true
+      },
       "review_verdict": "approve",
-      "notes": "Ships with one explained divergence (209/210 exact) — the Volatility3 pattern: exact parity everywhere except where a written, human-ruled explanation exists. Oracle verdict stays 'divergent' honestly; the explanation is the deliverable, not a silenced judge. Python fallback live.",
+      "notes": "Ships with one explained divergence (209/210 exact) \u2014 the Volatility3 pattern: exact parity everywhere except where a written, human-ruled explanation exists. Oracle verdict stays 'divergent' honestly; the explanation is the deliverable, not a silenced judge. Python fallback live.",
       "sessions": [
         {
           "id": "sess_01hww7c4p8t",
@@ -172,7 +201,10 @@
       "id": "u-index-4",
       "python_path": "src/duplifind/index.py",
       "rust_path": "crates/duplifind-core/src/units/u_index_4.rs",
-      "deps": ["u-tokenize-1", "u-dedupe-2"],
+      "deps": [
+        "u-tokenize-1",
+        "u-dedupe-2"
+      ],
       "order": 4,
       "contract": {
         "covering_tests": [
@@ -186,7 +218,10 @@
         ],
         "golden_corpus": "corpora/index-golden.jsonl"
       },
-      "risk_flags": ["iteration-order dependence", "serialization determinism"],
+      "risk_flags": [
+        "iteration-order dependence",
+        "serialization determinism"
+      ],
       "status": "escalated",
       "parity": {
         "runs": 180,
@@ -194,13 +229,20 @@
         "divergent": 19,
         "incomparable": 0,
         "last_verdict": "divergent",
-        "divergence_note": "19/180 corpus runs serialize the bloom filter with different bytes: FxHashMap iteration order leaks into the byte stream where the reference emits CPython dict insertion order. Query-level parity is 180/180 — the divergence is serialization-only. Minimal repro: escalations/u-index-4.md."
+        "divergence_note": "19/180 corpus runs serialize the bloom filter with different bytes: FxHashMap iteration order leaks into the byte stream where the reference emits CPython dict insertion order. Query-level parity is 180/180 \u2014 the divergence is serialization-only. Minimal repro: escalations/u-index-4.md."
       },
       "attempts": 5,
-      "budget": { "max_rounds": 5, "tokens_spent": 124000, "exhausted": true },
-      "attribution": { "header_preserved": true, "notice_ok": true },
+      "budget": {
+        "max_rounds": 5,
+        "tokens_spent": 124000,
+        "exhausted": true
+      },
+      "attribution": {
+        "header_preserved": true,
+        "notice_ok": true
+      },
       "review_verdict": "escalate",
-      "notes": "Budget exhausted at round 5 (MAX_ROUNDS hit twice — mandatory escalation). Fix requires a deterministic serializer over a BTreeMap: a data-structure redesign, which is a Stage-1-semantics proposal needing human sign-off, never improvised mid-loop. Python fallback is the live side for this unit.",
+      "notes": "Budget exhausted at round 5 (MAX_ROUNDS hit twice \u2014 mandatory escalation). Fix requires a deterministic serializer over a BTreeMap: a data-structure redesign, which is a Stage-1-semantics proposal needing human sign-off, never improvised mid-loop. Python fallback is the live side for this unit.",
       "sessions": [
         {
           "id": "sess_01hx2k9r7m3d",
@@ -212,7 +254,7 @@
           "id": "sess_01hx4n2t8v6y",
           "name": "unit-u-index-4-reviewer-r1",
           "role": "reviewer",
-          "outcome": "ESCALATE — redesign required, out of unit scope"
+          "outcome": "ESCALATE \u2014 redesign required, out of unit scope"
         }
       ]
     },
@@ -220,7 +262,9 @@
       "id": "u-score-5",
       "python_path": "src/duplifind/score.py",
       "rust_path": "crates/duplifind-core/src/units/u_score_5.rs",
-      "deps": ["u-shingle-3"],
+      "deps": [
+        "u-shingle-3"
+      ],
       "order": 5,
       "contract": {
         "covering_tests": [
@@ -234,7 +278,9 @@
         ],
         "golden_corpus": "corpora/score-golden.jsonl"
       },
-      "risk_flags": ["numpy SIMD already near-optimal"],
+      "risk_flags": [
+        "numpy SIMD already near-optimal"
+      ],
       "status": "fallback_python",
       "parity": {
         "runs": 120,
@@ -244,53 +290,99 @@
         "last_verdict": "equivalent"
       },
       "attempts": 1,
-      "budget": { "max_rounds": 5, "tokens_spent": 31000, "exhausted": false },
-      "attribution": { "header_preserved": true, "notice_ok": true },
+      "budget": {
+        "max_rounds": 5,
+        "tokens_spent": 31000,
+        "exhausted": false
+      },
+      "attribution": {
+        "header_preserved": true,
+        "notice_ok": true
+      },
       "review_verdict": "approve",
-      "notes": "The Rust port passed every correctness gate (oracle 120/120 equivalent, miri + clippy green), but the Stage-5 matched-corpus benchmark showed the numpy-vectorized Python side matches it within overlapping confidence intervals (bench verdict + repro corpus committed). Human decision 2026-09-30: keep Python as the live side — 'optimized Python matches the port' is the documented no-win outcome, and keeping Python is a success, not a failure (MIGRATION_PROMPT.md failure-mode table). Rust candidate stays behind the per-unit fallback switch for revisit."
+      "notes": "The Rust port passed every correctness gate (oracle 120/120 equivalent, miri + clippy green), but the Stage-5 matched-corpus benchmark showed the numpy-vectorized Python side matches it within overlapping confidence intervals (bench verdict + repro corpus committed). Human decision 2026-09-30: keep Python as the live side \u2014 'optimized Python matches the port' is the documented no-win outcome, and keeping Python is a success, not a failure (MIGRATION_PROMPT.md failure-mode table). Rust candidate stays behind the per-unit fallback switch for revisit."
     },
     {
       "id": "u-featurize-6",
       "python_path": "src/duplifind/featurize.py",
       "rust_path": null,
-      "deps": ["u-dedupe-2", "u-shingle-3"],
+      "deps": [
+        "u-dedupe-2",
+        "u-shingle-3"
+      ],
       "order": 6,
       "contract": {
-        "covering_tests": ["tests/test_featurize.py::test_feature_vector_len"],
+        "covering_tests": [
+          "tests/test_featurize.py::test_feature_vector_len"
+        ],
         "type_signature": "duplifind.featurize.featurize(tokens: list[str]) -> list[float]",
-        "invariants": ["Invariant: vector length fixed by config.featurize.dim"],
+        "invariants": [
+          "Invariant: vector length fixed by config.featurize.dim"
+        ],
         "golden_corpus": "corpora/featurize-golden.jsonl"
       },
       "risk_flags": [],
       "status": "pending",
-      "notes": "Added 2026-10-24 via an approved scope_change (upstream feature request duplifind#331, surfaced by the Stage-7 upstream watcher). Contract extraction is queued; translation has not started. Units can legitimately be pending during Stage 7 — maintenance mode re-opens the backlog, it does not freeze it."
+      "notes": "Added 2026-10-24 via an approved scope_change (upstream feature request duplifind#331, surfaced by the Stage-7 upstream watcher). Contract extraction is queued; translation has not started. Units can legitimately be pending during Stage 7 \u2014 maintenance mode re-opens the backlog, it does not freeze it."
     }
   ],
   "human_gates": [
     {
       "gate": "go_no_go",
       "state": "approved",
-      "note": "Stage 0: go — 58% projected end-to-end saving on the nightly sweep; I/O share 11% (under the no-go bar)"
+      "note": "Stage 0: go \u2014 58% projected end-to-end saving on the nightly sweep; I/O share 11% (under the no-go bar)",
+      "decided_by": "policy:GO-1",
+      "policy_version": "1.0.0",
+      "evidence": [
+        "end_to_end_saving_pct=58.0 (bar >= 50.0)",
+        "scoped_loc=6400",
+        "scope=duplifind.tokenize,duplifind.dedupe,duplifind.shingle,duplifind.index,duplifind.score"
+      ]
     },
     {
       "gate": "redesign_approval",
       "state": "approved",
-      "note": "Stage 1: k-gram shingles hashed to u64 (dict-of-dicts -> typed struct)"
+      "note": "Stage 1: k-gram shingles hashed to u64 (dict-of-dicts -> typed struct)",
+      "decided_by": "policy:RED-1",
+      "policy_version": "1.0.0",
+      "evidence": [
+        "spike_verdict=equivalent",
+        "bench_improvement_pct=20.0 (bar >= 10)"
+      ]
     },
     {
       "gate": "cutover",
       "state": "approved",
-      "note": "Stage 6: clean shadow window 2026-09-05..09-08 (0 divergent / 0.4M sampled requests); rollback pin kept in the release notes"
+      "note": "Stage 6: clean shadow window 2026-09-05..09-08 (0 divergent / 0.4M sampled requests); rollback pin kept in the release notes",
+      "decided_by": "policy:CUT-1",
+      "policy_version": "1.0.0",
+      "evidence": [
+        "shadow_diff_rate=0.0 (<= 0.0)",
+        "shadow_samples=400000 (>= 1000)",
+        "canary_green_minutes=4320 (>= 60)",
+        "rollback_tested=true (deploys the old pin, verifies, returns)"
+      ]
     },
     {
       "gate": "unit_escalation",
-      "state": "open",
-      "note": "u-index-4 divergent after 5 rounds (bloom-filter bytes); repro + BTreeMap serializer redesign proposal in escalations/u-index-4.md"
+      "state": "deferred",
+      "note": "u-index-4 divergent after 5 rounds (bloom-filter bytes); repro + BTreeMap serializer redesign proposal in escalations/u-index-4.md",
+      "decided_by": "policy:ESC-1",
+      "policy_version": "1.0.0",
+      "evidence": [
+        "unit=u-index-4",
+        "fallback=python (live)",
+        "deferred=drains into the end-of-run escalation dossier"
+      ]
     },
     {
       "gate": "scope_change",
       "state": "approved",
-      "note": "2026-10-24: add duplifind.featurize to scope (upstream #331) — the 'any scope change later' mandatory gate"
+      "note": "2026-10-24: add duplifind.featurize to scope (upstream #331) \u2014 the 'any scope change later' mandatory gate",
+      "decided_by": "human",
+      "evidence": [
+        "override=operator approved out-of-band (policy SC-1 default is reject; a human may still decide any gate at any level)"
+      ]
     }
   ],
   "journal": [
@@ -411,5 +503,15 @@
     "tokens_total": 1890000,
     "hours_human_total": 15.5,
     "regression_triage_hours": 31.0
-  }
+  },
+  "autonomy": {
+    "level": "L3",
+    "policy_version": "1.0.0",
+    "budget": {
+      "max_tokens": 5000000,
+      "max_wall_clock_minutes": 720
+    },
+    "publish_allowed": true
+  },
+  "run_status": "complete"
 }

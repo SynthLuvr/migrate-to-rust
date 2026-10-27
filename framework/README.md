@@ -11,13 +11,29 @@ All relative paths in these artifacts — `stages/<n>-*.md`, `roles/*.md`,
 not in the repo being migrated.
 
 1. **goose (recommended)** — `goose run --recipe framework/recipe.yaml`
-   The recipe is the orchestrator; it enforces stage order, human gates, and
+   The recipe is the orchestrator; it enforces stage order, gate resolution
+   per the pre-authorized autonomy level, and
    the state file. Adjust `settings:` to your provider/model. Run it from
    the **root of this `migrate-to-rust` checkout** — the recipe references
    `framework/...`, `SUMMARY.md`, `TOOLCHAIN.md`, and `research/...`
    relative to that root — and point at a target project elsewhere on disk
    via the recipe's `TARGET_PYTHON_PROJECT` parameter (absolute path), not
    by `cd`-ing into the target repo.
+   **Unattended runs (autonomy L2/L3, issue #22)** — put the deterministic
+   driver in charge instead; it owns the loop and shells out to any CLI
+   agent (goose included) as the per-stage worker, resolving every gate by
+   [`autonomy/policy.json`](autonomy/policy.json) in code:
+
+   ```console
+   python framework/tools/state.py init framework/state/migration-state.json \
+     --name myproject --python-path src/myproject --autonomy-level L2
+   python framework/tools/pipeline.py run framework/state/migration-state.json \
+     --agent-cmd 'goose run --recipe {framework}/recipe.yaml'
+   ```
+
+   The run always ends in a terminal state (`complete`, `no_go_measured`,
+   `budget_exhausted`, or `failed_safely` — never "awaiting input") with a
+   run report, the state file, the journal, and an escalation dossier.
 2. **Any CLI agent** (Claude Code, Codex, Aider) — paste
    [`MIGRATION_PROMPT.md`](MIGRATION_PROMPT.md) as the agent's system context
    (`CLAUDE.md` / `AGENTS.md` / `CONVENTIONS.md` in the target repo), and tell
@@ -52,7 +68,8 @@ not in the repo being migrated.
 | `stages/0..7-*.md` | Per-stage checklists: purpose, steps, **exit criteria**, escalation triggers |
 | `roles/translator.md` | Subagent instructions for mechanical per-unit translation |
 | `roles/reviewer.md` | Subagent instructions for adversarial parity + PyO3-FFI review |
-| `tools/*.py` + `tools/README.md` | The 8 deterministic helpers — implemented, stdlib-only, JSON-in/JSON-out, acceptance-tested in `tools/tests/` (specs, conventions, and quick reference in `tools/README.md`) |
+| `tools/*.py` + `tools/README.md` | The 8 deterministic helpers — implemented, stdlib-only, JSON-in/JSON-out, acceptance-tested in `tools/tests/` — plus `tools/pipeline.py`, the deterministic driver for unattended L2+ runs (issue #22); specs, conventions, and quick reference in `tools/README.md` |
+| `autonomy/policy.json` | The autonomy policy layer (issue #22): levels L0–L3 and one machine-decidable rule per gate with conservative defaults — evaluated only in code, journaled, never LLM self-approval |
 | `knowledge/substitutions.json` | Machine-readable crate mapping + no-equivalent zones (from `research/5`) |
 | `state/migration-state.schema.json` | The dual-build state manager schema — the resumable, per-unit-reversible record |
 | `examples/` | **The worked example** — a filled `migration-state.json` (one unit in each of the six statuses), a Stage-2 `contract.json`, a real oracle verdict showing the 3-way classification, and a stage-by-stage walkthrough ([`examples/README.md`](examples/README.md)) |

@@ -33,8 +33,12 @@ the agent spends most of its budget. Loop spec: `MIGRATION_PROMPT.md`.
 - [ ] Budget ledger within projection; deviations reported
 
 ## Escalate
-- Any unit hitting `MAX_ROUNDS` twice → human queue with minimal repro.
-- Reviewer/translator disputes on semantics → human arbitration, both
-  candidates attached.
+- Any unit hitting `MAX_ROUNDS` twice → escalate with minimal repro. At
+  L0/L1 that opens the human queue; at L2+ policy rule ESC-1 resolves it as
+  **defer** — the unit keeps its Python fallback live, the backlog
+  continues, and the escalation drains into the end-of-run dossier
+  (`tools/state.py mark` resolves the gate automatically).
+- Reviewer/translator disputes on semantics → human arbitration at L0/L1
+  (both candidates attached); at L2+ defer via ESC-1 like any stall.
 - Temptation to weaken the oracle to make a unit pass → this is the ScanCode
   failure mode; forbidden. Escalate instead.

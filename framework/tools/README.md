@@ -30,6 +30,36 @@ eight scripts — it is the transport the framework's *role separation* runs
 on when a GLV server is reachable. Spec, API cheat sheet, and delegation
 loop: [`glv-subagents.md`](glv-subagents.md).
 
+## The deterministic driver — `pipeline.py` (issue #22)
+
+Not a ninth gap-tool: a **composition layer** over the eight (it writes the
+state file only through `state.py`'s journaled writer and verifies stages
+with `state.py` validation + `oracle.py self-test`). The LLM is demoted to
+a *stage worker* invoked via any CLI agent; the loop itself is code —
+testable, deterministic, resumable by construction:
+
+```
+loop:
+  stage = state.stage; run the stage checklist via the agent CLI
+  verify exit criteria  → state.py validation + state-expressible checks
+  resolve open gates    → evaluate ../autonomy/policy.json rules in code
+  journal decisions     → state.py (decided_by + policy_version + evidence)
+  advance stage or terminal-state exit
+```
+
+- **Autonomy levels** (`--autonomy L0..L3`, pre-authorized before the run):
+  L0/L1 stay with the agent-driven recipe (gates are human stops — the
+  driver refuses to run); L2 resolves every gate by policy, publish
+  disabled; L3 adds cutover/publish. Zero mid-run questions at L2+.
+- **Terminal-state discipline**: a run always ends in `complete` /
+  `no_go_measured` / `budget_exhausted` / `failed_safely` — never "awaiting
+  input" — and every terminal state emits the same deliverable set (run
+  report with the gate + escalation dossiers, state file, journal).
+- **Budget guard**: global token/wall-clock ceilings; over either, the run
+  stops safely and resumably in `budget_exhausted`.
+- Agent retries per stage are bounded (`budget.max_agent_retries_per_stage`);
+  exhaustion ends the run in `failed_safely` — never a silent skip.
+
 ## Minimal viable subset
 If you only build three things before starting: **#1 oracle**, **#4 state**,
 **#7 attribution**. The oracle is the difference between a migration and the
@@ -73,11 +103,18 @@ python framework/tools/oracle.py compare --runs shadow-runs.json   # Stage 6
 python framework/tools/oracle.py self-test   # Stage 2 gate: must catch 5/5
 
 # #4 the only writer of the state file
-python framework/tools/state.py init state/migration-state.json --name X --python-path src/x
+python framework/tools/state.py init state/migration-state.json --name X --python-path src/x --autonomy-level L2
 python framework/tools/state.py set  state.json --field 'units[u1].status=ported'
 python framework/tools/state.py mark state.json --unit u1 --status escalated --note "..."
+python framework/tools/state.py resolve-gate state.json --gate go_no_go --decision approved --by policy:GO-1
 python framework/tools/state.py shim state.json --unit u1 --write shims/u1.py
 python framework/tools/state.py validate|journal|show|migrate state.json
+
+# the deterministic driver (issue #22): L2+ unattended runs
+python framework/tools/pipeline.py run state.json \
+  --agent-cmd 'goose run --recipe {framework}/recipe.yaml' --autonomy L2
+python framework/tools/pipeline.py resolve-gates state.json   # policy only, no agent
+python framework/tools/pipeline.py status|report state.json
 
 # #2 / #3 feed Stage 1 → Stage 2
 python framework/tools/port_plan.py from-cprofile --profile run.prof
@@ -110,8 +147,15 @@ Design decisions worth knowing before you extend:
   atomically (tmp + rename), and *rolls back* any change that would leave
   the file schema-invalid or coherence-broken. `mark` encodes the
   MIGRATION_PROMPT.md discipline as hard guards: `ported` requires an
-  equivalent verdict, `escalated` auto-opens the `unit_escalation` human
-  gate, `divergent_explained` requires the written explanation. The
+  equivalent verdict, `escalated` opens the `unit_escalation` gate — and at
+  autonomy L2+ immediately resolves it as deferred via policy rule ESC-1
+  (defer, not halt; the Python fallback stays live) — `divergent_explained`
+  requires the written explanation. `resolve-gate` records gate decisions
+  (`--by human` or `--by policy:<rule-id>`, rule ids checked against
+  `autonomy/policy.json`) with `policy_version` + `evidence[]`; validation
+  enforces the resolution discipline (a resolved gate always records who
+  decided; a policy-approved cutover requires L3 + `publish_allowed`) and
+  terminal-`run_status` coherence. The
   fallback shim is reversible per unit via one env var
   (`<PROJECT>_FALLBACK=all|<unit-ids>|none`) — no state anywhere else.
   Validation includes schema checking (an internal stdlib validator for

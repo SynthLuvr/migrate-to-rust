@@ -1,5 +1,5 @@
 {
-  "$comment": "Example instance of migration-state.schema.json: a mid-Stage-4 migration exercising the journal[], human_gates.gate=scope_change, and per-unit notes/sessions fields. CI (framework/state/check_examples.py) validates every examples/*.json against the schema.",
+  "$comment": "Example instance of migration-state.schema.json: a mid-Stage-4 migration at autonomy L1 (agent proposes, humans decide \u2014 the open scope_change and unit_escalation gates await a human; at L2+ the driver would resolve them via policy rules SC-1/ESC-1 instead), exercising the journal[], human_gates.gate=scope_change, and per-unit notes/sessions fields. CI (framework/state/check_examples.py) validates every examples/*.json against the schema.",
   "project": {
     "name": "datamill",
     "python_path": "src/datamill",
@@ -8,7 +8,11 @@
   "stage": 4,
   "go_no_go": {
     "decision": "go",
-    "scope": ["datamill.parse", "datamill.index", "datamill.rank"],
+    "scope": [
+      "datamill.parse",
+      "datamill.index",
+      "datamill.rank"
+    ],
     "projection": {
       "scoped_loc": 18400,
       "token_cost_usd": 4200.0,
@@ -37,10 +41,14 @@
           "tests/test_parse.py::test_nesting_depth"
         ],
         "type_signature": "contracts/u-parse-1.types.md",
-        "invariants": ["len(out.chunks) == len(in.chunks)"],
+        "invariants": [
+          "len(out.chunks) == len(in.chunks)"
+        ],
         "golden_corpus": "corpora/parse-golden.jsonl"
       },
-      "risk_flags": ["regex translation"],
+      "risk_flags": [
+        "regex translation"
+      ],
       "status": "ported",
       "parity": {
         "runs": 250,
@@ -50,8 +58,15 @@
         "last_verdict": "equivalent"
       },
       "attempts": 1,
-      "budget": { "max_rounds": 5, "tokens_spent": 41000, "exhausted": false },
-      "attribution": { "header_preserved": true, "notice_ok": true },
+      "budget": {
+        "max_rounds": 5,
+        "tokens_spent": 41000,
+        "exhausted": false
+      },
+      "attribution": {
+        "header_preserved": true,
+        "notice_ok": true
+      },
       "review_verdict": "approve",
       "notes": "Candidate c2 won on first oracle pass; reviewer r1 asked one FIX round (doc comment drift), then approved. Python fallback still live until Stage 7 retirement.",
       "sessions": [
@@ -79,15 +94,23 @@
       "id": "u-index-2",
       "python_path": "src/datamill/index.py",
       "rust_path": "crates/datamill-core/src/units/u_index_2.rs",
-      "deps": ["u-parse-1"],
+      "deps": [
+        "u-parse-1"
+      ],
       "order": 2,
       "contract": {
-        "covering_tests": ["tests/test_index.py::test_incremental"],
+        "covering_tests": [
+          "tests/test_index.py::test_incremental"
+        ],
         "type_signature": "contracts/u-index-2.types.md",
-        "invariants": ["index.get(k) is total over emitted keys"],
+        "invariants": [
+          "index.get(k) is total over emitted keys"
+        ],
         "golden_corpus": "corpora/index-golden.jsonl"
       },
-      "risk_flags": ["dict-ordering dependence"],
+      "risk_flags": [
+        "dict-ordering dependence"
+      ],
       "status": "escalated",
       "parity": {
         "runs": 180,
@@ -98,10 +121,17 @@
         "divergence_note": "BTreeMap iteration order vs CPython dict insertion order on re-inserted keys; minimal repro in escalations/u-index-2.md"
       },
       "attempts": 5,
-      "budget": { "max_rounds": 5, "tokens_spent": 118000, "exhausted": true },
-      "attribution": { "header_preserved": true, "notice_ok": true },
+      "budget": {
+        "max_rounds": 5,
+        "tokens_spent": 118000,
+        "exhausted": true
+      },
+      "attribution": {
+        "header_preserved": true,
+        "notice_ok": true
+      },
       "review_verdict": "escalate",
-      "notes": "Budget exhausted at round 5. Divergence is ordering-only and may qualify for a normalization rule; needs human call — data-structure redesign proposal drafted (arena-keyed vecdeque) rather than improvised.",
+      "notes": "Budget exhausted at round 5. Divergence is ordering-only and may qualify for a normalization rule; needs human call \u2014 data-structure redesign proposal drafted (arena-keyed vecdeque) rather than improvised.",
       "sessions": [
         {
           "id": "sess_01hb1c9z4r",
@@ -127,12 +157,18 @@
       "id": "u-rank-3",
       "python_path": "src/datamill/rank.py",
       "rust_path": null,
-      "deps": ["u-index-2"],
+      "deps": [
+        "u-index-2"
+      ],
       "order": 3,
       "contract": {
-        "covering_tests": ["tests/test_rank.py::test_ties"],
+        "covering_tests": [
+          "tests/test_rank.py::test_ties"
+        ],
         "type_signature": "contracts/u-rank-3.types.md",
-        "invariants": ["stable sort on ties"],
+        "invariants": [
+          "stable sort on ties"
+        ],
         "golden_corpus": "corpora/rank-golden.jsonl"
       },
       "risk_flags": [],
@@ -143,12 +179,14 @@
     {
       "gate": "go_no_go",
       "state": "approved",
-      "note": "Stage 0: go, scope = parse/index/rank (63.5% projected e2e saving)"
+      "note": "Stage 0: go, scope = parse/index/rank (63.5% projected e2e saving)",
+      "decided_by": "human"
     },
     {
       "gate": "redesign_approval",
       "state": "approved",
-      "note": "Stage 1: arena-keyed store for datamill.index"
+      "note": "Stage 1: arena-keyed store for datamill.index",
+      "decided_by": "human"
     },
     {
       "gate": "scope_change",
@@ -215,5 +253,15 @@
     "tokens_total": 2100000,
     "hours_human_total": 11.5,
     "regression_triage_hours": 0
-  }
+  },
+  "autonomy": {
+    "level": "L1",
+    "policy_version": "1.0.0",
+    "budget": {
+      "max_tokens": 5000000,
+      "max_wall_clock_minutes": 720
+    },
+    "publish_allowed": false
+  },
+  "run_status": "running"
 }

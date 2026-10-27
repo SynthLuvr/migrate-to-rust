@@ -113,6 +113,124 @@ def test_divergent_explained_requires_note_and_divergent_verdict(
     assert u["parity"]["divergence_note"] == "ordering-only divergence"
 
 
+def test_mark_escalated_at_l2_auto_resolves_via_policy(monkeypatch, capsys, mini_state):
+    # issue #22: at L2+ escalation is defer, not halt — the gate opens and
+    # immediately resolves via policy rule ESC-1 (python fallback stays live)
+    run_tool(monkeypatch, capsys, "state.py", [
+        "set", str(mini_state), "--field", 'autonomy={"level": "L2"}',
+        "--json-value"])
+    code, out = run_tool(monkeypatch, capsys, "state.py", [
+        "mark", str(mini_state), "--unit", "u1", "--status", "escalated",
+        "--note", "repro attached"])
+    assert code == 0
+    st = _load(mini_state)
+    gate = [g for g in st["human_gates"] if g["gate"] == "unit_escalation"][0]
+    assert gate["state"] == "deferred"
+    assert gate["decided_by"] == "policy:ESC-1"
+    assert gate["policy_version"]  # journaled decisions name their policy
+    assert any("fallback=python" in e for e in gate["evidence"])
+    fields = [e["field"] for e in st["journal"]]
+    assert "human_gates[gate=unit_escalation].decided_by" in fields
+
+
+def test_mark_escalated_at_l0_opens_and_waits_unchanged(monkeypatch, capsys, mini_state):
+    # no autonomy block = L0 (supervised): the pre-policy behavior stands
+    code, _ = run_tool(monkeypatch, capsys, "state.py", [
+        "mark", str(mini_state), "--unit", "u1", "--status", "escalated"])
+    assert code == 0
+    gate = [g for g in _load(mini_state)["human_gates"]
+            if g["gate"] == "unit_escalation"][0]
+    assert gate["state"] == "open" and "decided_by" not in gate
+
+
+def test_resolve_gate_records_human_and_policy_decisions(monkeypatch, capsys, mini_state):
+    code, _ = run_tool(monkeypatch, capsys, "state.py", [
+        "resolve-gate", str(mini_state), "--gate", "go_no_go", "--create",
+        "--decision", "approved", "--by", "policy:GO-1",
+        "--evidence", "end_to_end_saving_pct=58.0 (bar >= 50.0)"])
+    assert code == 0
+    gate = [g for g in _load(mini_state)["human_gates"]
+            if g["gate"] == "go_no_go"][0]
+    assert gate["state"] == "approved"
+    assert gate["decided_by"] == "policy:GO-1" and gate["policy_version"]
+    # a human decision is recorded just as first-class
+    code, _ = run_tool(monkeypatch, capsys, "state.py", [
+        "resolve-gate", str(mini_state), "--gate", "scope_change", "--create",
+        "--decision", "approved", "--by", "human", "--note", "operator OK"])
+    assert code == 0
+    gate = [g for g in _load(mini_state)["human_gates"]
+            if g["gate"] == "scope_change"][0]
+    assert gate["decided_by"] == "human" and "policy_version" not in gate
+
+
+def test_resolve_gate_refuses_unknown_rules_and_non_policy_ids(
+        monkeypatch, capsys, mini_state):
+    code, out = run_tool(monkeypatch, capsys, "state.py", [
+        "resolve-gate", str(mini_state), "--gate", "redesign_approval",
+        "--create", "--decision", "approved", "--by", "policy:NOPE-9"])
+    assert code == 2 and "not defined" in out["error"]
+    code, out = run_tool(monkeypatch, capsys, "state.py", [
+        "resolve-gate", str(mini_state), "--gate", "redesign_approval",
+        "--create", "--decision", "approved", "--by", "the-agent-itself"])
+    assert code == 2 and "human" in out["error"]
+
+
+def test_policy_cutover_approval_requires_l3_publish_allowed(
+        monkeypatch, capsys, mini_state):
+    run_tool(monkeypatch, capsys, "state.py", [
+        "set", str(mini_state), "--field",
+        'autonomy={"level": "L2", "publish_allowed": false}', "--json-value"])
+    code, out = run_tool(monkeypatch, capsys, "state.py", [
+        "resolve-gate", str(mini_state), "--gate", "cutover", "--create",
+        "--decision", "approved", "--by", "policy:CUT-1"])
+    assert code == 2 and "L3" in out["error"]
+
+
+def test_validate_enforces_gate_resolution_discipline(monkeypatch, capsys, tmp_path):
+    def mutated(mutator):
+        st = json.loads(EXAMPLE.read_text())
+        mutator(st)
+        p = tmp_path / "g.json"
+        p.write_text(json.dumps(st))
+        return run_tool(monkeypatch, capsys, "state.py", ["validate", str(p)])
+
+    # resolved gate without decided_by
+    code, out = mutated(lambda s: s["human_gates"][0].pop("decided_by"))
+    assert code == 2 and any("decided_by" in e for e in out["invariant_errors"])
+    # decided_by naming a well-formed rule id the policy does not define
+    code, out = mutated(lambda s: s["human_gates"][0].update(
+        decided_by="policy:ZZ-99"))
+    assert code == 2 and any("does not define" in e for e in out["invariant_errors"])
+    # policy version required on policy decisions (this example's resolved
+    # gates are human decisions; make one a policy decision sans version)
+    def as_policy_sans_version(s):
+        s["human_gates"][0]["decided_by"] = "policy:GO-1"
+        s["human_gates"][0].pop("policy_version", None)
+    code, out = mutated(as_policy_sans_version)
+    assert code == 2 and any("policy_version" in e for e in out["invariant_errors"])
+    # publish_allowed without L3 (this example is L1/publish=false; flip both)
+    code, out = mutated(lambda s: s["autonomy"].update(
+        level="L2", publish_allowed=True))
+    assert code == 2 and any("L3" in e for e in out["invariant_errors"])
+
+
+def test_validate_warns_on_resumed_terminal_run(monkeypatch, capsys, tmp_path):
+    st = json.loads(EXAMPLE.read_text())
+    st["run_status"] = "complete"
+    st["journal"].append({  # the terminal transition itself
+        "timestamp": "2026-10-31T10:00:00Z", "unit": None,
+        "field": "run_status", "from": "running", "to": "complete",
+        "actor": "pipeline.py"})
+    st["journal"].append({  # work continued after run_status=complete
+        "timestamp": "2026-11-01T10:00:00Z", "unit": None,
+        "field": "stage", "from": 4, "to": 5, "actor": "orchestrator"})
+    p = tmp_path / "resumed.json"
+    p.write_text(json.dumps(st))
+    code, out = run_tool(monkeypatch, capsys, "state.py", ["validate", str(p)])
+    assert code == 0  # warning, not error — resume can be legitimate
+    assert any("resumed after finishing" in w for w in out["warnings"])
+
+
 def test_shim_emits_reversible_per_unit_switch(monkeypatch, capsys, mini_state):
     code, out = run_tool(monkeypatch, capsys, "state.py",
                          ["shim", str(mini_state), "--unit", "u1"])
@@ -131,6 +249,10 @@ def test_migrate_backfills_and_journals(monkeypatch, capsys, tmp_path):
     for u in st["units"]:
         u.pop("budget", None)
     st.pop("budget_ledger", None)
+    st.pop("autonomy", None)          # issue #22 backfills
+    st.pop("run_status", None)
+    for g in st["human_gates"]:
+        g.pop("decided_by", None)
     p = tmp_path / "old.json"
     p.write_text(json.dumps(st))
     journal_len_before = len(st.get("journal", []))
@@ -139,6 +261,10 @@ def test_migrate_backfills_and_journals(monkeypatch, capsys, tmp_path):
     after = _load(p)
     assert all("budget" in u for u in after["units"])
     assert "budget_ledger" in after
+    assert after["autonomy"]["level"] == "L0"   # supervised meaning preserved
+    assert after["run_status"] == "pending"
+    resolved = [g for g in after["human_gates"] if g["state"] != "open"]
+    assert resolved and all(g["decided_by"] == "human" for g in resolved)
     assert len(after["journal"]) > journal_len_before
     code, _ = run_tool(monkeypatch, capsys, "state.py", ["validate", str(p)])
     assert code == 0
@@ -172,7 +298,9 @@ def test_init_creates_valid_journaled_state(monkeypatch, capsys, tmp_path):
     assert code == 0
     st = _load(p)
     assert st["stage"] == 0 and st["units"] == []
-    assert len(st["journal"]) == 2  # project + stage creation entries
+    # project + stage + autonomy + run_status creation entries
+    assert len(st["journal"]) == 4
+    assert st["autonomy"]["level"] == "L0" and st["run_status"] == "pending"
     code, _ = run_tool(monkeypatch, capsys, "state.py", ["validate", str(p)])
     assert code == 0
 
@@ -204,6 +332,13 @@ def test_validator_agrees_with_jsonschema_package():
             {"timestamp": 1760264700, "unit": None, "field": "x", "from": 1, "to": 2})),
         ("session missing role", lambda s: s["units"][0]["sessions"].append(
             {"id": "s1", "name": "n"})),
+        ("bad gate decided_by type", lambda s: s["human_gates"][0].update(
+            decided_by=7)),
+        ("bad gate state", lambda s: s["human_gates"][0].update(state="awaiting")),
+        ("bad autonomy level", lambda s: s["autonomy"].update(level="L4")),
+        ("bad run_status", lambda s: s.update(run_status="awaiting_input")),
+        ("bad gate evidence item", lambda s: s["human_gates"][0].update(
+            evidence=["ok=1", 5])),
     ]
     for label, mutate in mutations:
         instance = json.loads(EXAMPLE.read_text())
