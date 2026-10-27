@@ -7,9 +7,9 @@ Across the corpus, at least one instance must exercise ``journal[]``, the
 least one unit in each of the six statuses must appear (the worked example,
 ``framework/examples/migration-state.json``, exists precisely to cover
 them); and the schema must *constrain* those fields — malformed journal
-entries, session entries, and gate values are rejected rather than merely
-tolerated by the schema's permissive default of allowing unspecified
-properties.
+entries, session entries, gate values, and deliberately incomplete units
+(e.g. a unit missing ``status``) are rejected rather than merely tolerated
+by the schema's permissive default of allowing unspecified properties.
 
 Non-zero exit on any failure, so CI fails loudly.
 
@@ -154,6 +154,33 @@ def require_fields_constrained(schema: dict) -> None:
     print("ok: journal/sessions required fields and gate enum are enforced")
 
 
+def require_units_constrained(schema: dict) -> None:
+    """A deliberately incomplete unit must be rejected by the schema, not
+    merely tolerated (units[] has no ``additionalProperties: false`` —
+    required fields are the only bite)."""
+    unit_schema = schema["properties"]["units"]["items"]
+    minimal_unit = {
+        "id": "u-example-1",
+        "python_path": "pkg/example.py",
+        "deps": [],
+        "order": 1,
+        "status": "pending",
+    }
+    must_accept("a minimal well-formed unit", unit_schema, minimal_unit)
+    for key in ("status", "deps"):
+        must_reject(
+            f"a unit missing '{key}'",
+            unit_schema,
+            {k: v for k, v in minimal_unit.items() if k != key},
+        )
+    must_reject(
+        "a unit with a bogus status ('done')",
+        unit_schema,
+        {**minimal_unit, "status": "done"},
+    )
+    print("ok: unit required fields and the status enum are enforced")
+
+
 def main() -> None:
     schema = json.loads(SCHEMA_PATH.read_text())
     Draft202012Validator.check_schema(schema)
@@ -163,6 +190,7 @@ def main() -> None:
     require_fields_exercised(instances)
     require_all_statuses_exercised(instances, schema)
     require_fields_constrained(schema)
+    require_units_constrained(schema)
     print(f"validated {len(instances)} example instance(s) against the schema")
 
 
