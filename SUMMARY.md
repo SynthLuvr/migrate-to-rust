@@ -75,8 +75,8 @@
  └──────────────┬─────────────────────────────────────────────────┘
                 ▼
  ┌────────────────────────────────────────────────────────────────┐
- │ 3. SCAFFOLD             Cargo workspace + PyO3 crate + maturin │
- │    + CI (clippy/rustfmt/nextest/llvm-cov) wired before porting │
+ │ 3. SCAFFOLD             rust-template base + PyO3 + maturin +  │
+ │    gate extension (nextest/miri) wired before porting          │
  └──────────────┬─────────────────────────────────────────────────┘
                 ▼
  ┌────────────────────────────────────────────────────────────────┐

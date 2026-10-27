@@ -30,6 +30,8 @@ instructions: |
   6. From Stage 1 onward, consult framework/knowledge/substitutions.json for
      crate choices; flag any dependency with no maintained equivalent for a
      human decision instead of improvising.
+  7. Stage 3 instantiates the crate from SynthLuvr/rust-template per
+     framework/stages/3-scaffold.md — never hand-roll the gate stack.
 prompt: |
   Begin Stage 0 (Feasibility) on $TARGET_PYTHON_PROJECT. If no target was
   given, ask for it before profiling anything. Initialize

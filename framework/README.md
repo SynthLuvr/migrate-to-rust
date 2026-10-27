@@ -48,6 +48,9 @@ agent can execute directly, rather than merely read.
 
 - [ ] Re-verify crate maintenance in `knowledge/substitutions.json` (verified
       2026-10-25; ecosystems move)
+- [ ] Confirm rust-template is reachable — `git clone
+      https://github.com/SynthLuvr/rust-template` must work (Stage 3
+      instantiates the crate from it; see `stages/3-scaffold.md`)
 - [ ] Build or stub the `tools/*.py` helpers to their acceptance criteria —
       the parity oracle (gap #1) is non-negotiable before any translation
 - [ ] Point `recipe.yaml` at your target project and provider/model

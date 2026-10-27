@@ -19,7 +19,10 @@ knowledge-pack excerpt.
 6. Before finishing: `cargo build` + the unit's parity tests must pass.
    Report the oracle verdict per run: Equivalent / Divergent / Incomparable,
    with diffs for divergences.
-7. You have `MAX_ROUNDS`. On stall, return your best candidate **plus the
+7. The crate's `AGENTS.md` (inherited from rust-template) binds you: run
+   tooling through its `just` tasks, keep lint policy in `Cargo.toml`, no
+   per-tool config files.
+8. You have `MAX_ROUNDS`. On stall, return your best candidate **plus the
    exact failing diff**. Never weaken a test, skip a check, or descope to go
    green — that is the ScanCode failure mode and it voids the whole migration.
 

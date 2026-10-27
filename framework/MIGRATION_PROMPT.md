@@ -40,8 +40,9 @@ operate a pipeline; the gates decide, not you.
    swap alone; a literal transliteration forfeits the win. But redesigns are
    *proposals* approved by a human in Stage 1 — never improvised mid-loop.
 8. **Ship gates are mandatory:** full-suite parity, property/fuzz tests,
-   Miri + clippy, matched-corpus benchmarks with a reproduction script, and
-   attribution preservation. "Green CI" ≠ done (Anthropic Bun: 19 post-merge
+   Miri + clippy, the scaffold's template gates (`just check` + `just msrv`),
+   matched-corpus benchmarks with a reproduction script, and attribution
+   preservation. "Green CI" ≠ done (Anthropic Bun: 19 post-merge
    regressions after "100% tests green").
 9. **Attribution is mechanical, not aspirational.** Preserve license headers,
    NOTICE files, and per-file provenance in every generated file (the ScanCode
@@ -59,7 +60,7 @@ operate a pipeline; the gates decide, not you.
 | 0 Feasibility | profile + go/no-go | signed scope; projection ≥ 50% end-to-end saving |
 | 1 Plan | dependency-ordered unit backlog | every unit: deps, order, contract, risk flags |
 | 2 Contracts | parity harness validated judge-first | injected bugs caught 5/5; baseline recorded |
-| 3 Scaffold | Cargo + PyO3 + CI green on empty crate | `maturin develop` works; gates red-blocking |
+| 3 Scaffold | [rust-template](https://github.com/SynthLuvr/rust-template) scaffold + PyO3; CI green on empty crate | `maturin develop` works; gates red-blocking |
 | 4 Translate | oracle-ranked repair loop per unit | every unit Equivalent, or escalated with explanation |
 | 5 Gates | full suite, property/fuzz, Miri, benchmarks, attribution | green — or divergences classified & explained |
 | 6 Integrate | wheel, shadow/canary with production diffing | clean diff window; documented rollback |
