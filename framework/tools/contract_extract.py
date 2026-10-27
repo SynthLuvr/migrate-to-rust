@@ -38,8 +38,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, EXIT_SETUP, emit, module_name_of,
-    read_json, run_child, write_json_atomic,
+    EXIT_FINDINGS, EXIT_OK, ToolError, emit, module_name_of, read_json,
+    run_child, run_cli, write_json_atomic,
 )
 
 TOOL = "contract_extract.py"
@@ -57,9 +57,9 @@ def collect_pytest(root: Path) -> list[str]:
         [sys.executable, "-m", "pytest", "--collect-only", "-q", str(root)],
         cwd=str(root), timeout=300.0)
     if code not in (0, 5) or not stdout:  # 5 = no tests collected
-        print(f"pytest collection failed (exit {code}): {stderr.strip()[:300]}",
-              file=sys.stderr)
-        raise SystemExit(EXIT_SETUP if code == 4 else EXIT_ERROR)
+        raise ToolError(
+            f"pytest collection failed (exit {code}): {stderr.strip()[:300]}",
+            kind="setup" if code == 4 else "io")
     nodeids = []
     for line in stdout.splitlines():
         line = line.strip()
@@ -149,8 +149,8 @@ def cmd_extract(args) -> int:
     state = read_json(args.state)
     units = state.get("units", [])
     if not units:
-        print("state file has no units — run port_plan.py first", file=sys.stderr)
-        return EXIT_ERROR
+        raise ToolError("state file has no units — run port_plan.py first",
+                        kind="usage")
     root = Path(args.root or ".").resolve()
     state_path = Path(args.state).resolve()
     project_root = state_path.parent.parent  # <root>/framework/state/x.json
@@ -160,9 +160,8 @@ def cmd_extract(args) -> int:
     for u in units:
         cand = _find_source(u["python_path"], root, project_root)
         if cand is None:
-            print(f"unit {u['id']}: python file not found: {u['python_path']}",
-                  file=sys.stderr)
-            return EXIT_ERROR
+            raise ToolError(
+                f"unit {u['id']}: python file not found: {u['python_path']}")
         unit_files[u["id"]] = cand
 
     if args.pytest_collect:
@@ -319,4 +318,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_cli(main, tool=TOOL, version=VERSION))

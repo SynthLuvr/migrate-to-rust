@@ -13,14 +13,21 @@ TOOLS = Path(__file__).resolve().parent.parent
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
+from _common import run_cli  # noqa: E402
+
 REPO_ROOT = TOOLS.parent.parent
 
 
 def run_tool(monkeypatch, capsys, script: str, argv: list[str]) -> tuple[int, dict]:
-    """Run a tool's main() in-process; returns (exit_code, parsed_json)."""
+    """Run a tool's main() in-process through the shared CLI boundary
+    (run_cli), exactly like the real command line — so refusals surface as
+    JSON envelopes instead of escaping exceptions. Returns (exit_code,
+    parsed_json); json.loads enforces the 'stdout is always one JSON
+    object' convention even on error paths."""
     mod = __import__(script[:-3])
     monkeypatch.setattr(sys, "argv", [script] + argv)
-    code = mod.main(argv)
+    code = run_cli(mod.main, argv, tool=getattr(mod, "TOOL", script),
+                   version=getattr(mod, "VERSION", None))
     out = capsys.readouterr().out
     return code, json.loads(out)
 

@@ -41,7 +41,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, emit, iter_tree_files, read_json, sha256_file,
+    EXIT_FINDINGS, EXIT_OK, ToolError, emit, iter_tree_files,
+    read_json, run_cli, sha256_file,
 )
 
 TOOL = "attribution.py"
@@ -111,8 +112,7 @@ def cmd_check(args) -> int:
     port = Path(args.port).resolve()
     for label, p in (("original", original), ("port", port)):
         if not p.is_dir():
-            print(f"{label} tree {p} is not a directory", file=sys.stderr)
-            return EXIT_ERROR
+            raise ToolError(f"{label} tree {p} is not a directory")
     state = read_json(args.state)
     units = [u for u in state.get("units", []) if u.get("rust_path")]
     allowlist = _load_allowlist(args.allowlist)
@@ -292,4 +292,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_cli(main, tool=TOOL, version=VERSION))

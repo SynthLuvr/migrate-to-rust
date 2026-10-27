@@ -29,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, emit, read_json, run_child,
+    EXIT_FINDINGS, EXIT_OK, ToolError, emit, read_json, run_child, run_cli,
 )
 
 TOOL = "upstream_watch.py"
@@ -43,9 +43,8 @@ OUT_OF_SCOPE_HINTS = ("tests/", "test_", "docs/", "doc/", ".github/", "examples/
 def _git(repo: Path, *args: str) -> list[str]:
     code, out, err = run_child(["git", *args], cwd=str(repo), timeout=60.0)
     if code != 0:
-        print(f"git {' '.join(args)} failed (exit {code}): {err.strip()[:200]}",
-              file=sys.stderr)
-        raise SystemExit(EXIT_ERROR)
+        raise ToolError(
+            f"git {' '.join(args)} failed (exit {code}): {err.strip()[:200]}")
     return [l for l in out.splitlines() if l.strip()]
 
 
@@ -89,8 +88,7 @@ def cmd_watch(args) -> int:
     units = state.get("units", [])
     repo = Path(args.repo).resolve()
     if not (repo / ".git").exists():
-        print(f"{repo} is not a git repository", file=sys.stderr)
-        return EXIT_ERROR
+        raise ToolError(f"{repo} is not a git repository")
     base = args.base or "HEAD~1"
     head = args.head  # None -> working tree
     if head:
@@ -226,4 +224,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_cli(main, tool=TOOL, version=VERSION))

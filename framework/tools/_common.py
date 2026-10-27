@@ -4,6 +4,9 @@ Design contract (framework/tools/README.md "Anti-requirements"):
 - stdlib only, deterministic, stateless between invocations
 - every tool prints machine-readable JSON on stdout and embeds a
   human-readable summary; ``--human`` additionally echoes it to stderr
+- stdout is ALWAYS a single JSON object — including error paths (a refusal
+  is a result, not a crash); ToolError/run_cli() below provide the
+  uniform error envelope
 - exit codes: 0 = clean verdict, 1 = usage/IO error, 2 = findings/divergence,
   3 = incomparable/warning-class outcome, 4 = setup/dependency failure
 """
@@ -101,6 +104,59 @@ def emit(payload: dict, human: str | None = None, human_flag: bool = False) -> i
     if human_flag and human:
         print(human, file=sys.stderr)
     return code
+
+
+class ToolError(Exception):
+    """A refusal (usage/IO/setup problem) raised mid-command. The CLI
+    boundary (``run_cli``) converts it into the JSON error envelope on
+    stdout instead of letting it escape as a traceback. ``kind`` ∈ io
+    (filesystem/environment) · usage (bad/missing input content) ·
+    setup (missing dependency, exit 4)."""
+
+    def __init__(self, detail: str, *, kind: str = "io"):
+        super().__init__(detail)
+        self.detail = detail
+        self.kind = kind
+
+
+def emit_error(detail: str, *, kind: str = "io", tool: str | None = None,
+               version: int | None = None, human_flag: bool = False) -> int:
+    """Emit the uniform JSON error envelope on stdout (README "Uniform
+    conventions"): ``error.kind`` + ``error.detail``, and
+    ``summary.exit_code`` mirroring the process exit code — so callers
+    parsing stdout always get JSON, even on failure. Returns the exit
+    code."""
+    exit_code = EXIT_SETUP if kind == "setup" else EXIT_ERROR
+    payload: dict = {}
+    if tool is not None:
+        payload["tool"] = tool
+    if version is not None:
+        payload["version"] = version
+    payload["error"] = {"kind": kind, "detail": detail}
+    payload["summary"] = {"exit_code": exit_code, "human": detail}
+    return emit(payload, human=detail, human_flag=human_flag)
+
+
+def run_cli(main_func, argv=None, *, tool: str | None = None,
+            version: int | None = None) -> int:
+    """CLI boundary for every tool's ``__main__``: refusals leave as the
+    JSON error envelope, never a bare traceback/stderr line. Input
+    problems — missing/unreadable files (OSError), malformed JSON or bad
+    values (ValueError) — are results, not crashes; genuine programming
+    errors (TypeError, KeyError, ...) still traceback. Usage:
+    ``sys.exit(run_cli(main, tool=TOOL, version=VERSION))``."""
+    # every tool defines --human as a top-level flag; honor it on the error
+    # envelope too, so `--human` echoes the summary to stderr consistently
+    human_flag = "--human" in (argv if argv is not None else sys.argv[1:])
+    try:
+        return main_func(argv)
+    except ToolError as e:
+        return emit_error(e.detail, kind=e.kind, tool=tool, version=version,
+                          human_flag=human_flag)
+    except (OSError, ValueError) as e:
+        kind = "usage" if isinstance(e, ValueError) else "io"
+        return emit_error(f"{type(e).__name__}: {e}", kind=kind, tool=tool,
+                          version=version, human_flag=human_flag)
 
 
 def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,
