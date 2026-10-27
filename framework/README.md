@@ -5,14 +5,41 @@ agent can execute directly, rather than merely read.
 
 ## Run it one of three ways
 
+All relative paths in these artifacts — `stages/<n>-*.md`, `roles/*.md`,
+`tools/README.md`, `knowledge/substitutions.json`,
+`state/migration-state.schema.json` — live in **this framework checkout**,
+not in the repo being migrated.
+
 1. **goose (recommended)** — `goose run --recipe framework/recipe.yaml`
    The recipe is the orchestrator; it enforces stage order, human gates, and
-   the state file. Adjust `settings:` to your provider/model.
+   the state file. Adjust `settings:` to your provider/model. Run it from
+   the **root of this `migrate-to-rust` checkout** — the recipe references
+   `framework/...`, `SUMMARY.md`, `TOOLCHAIN.md`, and `research/...`
+   relative to that root — and point at a target project elsewhere on disk
+   via the recipe's `TARGET_PYTHON_PROJECT` parameter (absolute path), not
+   by `cd`-ing into the target repo.
 2. **Any CLI agent** (Claude Code, Codex, Aider) — paste
    [`MIGRATION_PROMPT.md`](MIGRATION_PROMPT.md) as the agent's system context
    (`CLAUDE.md` / `AGENTS.md` / `CONVENTIONS.md` in the target repo), and tell
    the agent to load the current `stages/<n>-*.md` checklist when it enters a
-   stage.
+   stage. The prompt's paths resolve only inside this framework checkout, so
+   pick **one**:
+   - **(a) Record the checkout's absolute path.** Append to the same file
+     you pasted the prompt into, e.g.:
+
+     ```markdown
+     ## Framework checkout
+     Every framework-relative path in the prompt above (`stages/…`, `roles/…`,
+     `tools/…`, `knowledge/…`, `state/…`, `../SUMMARY.md`) resolves against:
+     `/abs/path/to/migrate-to-rust/framework`
+     ```
+
+     The agent then reads every framework file from that path; the target
+     repo holds only the code under migration.
+   - **(b) Vendor the framework into the target repo** —
+     `cp -r /abs/path/to/migrate-to-rust/framework ./framework/` (or a git
+     subtree). The prompt's relative references then resolve as-is; keep
+     the copy in sync when the framework changes.
 3. **Manual / hybrid** — a human orchestrates stage-by-stage using the same
    checklists, with the agent doing stages 3–4 under supervision.
 
