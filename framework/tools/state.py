@@ -19,8 +19,14 @@ Subcommands
              results roll back
   mark       status transitions with the MIGRATION_PROMPT.md discipline
              encoded as hard guards (ported requires an equivalent verdict;
-             escalated auto-opens the unit_escalation human gate;
+             escalated auto-opens the unit_escalation human gate — and at
+             autonomy L2+ immediately resolves it as deferred via policy
+             rule ESC-1: defer, not halt, the Python fallback stays live;
              divergent_explained requires a written explanation)
+  resolve-gate  record a gate decision — decided_by 'human' or
+             'policy:<rule-id>' + policy_version + evidence[] — journaled,
+             validated, atomic; the policy evaluation itself lives in
+             pipeline.py resolve-gates
   shim       emit the per-unit fallback switch (Python stays callable per
              unit — reversible via one env var, no extra state anywhere)
   migrate    bring an older/partial state up to the current schema shape
@@ -48,11 +54,74 @@ from _common import (  # noqa: E402
 TOOL = "state.py"
 VERSION = 1
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "state" / "migration-state.schema.json"
+POLICY_PATH = Path(__file__).resolve().parent.parent / "autonomy" / "policy.json"
 STATUSES = ["pending", "ported", "divergent_explained", "escalated", "fallback_python", "retired"]
 # statuses whose live side is the Rust implementation (fallback still on call
 # for everything else; "retired" means the fallback was deliberately removed
 # in Stage 7, so rust is the only side left)
 RUST_LIVE_STATUSES = {"ported", "divergent_explained", "retired"}
+GATES = ["go_no_go", "scope_change", "redesign_approval", "unit_escalation",
+         "cutover", "crate_substitution", "no_equivalent_dependency"]
+# autonomy levels that resolve gates by policy (autonomy/policy.json)
+# instead of stopping for a human (issue #22): L2 = all gates policy-resolved,
+# publish disabled; L3 = full autopilot incl. cutover
+POLICY_LEVELS = {"L0", "L1", "L2", "L3"}
+DRIVER_LEVELS = {"L2", "L3"}
+TERMINAL_RUN_STATUSES = {"complete", "no_go_measured", "budget_exhausted", "failed_safely"}
+_POLICY_DECIDED_BY_RE = re.compile(r"^policy:[A-Za-z][A-Za-z0-9]*-\d+$")
+
+
+def load_policy(path: Path | None = None) -> dict | None:
+    """Best-effort load of autonomy/policy.json (structural check lives in
+    pipeline.py; here we only need version + rule ids). Returns None when the
+    file is missing/unreadable — older checkouts run without a policy file."""
+    try:
+        policy = json.loads((path or POLICY_PATH).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return policy if isinstance(policy, dict) else None
+
+
+def autonomy_level(state: dict) -> str:
+    """Effective autonomy level; absent block = L0 (supervised, the
+    pre-policy behavior — an old state file keeps its meaning)."""
+    level = (state.get("autonomy") or {}).get("level")
+    return level if level in POLICY_LEVELS else "L0"
+
+
+def publish_preauthorized(state: dict) -> bool:
+    """Cutover/publish is pre-authorized at L3 only, with the explicit flag."""
+    auto = state.get("autonomy") or {}
+    return auto.get("level") == "L3" and auto.get("publish_allowed") is True
+
+
+def find_gate(state: dict, name: str) -> dict | None:
+    """The newest open gate named `name`, else the newest gate of that name."""
+    gate = None
+    for g in reversed(state.get("human_gates", [])):
+        if g.get("gate") == name:
+            gate = g
+            if g.get("state") == "open":
+                break
+    return gate
+
+
+def merge_evidence(existing: list | None, added: list | None) -> list:
+    """Union two evidence lists, first occurrence first."""
+    merged = list(existing or [])
+    merged.extend(e for e in added or [] if e not in merged)
+    return merged
+
+
+def record_gate_fields(gate: dict, updates: dict, changes: list) -> None:
+    """Journal + apply field updates on one gate record — the shared write
+    path for resolve-gate (humans/CLI) and the driver (pipeline.py)."""
+    prefix = f"human_gates[gate={gate.get('gate')}]"
+    for field, new in updates.items():
+        old = gate.get(field)
+        if old != new:
+            changes.append((None, f"{prefix}.{field}", old, new))
+            gate[field] = new
 
 # --------------------------------------------------------------- schema ----
 # A stdlib-only validator for the draft-2020-12 subset the schema uses:
@@ -130,6 +199,69 @@ def validate_schema(instance, schema: dict, path: str = "$", errors: list | None
 
 # ----------------------------------------------------------- invariants ----
 
+def _gate_discipline_errors(state: dict, policy: dict | None) -> list[str]:
+    """A resolved gate records WHO decided — 'human' or 'policy:<rule-id>' —
+    plus the policy version it evaluated; a policy-approved cutover is
+    publish, which is pre-authorized at L3 only."""
+    errors: list[str] = []
+    rule_ids = ({r.get("id") for r in policy.get("rules", [])}
+                if policy else None)
+    auto = state.get("autonomy") or {}
+    if auto.get("publish_allowed") and not publish_preauthorized(state):
+        errors.append("autonomy: publish_allowed=true requires level=L3 "
+                      "(publish is an L3-only pre-authorization)")
+    for i, g in enumerate(state.get("human_gates", [])):
+        label = f"human_gates[{i}] ({g.get('gate')})"
+        if g.get("state") == "open":
+            continue
+        decided_by = g.get("decided_by")
+        if not decided_by:
+            errors.append(f"{label}: state={g.get('state')!r} requires decided_by "
+                          f"('human' or 'policy:<rule-id>')")
+            continue
+        if decided_by != "human":
+            if not _POLICY_DECIDED_BY_RE.match(str(decided_by)):
+                errors.append(f"{label}: decided_by={decided_by!r} must be 'human' "
+                              f"or 'policy:<rule-id>'")
+                continue
+            if not g.get("policy_version"):
+                errors.append(f"{label}: decided_by={decided_by} requires "
+                              f"policy_version")
+            rid = str(decided_by).split(":", 1)[1]
+            if rule_ids is not None and rid not in rule_ids:
+                errors.append(f"{label}: decided_by names rule {rid!r} which "
+                              f"autonomy/policy.json does not define")
+        if (g.get("gate") == "cutover" and g.get("state") == "approved"
+                and str(decided_by).startswith("policy:")
+                and not publish_preauthorized(state)):
+            errors.append(
+                f"{label}: policy-approved cutover requires autonomy.level=L3 "
+                f"and autonomy.publish_allowed=true (got level={auto.get('level')!r}, "
+                f"publish_allowed={auto.get('publish_allowed')!r})")
+    return errors
+
+
+def _resumed_after_terminal_warning(state: dict) -> str | None:
+    """Terminal-state discipline: once run_status reaches a terminal value,
+    newer journaled transitions mean the run resumed after finishing (fine
+    for budget_exhausted with a raised ceiling; verify intent)."""
+    if state.get("run_status") not in TERMINAL_RUN_STATUSES:
+        return None
+    entries = state.get("journal", [])
+    for idx, entry in enumerate(entries):
+        if (entry.get("field") == "run_status"
+                and entry.get("to") in TERMINAL_RUN_STATUSES):
+            later = entries[idx + 1:]
+            if not later:
+                return None
+            return (f"run_status={state['run_status']} is terminal but "
+                    f"{len(later)} newer journal entr"
+                    f"{'y exists' if len(later) == 1 else 'ies exist'} — the run "
+                    f"resumed after finishing (fine for budget_exhausted with a "
+                    f"raised ceiling; verify intent)")
+    return None
+
+
 def check_invariants(state: dict) -> tuple[list[str], list[str]]:
     """Coherence checks the JSON schema cannot express. Returns (errors,
     warnings) — warnings are reported, never silent, but do not fail."""
@@ -202,11 +334,19 @@ def check_invariants(state: dict) -> tuple[list[str], list[str]]:
             )
         if status == "escalated":
             gates = [g for g in state.get("human_gates", [])
-                     if g.get("gate") == "unit_escalation" and g.get("state") == "open"]
+                     if g.get("gate") == "unit_escalation"
+                     and g.get("state") in ("open", "deferred")]
             if not gates:
                 warnings.append(
-                    f"units[{uid}]: status=escalated but no open unit_escalation human gate"
+                    f"units[{uid}]: status=escalated but no unit_escalation gate "
+                    f"(open for humans, or deferred via policy:ESC-1 at L2+)"
                 )
+
+    errors += _gate_discipline_errors(state, load_policy())
+
+    resumed = _resumed_after_terminal_warning(state)
+    if resumed:
+        warnings.append(resumed)
 
     # out-of-band edit detection: the last journaled status transition for a
     # unit must agree with the unit's current status
@@ -419,6 +559,25 @@ def cmd_validate(args) -> int:
     return _emit_validation(state, args.file, args.human)
 
 
+def autonomy_block(level: str) -> dict:
+    """The pre-authorized autonomy block (issue #22) for `level`, filled from
+    autonomy/policy.json defaults: the policy version in force, the run-level
+    budget ceilings, and the level's publish flag. L0 keeps the supervised
+    meaning of pre-policy state files."""
+    policy = load_policy() or {}
+    block = {"level": level if level in POLICY_LEVELS else "L0"}
+    if policy.get("version"):
+        block["policy_version"] = policy["version"]
+    budget = policy.get("budget") or {}
+    block["budget"] = {
+        "max_tokens": budget.get("max_tokens", 5_000_000),
+        "max_wall_clock_minutes": budget.get("max_wall_clock_minutes", 720),
+    }
+    block["publish_allowed"] = bool(
+        (policy.get("levels") or {}).get(block["level"], {}).get("publish_allowed"))
+    return block
+
+
 def cmd_init(args) -> int:
     path = Path(args.file)
     if path.exists() and not args.force:
@@ -431,15 +590,20 @@ def cmd_init(args) -> int:
         "journal": [],
         "budget_ledger": {"tokens_total": 0, "hours_human_total": 0.0,
                           "regression_triage_hours": 0.0},
+        "autonomy": autonomy_block(args.autonomy_level),
+        "run_status": "pending",
     }
     schema = json.loads(SCHEMA_PATH.read_text())
     errs = validate_schema(state, schema)
     assert not errs, errs
     append_transitions(state, [(None, "project", None, {"name": args.name,
                                                         "python_path": args.python_path}),
-                               (None, "stage", None, args.stage)], actor="state.py")
+                               (None, "stage", None, args.stage),
+                               (None, "autonomy", None, state["autonomy"]),
+                               (None, "run_status", None, "pending")], actor="state.py")
     write_json_atomic(path, state)
-    human = f"initialized {path} (project={args.name}, stage={args.stage})"
+    human = (f"initialized {path} (project={args.name}, stage={args.stage}, "
+             f"autonomy={args.autonomy_level})")
     emit({"tool": TOOL, "version": VERSION, "file": str(path),
           "summary": {"exit_code": EXIT_OK, "human": human}}, human_flag=args.human)
     return EXIT_OK
@@ -499,6 +663,40 @@ def cmd_set(args) -> int:
     return EXIT_OK
 
 
+def _escalation_gate(state: dict, unit: str, note: str | None, actor: str,
+                     journal_change) -> dict:
+    """The unit's escalation gate: reuse the open one, else open it."""
+    gate = next((g for g in state.get("human_gates", [])
+                 if g.get("gate") == "unit_escalation" and g.get("state") == "open"),
+                None)
+    if gate is None:
+        gate = {"gate": "unit_escalation", "state": "open",
+                "note": note or f"{unit}: escalated by {actor}"}
+        state.setdefault("human_gates", []).append(gate)
+        journal_change("human_gates[gate=unit_escalation].state", None, "open")
+    return gate
+
+
+def _defer_escalation_via_policy(gate: dict, unit: str, journal_change) -> None:
+    """At L2+ escalation is defer, not halt: resolve the gate via ESC-1 —
+    the unit keeps its Python fallback live and drains into the end-of-run
+    escalation dossier while the backlog continues."""
+    version = (load_policy() or {}).get("version")
+    gate["state"] = "deferred"
+    gate["decided_by"] = "policy:ESC-1"
+    if version:
+        gate["policy_version"] = version
+    gate["evidence"] = sorted(set(gate.get("evidence") or []) | {
+        f"unit={unit}", "fallback=python (live)",
+        "deferred=drains into the end-of-run escalation dossier"})
+    journal_change("human_gates[gate=unit_escalation].state", "open", "deferred")
+    journal_change("human_gates[gate=unit_escalation].decided_by",
+                   None, "policy:ESC-1")
+    if version:
+        journal_change("human_gates[gate=unit_escalation].policy_version",
+                       None, version)
+
+
 def cmd_mark(args) -> int:
     path = Path(args.file)
     state = _load(path)
@@ -531,14 +729,11 @@ def cmd_mark(args) -> int:
         mark_field(f"units[{args.unit}].parity.divergence_note",
                    parity.get("divergence_note"), args.note)
         parity["divergence_note"] = args.note
+
     if args.status == "escalated":
-        gates = state.setdefault("human_gates", [])
-        has_open = any(g.get("gate") == "unit_escalation" and g.get("state") == "open"
-                       for g in gates)
-        if not has_open:
-            gates.append({"gate": "unit_escalation", "state": "open",
-                          "note": args.note or f"{args.unit}: escalated by {args.actor}"})
-            mark_field("human_gates[gate=unit_escalation].state", None, "open")
+        gate = _escalation_gate(state, args.unit, args.note, args.actor, mark_field)
+        if autonomy_level(state) in DRIVER_LEVELS:
+            _defer_escalation_via_policy(gate, args.unit, mark_field)
 
     mark_field(f"units[{args.unit}].status", old_status, args.status)
     unit["status"] = args.status
@@ -554,6 +749,81 @@ def cmd_mark(args) -> int:
     human = f"{args.unit}: {old_status} -> {args.status} ({n} journal entr{'y' if n == 1 else 'ies'})"
     emit({"tool": TOOL, "version": VERSION, "file": str(path), "unit": args.unit,
           "from": old_status, "to": args.status, "changes": len(changes),
+          "summary": {"exit_code": EXIT_OK, "human": human}}, human_flag=args.human)
+    return EXIT_OK
+
+
+def _decider_error(args, policy: dict | None, version: str | None) -> str | None:
+    """Validate --by: 'human', or 'policy:<rule-id>' the policy defines."""
+    if args.by == "human":
+        return None
+    if not _POLICY_DECIDED_BY_RE.match(args.by):
+        return "--by must be 'human' or 'policy:<rule-id>' (e.g. policy:GO-1)"
+    rule_id = args.by.split(":", 1)[1]
+    rule_ids = ({r.get("id") for r in policy.get("rules", [])}
+                if policy else None)
+    if rule_ids is not None and rule_id not in rule_ids:
+        return f"--by {args.by!r}: rule id not defined in autonomy/policy.json"
+    if not version:
+        return (f"--by {args.by!r} requires --policy-version (or a readable "
+                f"autonomy/policy.json)")
+    return None
+
+
+def cmd_resolve_gate(args) -> int:
+    """Record a gate decision — 'human' or 'policy:<rule-id>' — journaled,
+    validated, atomic. The policy evaluation itself lives in pipeline.py
+    (resolve-gates); this is the recording surface both humans and the
+    driver write through."""
+    path = Path(args.file)
+    state = _load(path)
+    gate = find_gate(state, args.gate)
+    changes = []
+    if gate is None:
+        if not args.create:
+            return _refusal(f"no {args.gate!r} gate in {path} — open one first "
+                            f"or pass --create", args.human, file=str(path))
+        gate = {"gate": args.gate, "state": "open",
+                "note": args.note or f"{args.gate}: opened for resolution"}
+        state.setdefault("human_gates", []).append(gate)
+        changes.append((None, f"human_gates[gate={args.gate}].state", None, "open"))
+    policy = load_policy()
+    version = args.policy_version or (policy or {}).get("version")
+    error = _decider_error(args, policy, version)
+    if error:
+        return _refusal(error, args.human, file=str(path))
+    if (args.gate == "cutover" and args.decision == "approved"
+            and args.by.startswith("policy:")
+            and not publish_preauthorized(state)):
+        return _refusal("policy-approved cutover requires autonomy.level=L3 and "
+                        "autonomy.publish_allowed=true — publish is an L3-only "
+                        "pre-authorization (set the level BEFORE the run, never "
+                        "mid-run)", args.human, file=str(path))
+
+    old = gate.get("state")
+    updates = {"state": args.decision, "decided_by": args.by}
+    if args.by != "human" and version:
+        updates["policy_version"] = version
+    if args.evidence:
+        updates["evidence"] = merge_evidence(gate.get("evidence"), args.evidence)
+    if args.note:
+        updates["note"] = args.note
+    record_gate_fields(gate, updates, changes)
+    if not changes:
+        human = f"no changes ({path} untouched)"
+        emit({"tool": TOOL, "version": VERSION, "file": str(path), "changes": [],
+              "summary": {"exit_code": EXIT_OK, "human": human}}, human_flag=args.human)
+        return EXIT_OK
+    try:
+        save_validated(state, path, actor=args.actor, changes=changes)
+    except ValueError as e:
+        return _refusal(str(e), args.human, file=str(path), rolled_back=True)
+    human = (f"gate {args.gate}: {old} -> {args.decision} "
+             f"(decided_by={args.by}, {len(changes)} journal entries)")
+    emit({"tool": TOOL, "version": VERSION, "file": str(path), "gate": args.gate,
+          "decision": args.decision, "decided_by": args.by,
+          "policy_version": gate.get("policy_version"),
+          "evidence": gate.get("evidence", []),
           "summary": {"exit_code": EXIT_OK, "human": human}}, human_flag=args.human)
     return EXIT_OK
 
@@ -664,6 +934,17 @@ def cmd_migrate(args) -> int:
     ensure(state, "budget_ledger",
            {"tokens_total": 0, "hours_human_total": 0.0, "regression_triage_hours": 0.0},
            "budget_ledger", None)
+    # issue #22 backfills: pre-authorization block (L0 keeps the supervised
+    # meaning), run_status, and decided_by for gates resolved before the
+    # policy layer existed — those were human decisions by definition
+    ensure(state, "autonomy", autonomy_block("L0"), "autonomy", None)
+    ensure(state, "run_status", "pending", "run_status", None)
+    for i, g in enumerate(state.get("human_gates", [])):
+        if g.get("state") != "open" and not g.get("decided_by"):
+            g["decided_by"] = "human"
+            field = f"human_gates[{i}].decided_by"
+            migrations.append({"field": field, "from": None, "to": "human"})
+            changes.append((None, field, None, "human"))
     for unit in state.get("units", []):
         uid = unit.get("id")
         ensure(unit, "attempts", 0, f"units[{uid}].attempts", uid)
@@ -720,10 +1001,13 @@ def cmd_show(args) -> int:
     for u in state.get("units", []):
         counts[u.get("status", "?")] = counts.get(u.get("status", "?"), 0) + 1
     human = (f"{state.get('project', {}).get('name', '?')}: stage={state.get('stage')}, "
+             f"run={state.get('run_status', 'n/a')}, "
+             f"autonomy={autonomy_level(state)}, "
              f"{len(state.get('units', []))} units: "
              + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())))
     emit({"tool": TOOL, "version": VERSION, "project": state.get("project"),
-          "stage": state.get("stage"), "status_counts": counts,
+          "stage": state.get("stage"), "run_status": state.get("run_status"),
+          "autonomy": state.get("autonomy"), "status_counts": counts,
           "journal_len": len(state.get("journal", [])),
           "open_gates": [g for g in state.get("human_gates", []) if g.get("state") == "open"],
           "summary": {"exit_code": EXIT_OK, "human": human}}, human_flag=args.human)
@@ -744,6 +1028,10 @@ def main(argv=None) -> int:
     p.add_argument("--name", required=True)
     p.add_argument("--python-path", required=True)
     p.add_argument("--stage", type=int, default=0)
+    p.add_argument("--autonomy-level", default="L0", choices=sorted(POLICY_LEVELS),
+                   help="pre-authorized autonomy for the run (issue #22); "
+                        "L0 = supervised human gates, L2+ = policy-resolved, "
+                        "L3 = autopilot incl. cutover")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init)
 
@@ -763,6 +1051,21 @@ def main(argv=None) -> int:
     p.add_argument("--note", help="required for divergent_explained; appended to notes otherwise")
     p.add_argument("--actor", default="orchestrator")
     p.set_defaults(func=cmd_mark)
+
+    p = sub.add_parser("resolve-gate", help="record a gate decision — human or "
+                                            "policy:<rule-id> — journaled and validated")
+    p.add_argument("file")
+    p.add_argument("--gate", required=True, choices=GATES)
+    p.add_argument("--decision", required=True, choices=["approved", "rejected", "deferred"])
+    p.add_argument("--by", required=True, help="'human' or 'policy:<rule-id>' (e.g. policy:GO-1)")
+    p.add_argument("--policy-version", help="defaults to autonomy/policy.json's version")
+    p.add_argument("--evidence", action="append", default=[],
+                   help="key=value record the decision evaluated (repeatable)")
+    p.add_argument("--note")
+    p.add_argument("--create", action="store_true",
+                   help="open the gate first if no gate of this name exists")
+    p.add_argument("--actor", default="orchestrator")
+    p.set_defaults(func=cmd_resolve_gate)
 
     p = sub.add_parser("shim", help="emit the per-unit fallback switch shim")
     p.add_argument("file")

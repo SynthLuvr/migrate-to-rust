@@ -87,6 +87,38 @@ def require_fields_exercised(instances: list[dict]) -> None:
     print("ok: an example instance exercises journal[], scope_change, and unit notes/sessions")
 
 
+def require_autonomy_exercised(instances: list[dict]) -> None:
+    """Issue #22: the corpus must exercise the autonomy layer — an autonomy
+    block with a journaled policy decision (decided_by=policy:<rule> with
+    evidence), a human decision, a terminal run_status, and the deferred
+    gate state — or those schema fields stop being guarded."""
+    policy_decided = any(
+        str(gate.get("decided_by", "")).startswith("policy:")
+        and gate.get("policy_version") and gate.get("evidence")
+        and gate.get("state") == "deferred"
+        for inst in instances for gate in inst.get("human_gates", [])
+    )
+    human_decided = any(
+        gate.get("decided_by") == "human"
+        for inst in instances for gate in inst.get("human_gates", [])
+    )
+    autonomy_blocks = [inst.get("autonomy") for inst in instances
+                       if isinstance(inst.get("autonomy"), dict)
+                       and inst["autonomy"].get("level") in ("L2", "L3")]
+    terminal = [inst.get("run_status") for inst in instances
+                if inst.get("run_status") in
+                ("complete", "no_go_measured", "budget_exhausted", "failed_safely")]
+    if not (policy_decided and human_decided and autonomy_blocks and terminal):
+        fail(
+            "no example exercises the autonomy layer together: a policy-decided "
+            "(deferred) gate with policy_version+evidence, a human decision, an "
+            "L2/L3 autonomy block, and a terminal run_status "
+            "(see framework/examples/migration-state.json)"
+        )
+    print("ok: an example instance exercises policy/human gate decisions, an "
+          "L2+ autonomy block, and a terminal run_status")
+
+
 def require_all_statuses_exercised(instances: list[dict], schema: dict) -> None:
     """Every status the schema's enum permits must appear on some unit in
     the example corpus (the worked example exists to cover them all)."""
@@ -151,7 +183,29 @@ def require_fields_constrained(schema: dict) -> None:
         gate_schema,
         {"gate": "scope_change", "state": "open"},
     )
-    print("ok: journal/sessions required fields and gate enum are enforced")
+    must_reject(
+        "a bogus autonomy level",
+        schema["properties"]["autonomy"]["properties"]["level"],
+        "L4",
+    )
+    must_reject(
+        "a non-terminal run_status ('awaiting_input')",
+        schema["properties"]["run_status"],
+        "awaiting_input",
+    )
+    must_accept(
+        "a policy-decided gate record",
+        gate_schema,
+        {"gate": "go_no_go", "state": "approved", "decided_by": "policy:GO-1",
+         "policy_version": "1.0.0", "evidence": ["saving=58.0"]},
+    )
+    must_reject(
+        "a bogus gate resolution state",
+        gate_schema,
+        {"gate": "cutover", "state": "awaiting-input"},
+    )
+    print("ok: journal/sessions required fields, gate enum, and the autonomy/"
+          "run_status/gate-resolution fields are enforced")
 
 
 def require_units_constrained(schema: dict) -> None:
@@ -188,6 +242,7 @@ def main() -> None:
 
     instances = validate_examples(validator, resolve_instance_paths(sys.argv[1:]))
     require_fields_exercised(instances)
+    require_autonomy_exercised(instances)
     require_all_statuses_exercised(instances, schema)
     require_fields_constrained(schema)
     require_units_constrained(schema)

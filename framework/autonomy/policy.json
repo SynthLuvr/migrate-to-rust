@@ -1,0 +1,101 @@
+{
+  "$comment": "The autonomy policy layer (issue #22, proposal C): each former human gate becomes a machine-decidable rule with a conservative default, journaled and non-blocking. Evaluated only in code (tools/pipeline.py resolve-gates / tools/state.py resolve-gate) — never by LLM self-approval. Every decision records decided_by='policy:<rule-id>' + policy_version + evidence[] in migration-state.json. Levels: L0 = supervised (the pre-policy behavior — gates are hard human stops); L1 = agent proposes, still stops at gates; L2 = all gates policy-resolved, publish disabled; L3 = full autopilot incl. cutover. Operators pre-authorize the level BEFORE the run: there are zero mid-run questions at L2+. The dual-build design is what makes autonomy safe — per-unit Python fallback, one-env-var shim, rollback pin; every autonomous decision stays reversible per unit.",
+  "version": "1.0.0",
+  "default_level": "L0",
+  "levels": {
+    "L0": {
+      "name": "supervised",
+      "gates": "hard human stops — the pre-policy behavior; the agent (recipe.yaml / MIGRATION_PROMPT.md) drives and asks at every gate",
+      "publish_allowed": false,
+      "driver": false
+    },
+    "L1": {
+      "name": "assisted",
+      "gates": "agent proposes a resolution per gate but still stops and asks; humans decide",
+      "publish_allowed": false,
+      "driver": false
+    },
+    "L2": {
+      "name": "autonomous",
+      "gates": "all gates resolved by the rules below in code — journaled, non-blocking, conservative defaults",
+      "publish_allowed": false,
+      "driver": true
+    },
+    "L3": {
+      "name": "autopilot",
+      "gates": "as L2, plus Stage-6 cutover/publish once CUT-1's evidence bar is met",
+      "publish_allowed": true,
+      "driver": true
+    }
+  },
+  "budget": {
+    "$comment": "Global ceilings enforced by the driver (tools/pipeline.py run) — the run-level analogue of the per-unit MAX_ROUNDS budget. Copy into state.autonomy.budget at init time; the state block wins once present.",
+    "max_tokens": 5000000,
+    "max_wall_clock_minutes": 720,
+    "max_agent_retries_per_stage": 2
+  },
+  "rules": [
+    {
+      "id": "GO-1",
+      "gate": "go_no_go",
+      "title": "Stage-0 GO/NO-GO + scope from the recorded projection",
+      "decides": "approved (go) iff go_no_go.projection.end_to_end_saving_pct >= min_end_to_end_saving_pct AND go_no_go.no_equivalent_deps contains nothing that is still inside the recorded scope (DEP-1 descopes first); else rejected (no-go). Scope = the recorded go_no_go.scope tranche — the minimal set meeting the bar, never 'the repo'.",
+      "params": { "min_end_to_end_saving_pct": 50 },
+      "on_reject": {
+        "run_status": "no_go_measured",
+        "note": "NO-GO is a successful terminal state: keep or optimize the Python (ScanCode's original matched its Rust port once given similar effort). Re-enter Stage 0 in a fresh run to grow scope."
+      }
+    },
+    {
+      "id": "SUB-1",
+      "gate": "crate_substitution",
+      "title": "crate choice from the substitution table",
+      "decides": "approved with the highest-ranked crate in knowledge/substitutions.json whose 'verified' evidence is 'canonical'/'builtin' or an ISO date within max_verified_age_months of decision time; rejected (module stays Python) when the table has no entry or no candidate carries fresh verification. Never improvises a crate outside the table — that hard rule is unchanged.",
+      "params": { "max_verified_age_months": 6 },
+      "evidence_in": "python=<module> in the gate evidence[] (or the first word of the gate note)"
+    },
+    {
+      "id": "RED-1",
+      "gate": "redesign_approval",
+      "title": "Stage-1 data-structure redesign proposals",
+      "decides": "approved iff a spike passes the oracle on the golden corpus (spike_verdict=equivalent) AND the matched-corpus benchmark improves by >= min_benchmark_improvement_pct; else rejected — keep the literal shape. The safe default: a proposal without recorded evidence keeps the literal translation; correctness gates apply either way.",
+      "params": { "min_benchmark_improvement_pct": 10 },
+      "evidence_in": "spike_verdict=<equivalent|divergent|incomparable>, bench_improvement_pct=<number> in the gate evidence[]"
+    },
+    {
+      "id": "DEP-1",
+      "gate": "no_equivalent_dependency",
+      "title": "dependency with no maintained Rust equivalent — descope, don't stop",
+      "decides": "approved as a descope: the dependency's modules stay Python (dual-build fallback); units inside the module and their transitive dependents are marked fallback_python and dropped from the tranche; the module is removed from go_no_go scope/no_equivalent_deps. Never a substitution, never a halt. 'Never improvise a substitute' remains a hard rule.",
+      "params": {},
+      "evidence_in": "module=<python package> in the gate evidence[]"
+    },
+    {
+      "id": "ESC-1",
+      "gate": "unit_escalation",
+      "title": "escalated units — defer, don't halt",
+      "decides": "deferred: the unit keeps its Python fallback live, stays 'escalated', and drains into the end-of-run escalation dossier; the backlog continues. Escalation is decoupled from progress — 'escalate to human queue' becomes defer, not halt.",
+      "params": {}
+    },
+    {
+      "id": "SC-1",
+      "gate": "scope_change",
+      "title": "mid-run scope changes — conservative reject",
+      "decides": "rejected: mid-run scope growth is not auto-approved under any level; the request is recorded and surfaced in the run report. The run continues on the already-approved scope; growing scope re-enters Stage 0 in a fresh run (a new projection, not a mid-flight edit).",
+      "params": {}
+    },
+    {
+      "id": "CUT-1",
+      "gate": "cutover",
+      "title": "Stage-6 cutover/publish",
+      "decides": "approved iff shadow_diff_rate <= max_shadow_diff_rate over >= min_shadow_samples AND canary SLOs green for >= min_canary_green_minutes AND rollback actually tested (deploy the old pin, verify, return) — and only at L3 with autonomy.publish_allowed=true. At L2 the gate resolves rejected (publish disabled; the run completes without cutover, dual-build intact). A failed evidence bar at L3 also rejects: no cutover, run continues safely on the fallback.",
+      "params": {
+        "max_shadow_diff_rate": 0.0,
+        "min_shadow_samples": 1000,
+        "min_canary_green_minutes": 60,
+        "rollback_test_required": true
+      },
+      "evidence_in": "shadow_diff_rate=<number>, shadow_samples=<int>, canary_green_minutes=<int>, rollback_tested=<true|false> in the gate evidence[]"
+    }
+  ]
+}

@@ -200,7 +200,10 @@ def _pr_proposal(base, head, changed, mapped, unmapped, plan, needing_human) -> 
         "1. Re-run the parity plan above (oracle manifests under `manifests/`).",
         "2. Reviewer pass (roles/reviewer.md) on any unit whose parity changed.",
         "3. `pyo3_review.py` on the port diff; `attribution.py check` if headers moved.",
-        "4. Human sign-off for units flagged above before merge.",
+        "4. Human sign-off for units flagged above before merge (at autonomy "
+        "L2+ these drain into the run-report escalation dossier instead of "
+        "blocking the port-forward; the maintain-stage decisions stay human "
+        "either way).",
         "",
     ]
     return "\n".join(lines)

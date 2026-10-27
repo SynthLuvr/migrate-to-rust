@@ -4,7 +4,12 @@
 # that root):
 #   goose run --recipe framework/recipe.yaml
 # Point at a target project elsewhere via TARGET_PYTHON_PROJECT, not by cd.
-# Enforces: stage order, human gates, state-file discipline, role separation.
+# Enforces: stage order, gate resolution per the pre-authorized autonomy
+# level, state-file discipline, role separation. For unattended runs
+# (autonomy L2/L3) prefer the deterministic driver:
+#   python framework/tools/pipeline.py run <state.json> \
+#     --agent-cmd 'goose run --recipe framework/recipe.yaml' --autonomy L2
+# which owns the loop and invokes an agent per stage as the stage worker.
 # Adjust `settings:` to your provider/model.
 title: Python to Rust Migration
 description: >
@@ -21,9 +26,17 @@ instructions: |
      matching framework/stages/<n>-*.md checklist and follow it. Do not enter
      the next stage until every exit criterion is met AND recorded in
      framework/state/migration-state.json.
-  3. Human gates are hard stops: Stage 0 go/no-go + scope, Stage 1
-     data-structure redesigns, any escalated unit, Stage 6 cutover. Ask;
-     never self-approve.
+  3. Gates resolve per the run's pre-authorized autonomy level
+     (framework/autonomy/policy.json; issue #22). Default L0: gates are
+     hard stops — Stage 0 go/no-go + scope, Stage 1 data-structure
+     redesigns, any escalated unit, Stage 6 cutover. Ask; never
+     self-approve. At L2+ the deterministic driver (framework/tools/
+     pipeline.py) resolves gates by policy rules in code, journaled with
+     decided_by=policy:<rule-id> + evidence; as the stage worker you record
+     data through tools/state.py and never touch gates, stage, or
+     run_status. NO-GO is a successful terminal state, escalations defer
+     (python fallback stays live), and no-equivalent dependencies descope
+     instead of halting.
   4. In Stage 4, delegate per-unit translation to subagents using
      framework/roles/translator.md as their instructions. Never assign the
      same file to two delegates. Review every unit with

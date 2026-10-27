@@ -27,9 +27,13 @@ GO/NO-GO recommendation.
 
 ## Exit criteria
 - [ ] Hotspot list backed by profiler output, not intuition
-- [ ] Scope drawn and signed by human
-- [ ] No-equivalent dependencies surfaced
-- [ ] Human signed GO (or NO-GO recorded)
+- [ ] Scope drawn (the minimal tranche meeting the bar) and the go/no-go
+      gate resolved — `decided_by: human` at L0/L1, `policy:GO-1` at L2+
+      (journaled with the projection evidence)
+- [ ] No-equivalent dependencies surfaced (resolved by descope via
+      `policy:DEP-1` at L2+ — descope, don't stop)
+- [ ] GO recorded, or NO-GO recorded — NO-GO ends the run in the
+      `no_go_measured` terminal state: a *successful* outcome, not a failure
 
 ## Escalate
 - Projection < 50% → recommend NO-GO in writing. An *optimized Python* is a

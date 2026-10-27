@@ -124,13 +124,47 @@
         "required": ["gate", "state"],
         "properties": {
           "gate": {
-            "enum": ["go_no_go", "scope_change", "redesign_approval", "unit_escalation", "cutover", "crate_substitution"],
-            "$comment": "scope_change = MIGRATION_PROMPT.md mandatory gate 'any scope change later'"
+            "enum": ["go_no_go", "scope_change", "redesign_approval", "unit_escalation", "cutover", "crate_substitution", "no_equivalent_dependency"],
+            "$comment": "scope_change = MIGRATION_PROMPT.md mandatory gate 'any scope change later'; no_equivalent_dependency is resolved by policy DEP-1 (descope, never a substitution)"
           },
-          "state": { "enum": ["open", "approved", "rejected"] },
-          "note": { "type": "string" }
+          "state": { "enum": ["open", "approved", "rejected", "deferred"], "$comment": "deferred = resolved by policy as defer-not-halt (ESC-1); a resolved gate is never blocking" },
+          "note": { "type": "string" },
+          "decided_by": {
+            "type": "string",
+            "$comment": "'human' or 'policy:<rule-id>' referencing autonomy/policy.json (state.py checks the pattern and the rule id); required on any non-open gate"
+          },
+          "policy_version": { "type": "string", "$comment": "the autonomy/policy.json version the rule was evaluated against (required when decided_by starts with policy:)" },
+          "evidence": {
+            "type": "array",
+            "items": { "type": "string" },
+            "$comment": "key=value measurement records the policy evaluated (or the human reviewed): spike_verdict=, bench_improvement_pct=, shadow_diff_rate=, shadow_samples=, canary_green_minutes=, rollback_tested=, module=, python= — extracted, never invented"
+          }
         }
       }
+    },
+    "autonomy": {
+      "type": "object",
+      "$comment": "Pre-authorized autonomy for this run (issue #22). Set once BEFORE the run starts (state.py init --autonomy-level / pipeline.py run --autonomy) and journaled on change; the driver enforces it, the agent cannot raise it mid-run. There are zero mid-run questions at L2+.",
+      "properties": {
+        "level": {
+          "enum": ["L0", "L1", "L2", "L3"],
+          "$comment": "L0 supervised (human gates are hard stops) · L1 agent proposes, humans decide · L2 all gates policy-resolved, publish disabled · L3 full autopilot incl. cutover"
+        },
+        "policy_version": { "type": "string", "$comment": "autonomy/policy.json version in force for this run" },
+        "budget": {
+          "type": "object",
+          "$comment": "run-level ceilings enforced by tools/pipeline.py; over either ceiling the run ends in the budget_exhausted terminal state",
+          "properties": {
+            "max_tokens": { "type": "integer", "minimum": 1 },
+            "max_wall_clock_minutes": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "publish_allowed": { "type": "boolean", "$comment": "must be true (L3 only) for a policy-approved cutover; state.py rejects the combination otherwise" }
+      }
+    },
+    "run_status": {
+      "enum": ["pending", "running", "complete", "no_go_measured", "budget_exhausted", "failed_safely"],
+      "$comment": "Terminal-state discipline (issue #22): a driver run ALWAYS ends in complete / no_go_measured / budget_exhausted / failed_safely — never 'awaiting input'. Every terminal state emits the same deliverable set (run report incl. the escalation dossier, state file, journal)."
     },
     "journal": {
       "type": "array",
