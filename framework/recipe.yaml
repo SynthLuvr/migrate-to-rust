@@ -1,14 +1,16 @@
 # goose recipe — orchestrator for the Python→Rust migration pipeline.
 # Run:  goose run --recipe framework/recipe.yaml
 # Enforces: stage order, human gates, state-file discipline, role separation.
-# Adjust `settings:` to your provider/model; point $TARGET_PYTHON_PROJECT at
-# the repo under migration (or supply it in chat at run time).
+# Adjust `settings:` to your provider/model; point the
+# TARGET_PYTHON_PROJECT parameter at the repo under migration (or supply
+# it in chat at run time).
 title: Python to Rust Migration
 description: >
   Evidence-grounded migration harness: profile -> plan -> contracts ->
   scaffold -> translate (oracle-ranked repair loop) -> gates -> integrate ->
   maintain. The Python API stays frozen; the Rust core ships as a PyO3 wheel.
-author: migrate-to-rust
+author:
+  contact: migrate-to-rust
 instructions: |
   You are the pipeline orchestrator. Follow this discipline exactly:
   1. Read framework/MIGRATION_PROMPT.md first. Its hard rules bind every
@@ -35,16 +37,23 @@ instructions: |
   7. Stage 3 instantiates the crate from SynthLuvr/rust-template per
      framework/stages/3-scaffold.md — never hand-roll the gate stack.
 prompt: |
-  Begin Stage 0 (Feasibility) on $TARGET_PYTHON_PROJECT. If no target was
+  Begin Stage 0 (Feasibility) on {{ TARGET_PYTHON_PROJECT }}. If no target was
   given, ask for it before profiling anything. Initialize
   framework/state/migration-state.json from
   framework/state/migration-state.schema.json and keep it current through
-  every stage.
-context:
-  - SUMMARY.md
-  - TOOLCHAIN.md
-  - framework/MIGRATION_PROMPT.md
-  - research/5-idioms-and-ecosystem-mapping.md
+  every stage. BACKGROUND — read from disk as needed: SUMMARY.md (research
+  synthesis), TOOLCHAIN.md (tool choices), and
+  research/5-idioms-and-ecosystem-mapping.md (idiom + crate knowledge).
+parameters:
+  - key: TARGET_PYTHON_PROJECT
+    input_type: string
+    requirement: user_prompt
+    description: >
+      Path to the Python project under migration. If omitted, the agent asks
+      for it in chat before profiling anything.
+# NOTE: goose >= 1.53 has no recipe `context` field (it is silently ignored).
+# SUMMARY.md, TOOLCHAIN.md, and research/5-idioms-and-ecosystem-mapping.md are
+# background the agent reads from disk per the instructions below.
 activities:
   - Profile the target project and produce the go/no-go report
   - Resume an in-progress migration from the state file
