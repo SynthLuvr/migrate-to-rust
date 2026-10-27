@@ -71,8 +71,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: HEAD-check cited URLs
-        # dfrws.org 403s automated checks (#10); reddit 403s datacenter IPs
-        # (GitHub runners) while serving residential requests fine.
+        # dfrws.org 403s automated checks (Cloudflare bot-block; pages verified
+        # live 2026-10-27, #10); reddit 403s datacenter IPs (GitHub runners)
+        # while serving residential requests fine.
         run: python scripts/check_links.py --external --allow-host dfrws.org --allow-host www.reddit.com
 
   state-schema:
