@@ -45,7 +45,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, emit, module_name_of, read_json,
+    EXIT_FINDINGS, EXIT_OK, emit, emit_error, module_name_of,
+    read_json, run_cli,
 )
 
 TOOL = "port_plan.py"
@@ -222,9 +223,9 @@ def cmd_from_cprofile(args) -> int:
 def cmd_plan(args) -> int:
     hotspots = read_json(args.hotspots)
     if not isinstance(hotspots, list) or not hotspots:
-        print("hotspots JSON must be a non-empty list of per-module measurements",
-              file=sys.stderr)
-        return EXIT_ERROR
+        return emit_error(
+            "hotspots JSON must be a non-empty list of per-module measurements",
+            kind="usage", tool=TOOL, version=VERSION, human_flag=args.human)
     project_root = Path(args.project_root or ".").resolve()
 
     # resolve each hotspot path against the project root; keep the original
@@ -238,8 +239,8 @@ def cmd_plan(args) -> int:
         if not p.exists():
             p = _find_by_suffix(h["path"], project_root)
         if p is None or not p.exists():
-            print(f"hotspot path not found: {h['path']}", file=sys.stderr)
-            return EXIT_ERROR
+            return emit_error(f"hotspot path not found: {h['path']}",
+                              tool=TOOL, version=VERSION, human_flag=args.human)
         resolved[str(p)] = p
         hotspot_of[str(p)] = h
 
@@ -383,4 +384,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_cli(main, tool=TOOL, version=VERSION))

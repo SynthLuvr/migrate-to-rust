@@ -48,6 +48,13 @@ Uniform conventions (so the agent can compose the tools blind):
 - **stdout is always a single JSON object** (`--human` additionally echoes
   the embedded summary to stderr). Errors are JSON too — a refusal is a
   result, not a crash. `summary.exit_code` always mirrors the exit code.
+  Failure paths emit the shared error envelope from `_common.py`
+  (`emit_error` / `run_cli`): `error.kind` ∈ `io` (filesystem/environment)
+  · `usage` (bad or missing input content) · `setup` (missing dependency,
+  exit 4), plus a one-line `error.detail`. The CLI boundary (`run_cli`)
+  converts missing/unreadable/malformed input files (OSError/ValueError)
+  into this envelope instead of a traceback, so stdout parses as JSON on
+  every exit path; genuine programming errors still crash loudly.
 - **Exit codes**: `0` clean · `1` usage/IO · `2` findings (divergence,
   attribution loss, lint errors, cycles, human decision needed) · `3`
   incomparable-without-divergence · `4` setup failure (e.g. no pytest).

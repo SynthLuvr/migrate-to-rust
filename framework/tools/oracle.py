@@ -62,8 +62,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_ERROR, EXIT_FINDINGS, EXIT_INCOMPARABLE, EXIT_OK,
-    emit, read_json, read_jsonl, run_child, sha256_bytes,
+    EXIT_FINDINGS, EXIT_INCOMPARABLE, EXIT_OK,
+    emit, emit_error, read_json, read_jsonl, run_child, run_cli, sha256_bytes,
 )
 
 TOOL = "oracle.py"
@@ -431,8 +431,9 @@ def cmd_judge(args) -> int:
     manifest = read_json(manifest_path)
     for key in ("reference", "candidate", "corpus"):
         if key not in manifest:
-            print(f"manifest missing required key {key!r}", file=sys.stderr)
-            return EXIT_ERROR
+            return emit_error(f"manifest missing required key {key!r}",
+                              kind="usage", tool=TOOL, version=VERSION,
+                              human_flag=args.human)
     corpus_path = Path(manifest["corpus"])
     if not corpus_path.is_absolute():
         corpus_path = manifest_path.parent / corpus_path
@@ -459,8 +460,9 @@ def cmd_compare(args) -> int:
     payload = read_json(args.runs)
     for key in ("reference", "candidate"):
         if not isinstance(payload.get(key), list):
-            print(f"runs file missing list {key!r}", file=sys.stderr)
-            return EXIT_ERROR
+            return emit_error(f"runs file missing list {key!r}",
+                              kind="usage", tool=TOOL, version=VERSION,
+                              human_flag=args.human)
     rules = merge_rules(payload)
     ref_recs = _records_by_index(payload["reference"])
     cand_recs = _records_by_index(payload["candidate"])
@@ -710,4 +712,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_cli(main, tool=TOOL, version=VERSION))

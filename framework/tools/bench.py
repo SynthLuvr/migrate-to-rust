@@ -43,8 +43,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, emit, python_version_string,
-    read_json, read_jsonl, run_child, sha256_bytes, sha256_file,
+    EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, emit, emit_error, python_version_string,
+    read_json, read_jsonl, run_child, run_cli, sha256_bytes, sha256_file,
 )
 from oracle import (  # noqa: E402
     RUNNER_SRC, _execute_entry_subprocess, classify_pair, merge_rules,
@@ -163,16 +163,17 @@ def cmd_run(args) -> int:
     manifest = read_json(manifest_path)
     for key in ("name", "corpus", "python", "rust"):
         if key not in manifest:
-            print(f"manifest missing required key {key!r}", file=sys.stderr)
-            return EXIT_ERROR
+            return emit_error(f"manifest missing required key {key!r}",
+                              kind="usage", tool=TOOL, version=VERSION,
+                              human_flag=args.human)
     corpus_path = Path(manifest["corpus"])
     if not corpus_path.is_absolute():
         corpus_path = manifest_path.parent / corpus_path
     rows = read_jsonl(corpus_path)
     inputs = [v for _, v in rows]
     if not inputs:
-        print(f"corpus {corpus_path} is empty", file=sys.stderr)
-        return EXIT_ERROR
+        return emit_error(f"corpus {corpus_path} is empty", kind="usage",
+                          tool=TOOL, version=VERSION, human_flag=args.human)
 
     try:
         corpus_info, warnings = corpus_commit_info(corpus_path, args.allow_dirty)
@@ -279,4 +280,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_cli(main, tool=TOOL, version=VERSION))

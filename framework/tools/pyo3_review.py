@@ -45,7 +45,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, emit  # noqa: E402
+from _common import EXIT_FINDINGS, EXIT_OK, emit, emit_error, run_cli  # noqa: E402
 
 TOOL = "pyo3_review.py"
 VERSION = 1
@@ -366,8 +366,9 @@ def cmd_review(args) -> int:
         from _common import iter_tree_files
         targets.extend(iter_tree_files(args.dir, extensions={".rs"}))
     if not targets and not args.diff:
-        print("nothing to review: pass --diff, --files, or --dir", file=sys.stderr)
-        return EXIT_ERROR
+        return emit_error("nothing to review: pass --diff, --files, or --dir",
+                          kind="usage", tool=TOOL, version=VERSION,
+                          human_flag=args.human)
     for t in targets:
         if t.suffix != ".rs":
             continue
@@ -412,4 +413,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_cli(main, tool=TOOL, version=VERSION))
