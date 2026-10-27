@@ -202,7 +202,7 @@ def cmd_check(args) -> int:
 
     # ---- strays: port files claimed by nobody ------------------------------
     strays = []
-    for rel, p in sorted(port_files.items()):
+    for rel in sorted(port_files):
         if os.path.splitext(rel)[1].lower() not in SOURCE_EXTENSIONS:
             continue
         if rel in covered_port_files or rel in allowlist:
@@ -210,7 +210,7 @@ def cmd_check(args) -> int:
         strays.append({"path": rel, "reason": allowlist.get(rel, "claimed by no unit "
                                                                  "and not allowlisted")})
     for s in strays:
-        failures.append({"check": "unattributed-file", **{k: s[k] for k in ("path",)},
+        failures.append({"check": "unattributed-file", "path": s["path"],
                          "status": "unattributed", "detail": s["reason"]})
 
     ok = not failures
@@ -250,12 +250,12 @@ def _compare_bytes(rel: str, opath: Path, ppath: Path | None, port_root: Path) -
         # a same-relative copy is required; fall back to same basename nowhere
         return {"path": rel, "status": "missing",
                 "detail": "present in original tree, missing in port tree"}
-    if sha256_file(opath) == sha256_file(ppath):
-        return {"path": rel, "status": "identical", "sha256": sha256_file(opath)}
+    ohash, phash = sha256_file(opath), sha256_file(ppath)
+    if ohash == phash:
+        return {"path": rel, "status": "identical", "sha256": ohash}
     return {"path": rel, "status": "changed",
-            "detail": f"bytes differ (original {sha256_file(opath)[:12]}.. vs port "
-                      f"{sha256_file(ppath)[:12]}..)",
-            "original_sha256": sha256_file(opath), "port_sha256": sha256_file(ppath)}
+            "detail": f"bytes differ (original {ohash[:12]}.. vs port {phash[:12]}..)",
+            "original_sha256": ohash, "port_sha256": phash}
 
 
 def _load_allowlist(path: str | None) -> dict[str, str]:

@@ -19,8 +19,6 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-TOOLS_DIR = Path(__file__).resolve().parent
-
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_FINDINGS = 2
@@ -120,14 +118,6 @@ def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def import_tool(name: str):
-    """Import a sibling tool module (e.g. bench.py importing oracle.py).
-    Works whether the tools are run as scripts or imported under pytest."""
-    if str(TOOLS_DIR) not in sys.path:
-        sys.path.insert(0, str(TOOLS_DIR))
-    return __import__(name)
-
-
 def iter_tree_files(root: str | os.PathLike, extensions: set[str] | None = None) -> list[Path]:
     """Sorted recursive file listing honoring SKIP_DIRS; optional extension
     filter (compared case-insensitively, with the leading dot)."""
@@ -145,3 +135,14 @@ def iter_tree_files(root: str | os.PathLike, extensions: set[str] | None = None)
 
 def python_version_string() -> str:
     return f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+
+
+def module_name_of(python_path: str) -> str:
+    """Dotted module name for a source path: strip src//lib/ layout prefix
+    and trailing __init__ (src/pkg/parse.py -> pkg.parse)."""
+    parts = list(Path(python_path).with_suffix("").parts)
+    if parts and parts[0] in ("src", "lib"):
+        parts = parts[1:]
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)

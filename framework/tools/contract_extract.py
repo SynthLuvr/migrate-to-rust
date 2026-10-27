@@ -38,7 +38,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, emit, read_json, write_json_atomic,
+    EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, EXIT_SETUP, emit, module_name_of,
+    read_json, run_child, write_json_atomic,
 )
 
 TOOL = "contract_extract.py"
@@ -47,25 +48,11 @@ INVARIANT_TAGS = ("Invariant:", "Postcondition:", "Property:")
 NODEID_RE = re.compile(r"^(\S+\.py)::(\S+)$")
 
 
-def module_name_of(python_path: str) -> str:
-    p = Path(python_path)
-    parts = list(p.with_suffix("").parts)
-    if parts and parts[0] in ("src", "lib"):
-        parts = parts[1:]
-    if parts and parts[-1] == "__init__":
-        parts = parts[:-1]
-    return ".".join(parts)
-
-
 # ---------------------------------------------------------------- pytest ---
-
-EXIT_SETUP = 4
-
 
 def collect_pytest(root: Path) -> list[str]:
     """Run pytest --collect-only -q ourselves. Node IDs only; the trailing
     'N tests collected' summary lines are filtered out."""
-    from _common import run_child
     code, stdout, stderr = run_child(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", str(root)],
         cwd=str(root), timeout=300.0)

@@ -40,7 +40,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, emit, now_iso, write_json_atomic  # noqa: E402
+from _common import (  # noqa: E402
+    EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, emit, module_name_of, now_iso, write_json_atomic,
+)
 
 TOOL = "state.py"
 VERSION = 1
@@ -390,6 +392,10 @@ def _load(path: Path) -> dict:
     return state
 
 
+def _find_unit(state: dict, uid: str) -> dict | None:
+    return next((u for u in state.get("units", []) if u.get("id") == uid), None)
+
+
 def _emit_validation(state: dict, label: str, human_flag: bool) -> int:
     schema = json.loads(SCHEMA_PATH.read_text())
     schema_errors = validate_schema(state, schema)
@@ -457,17 +463,13 @@ def cmd_set(args) -> int:
             return _refusal(f"--field expects path=value, got {pair!r}", args.human)
         field, raw = pair.split("=", 1)
         field = field.strip()
-        if args.json_value:
-            try:
-                value = json.loads(raw)
-            except json.JSONDecodeError as e:
+        try:
+            value = json.loads(raw)  # numbers, true/false, null, lists...
+        except json.JSONDecodeError as e:
+            if args.json_value:
                 return _refusal(f"--field {field}: value is not valid JSON: {e}",
                                 args.human)
-        else:
-            try:
-                value = json.loads(raw)  # numbers, true/false, null, lists...
-            except json.JSONDecodeError:
-                value = raw  # fall back to raw string
+            value = raw  # fall back to raw string
         try:
             old = get_field(state, field)
         except (KeyError, TypeError, ValueError):
@@ -500,10 +502,9 @@ def cmd_set(args) -> int:
 def cmd_mark(args) -> int:
     path = Path(args.file)
     state = _load(path)
-    units = [u for u in state.get("units", []) if u.get("id") == args.unit]
-    if not units:
+    unit = _find_unit(state, args.unit)
+    if unit is None:
         return _refusal(f"unknown unit {args.unit!r}", args.human, file=str(path))
-    unit = units[0]
     old_status = unit.get("status")
     parity = unit.setdefault("parity", {})
     changes = []
@@ -555,16 +556,6 @@ def cmd_mark(args) -> int:
           "from": old_status, "to": args.status, "changes": len(changes),
           "summary": {"exit_code": EXIT_OK, "human": human}}, human_flag=args.human)
     return EXIT_OK
-
-
-def _module_from_python_path(python_path: str) -> str:
-    p = Path(python_path)
-    parts = list(p.with_suffix("").parts)
-    if parts and parts[0] in ("src", "lib"):
-        parts = parts[1:]
-    if parts and parts[-1] == "__init__":
-        parts = parts[:-1]
-    return ".".join(parts)
 
 
 def _module_from_rust_path(rust_path: str) -> str:
@@ -622,15 +613,13 @@ def impl():
 
 def cmd_shim(args) -> int:
     state = _load(Path(args.file))
-    units = [u for u in state.get("units", []) if u.get("id") == args.unit]
-    if not units:
+    unit = _find_unit(state, args.unit)
+    if unit is None:
         return _refusal(f"unknown unit {args.unit!r}", args.human)
-    unit = units[0]
     if not unit.get("rust_path"):
         return _refusal(f"unit {args.unit!r} has no rust_path — nothing to "
                         f"switch to yet", args.human, unit=args.unit)
-        return EXIT_ERROR
-    python_import = args.python_import or _module_from_python_path(unit["python_path"])
+    python_import = args.python_import or module_name_of(unit["python_path"])
     rust_import = args.rust_import or _module_from_rust_path(unit["rust_path"])
     prefix = (args.env_prefix or
               re.sub(r"[^0-9A-Za-z]+", "_", state.get("project", {}).get("name", "migration")).upper())
@@ -719,12 +708,12 @@ def cmd_journal(args) -> int:
 def cmd_show(args) -> int:
     state = _load(Path(args.file))
     if args.unit:
-        units = [u for u in state.get("units", []) if u.get("id") == args.unit]
-        if not units:
+        unit = _find_unit(state, args.unit)
+        if unit is None:
             return _refusal(f"unknown unit {args.unit!r}", args.human)
-        human = (f"{args.unit}: status={units[0].get('status')} "
-                 f"parity={units[0].get('parity', {}).get('last_verdict', 'unjudged')}")
-        emit({"tool": TOOL, "version": VERSION, "unit": units[0],
+        human = (f"{args.unit}: status={unit.get('status')} "
+                 f"parity={unit.get('parity', {}).get('last_verdict', 'unjudged')}")
+        emit({"tool": TOOL, "version": VERSION, "unit": unit,
               "summary": {"exit_code": EXIT_OK, "human": human}}, human_flag=args.human)
         return EXIT_OK
     counts: dict[str, int] = {}

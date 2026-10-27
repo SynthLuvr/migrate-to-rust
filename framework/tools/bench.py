@@ -46,7 +46,9 @@ from _common import (  # noqa: E402
     EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, emit, python_version_string,
     read_json, read_jsonl, run_child, sha256_bytes, sha256_file,
 )
-from oracle import _execute_entry_subprocess, classify_pair, merge_rules  # noqa: E402
+from oracle import (  # noqa: E402
+    RUNNER_SRC, _execute_entry_subprocess, classify_pair, merge_rules,
+)
 
 TOOL = "bench.py"
 VERSION = 1
@@ -92,7 +94,6 @@ def corpus_commit_info(corpus_path: Path, allow_dirty: bool) -> tuple[dict, list
 def time_entry(entry: str, inputs: list, manifest_dir: Path, passes: int) -> list[float]:
     """Time `passes` full-corpus runs of one entry, one child process per
     pass (fresh import state — honest cold-start semantics, deterministic)."""
-    from oracle import RUNNER_SRC
     timings = []
     for _ in range(passes):
         stdin = "".join(json.dumps({"i": i, "input": v}) + "\n"
@@ -223,7 +224,7 @@ def cmd_run(args) -> int:
     # recorded for audit
     warmup = int(manifest.get("warmup", 2))
     repeats = int(manifest.get("repeats", 5))
-    for label, side in (("python", "python"), ("rust", "rust")):
+    for side in ("python", "rust"):
         time_entry(manifest[side]["entry"], inputs, manifest_path.parent, warmup)
     py_timings = time_entry(manifest["python"]["entry"], inputs, manifest_path.parent, repeats)
     rs_timings = time_entry(manifest["rust"]["entry"], inputs, manifest_path.parent, repeats)

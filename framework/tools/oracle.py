@@ -56,13 +56,14 @@ import json
 import math
 import re
 import sys
+import types
 import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     EXIT_ERROR, EXIT_FINDINGS, EXIT_INCOMPARABLE, EXIT_OK,
-    emit, read_json, read_jsonl, sha256_bytes,
+    emit, read_json, read_jsonl, run_child, sha256_bytes,
 )
 
 TOOL = "oracle.py"
@@ -388,7 +389,6 @@ def _execute_entry_local(entry: str, inputs: list) -> list[dict]:
 
 def _execute_entry_subprocess(entry: str, inputs: list, manifest_dir: Path,
                               timeout: float) -> list[dict]:
-    from _common import run_child
     stdin = "".join(json.dumps({"i": i, "input": v}) + "\n" for i, v in enumerate(inputs))
     code, stdout, stderr = run_child(
         [sys.executable, "-c", RUNNER_SRC, entry],
@@ -628,17 +628,16 @@ SELF_TEST_INPUTS = [
 
 
 def cmd_self_test(args) -> int:
-    import types, sys as _sys
     mod = types.ModuleType("_oracle_selftest_reference")
     mod.run = _reference_word_count
-    _sys.modules["_oracle_selftest_reference"] = mod
+    sys.modules["_oracle_selftest_reference"] = mod
     ref_recs = _execute_entry_local("_oracle_selftest_reference:run", SELF_TEST_INPUTS)
 
     results = []
     for name, fn in SELF_TEST_BUGS:
         bug_mod = types.ModuleType(f"_oracle_selftest_{name}")
         bug_mod.run = fn
-        _sys.modules[f"_oracle_selftest_{name}"] = bug_mod
+        sys.modules[f"_oracle_selftest_{name}"] = bug_mod
         cand_recs = _execute_entry_local(f"_oracle_selftest_{name}:run", SELF_TEST_INPUTS)
         runs = [classify_pair(i, ref_recs[i], cand_recs[i], merge_rules({}))
                 for i in range(len(SELF_TEST_INPUTS))]

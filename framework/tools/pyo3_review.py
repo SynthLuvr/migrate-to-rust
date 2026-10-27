@@ -72,9 +72,9 @@ STATIC_MUT_RE = re.compile(r"\bstatic\s+mut\b")
 INT_CAST_RE = re.compile(r"as\s+(i|u)(size|\d+)|\.extract::<\(i|u\)\w*>")
 
 ATTR_RE = re.compile(r"#\[\s*(pyfunction|pymethods|pyclass)")
-FN_RE = re.compile(r"^\s*(?:pub\s+)?(?:unsafe\s+)?(?:extern\s+)?" r"fn\s+(\w+)")
-PYCLASS_STRUCT_RE = re.compile(r"#\[\s*pyclass")
-# field TYPE position, not line start: `inner: Rc<Vec<u8>>,`
+FN_RE = re.compile(r"^\s*(?:pub\s+)?(?:unsafe\s+)?(?:extern\s+)?fn\s+(\w+)")
+PYMETHODS_ATTR_RE = re.compile(r"#\[\s*pymethods")
+PYCLASS_ATTR_RE = re.compile(r"#\[\s*pyclass")
 
 
 def _is_char_literal(source: str, i: int) -> bool:
@@ -145,49 +145,44 @@ def strip_comments_strings(source: str) -> str:
 
 
 def exported_spans(code: str) -> list[tuple[int, int, str]]:
-    """[(start_line, end_line, fn_name)] for functions inside
-    #[pyfunction] or a #[pymethods] impl block. 1-based inclusive lines."""
+    """[(start_line, end_line, fn_name)] for functions introduced by a
+    PyO3 attribute (#[pyfunction], first fn of a #[pymethods] impl).
+    1-based inclusive lines."""
     lines = code.splitlines()
     spans = []
     pending_attr = False
     depth = 0
     fn_start = fn_name = fn_depth = None
     for lineno, line in enumerate(lines, start=1):
-        if ATTR_RE.search(line) and "pymethods" in line:
-            pending_attr = "pymethods"
-        elif ATTR_RE.search(line):
-            pending_attr = "py"
+        pending_attr = pending_attr or bool(ATTR_RE.search(line))
         opened = line.count("{")
         closed = line.count("}")
         if fn_start is None and pending_attr and FN_RE.match(line):
             fn_name = FN_RE.match(line).group(1)
             fn_start = lineno
             fn_depth = depth + opened
-            pending_attr = None
+            pending_attr = False
         depth += opened - closed
         if fn_start is not None and depth < fn_depth and closed:
             spans.append((fn_start, lineno, fn_name or "<anon>"))
             fn_start = fn_name = fn_depth = None
-        # an impl block opened under a pymethods attribute exports every fn
-        if pending_attr == "pymethods" and opened and fn_start is None:
-            # keep watching for fns inside this impl at current depth
-            pass
     if fn_start is not None:
         spans.append((fn_start, len(lines), fn_name or "<anon>"))
     return spans
 
 
-def pymethods_impl_ranges(code: str) -> list[tuple[int, int]]:
-    """Line ranges of impl blocks carrying #[pymethods]."""
+def _attr_block_ranges(code: str, attr_re: re.Pattern, keyword: str) -> list[tuple[int, int]]:
+    """Line ranges of `impl`/`struct` blocks introduced by a matching
+    attribute line (e.g. #[pymethods] impl, #[pyclass] struct)."""
     lines = code.splitlines()
     ranges = []
     pending = False
     depth = 0
     start = None
     for lineno, line in enumerate(lines, start=1):
-        if "pymethods" in line and ATTR_RE.search(line):
+        if attr_re.search(line):
             pending = True
-        if pending and re.match(r"^\s*(pub\s+)?impl\b", line):
+        if pending and re.match(rf"^\s*(pub\s+)?{keyword}\b", line):
             start = lineno
             pending = False
         depth += line.count("{") - line.count("}")
@@ -197,35 +192,14 @@ def pymethods_impl_ranges(code: str) -> list[tuple[int, int]]:
     return ranges
 
 
-def pyclass_struct_ranges(code: str) -> list[tuple[int, int]]:
-    """Line ranges of #[pyclass] structs (field checks)."""
-    lines = code.splitlines()
-    ranges = []
-    pending = False
-    depth = 0
-    start = None
-    for lineno, line in enumerate(lines, start=1):
-        if PYCLASS_STRUCT_RE.search(line):
-            pending = True
-        if pending and re.match(r"^\s*(pub\s+)?struct\b", line):
-            start = lineno
-            pending = False
-        depth += line.count("{") - line.count("}")
-        if start is not None and depth <= 0 and "}" in line:
-            ranges.append((start, lineno))
-            start = None
-    return ranges
-
-
-def review_file(path: Path, findings: list[dict], min_severity: str) -> None:
+def review_file(path: Path, findings: list[dict]) -> None:
     raw = path.read_text(encoding="utf-8", errors="replace")
     code = strip_comments_strings(raw)
     raw_lines = raw.splitlines()
     code_lines = code.splitlines()
     exported = exported_spans(code)
-    impl_ranges = pymethods_impl_ranges(code)
     # functions inside a #[pymethods] impl are exported too
-    for start, end in impl_ranges:
+    for start, end in _attr_block_ranges(code, PYMETHODS_ATTR_RE, "impl"):
         depth = 0
         fn_start = fn_name = fn_depth = None
         for lineno in range(start, end + 1):
@@ -313,7 +287,7 @@ def review_file(path: Path, findings: list[dict], min_severity: str) -> None:
             "(knowledge/substitutions.json pyo3_api_generations)")
 
     # free-threading hazards in pyclass fields
-    for start, end in pyclass_struct_ranges(code):
+    for start, end in _attr_block_ranges(code, PYCLASS_ATTR_RE, "struct"):
         for lineno in range(start, end + 1):
             line = code_lines[lineno - 1]
             if PYCLASS_FIELD_RE.search(line) or STATIC_MUT_RE.search(line):
@@ -370,6 +344,17 @@ def review_diff(path: Path, findings: list[dict]) -> None:
             new_lineno += 1
 
 
+RULES_DOC = {
+    "PYO3-UNWRAP": "panic-capable calls in exported functions (must become PyErr)",
+    "PYO3-SWALLOW": "let _ = / .ok() discarding fallible FFI results",
+    "PYO3-REFCOUNT": "manual refcount/provenance ops without unsafe + SAFETY",
+    "PYO3-DETACH": "GIL-bound refs inside detach/allow_threads closures",
+    "PYO3-GEN": "mixed PyO3 API generations in one scope",
+    "PYO3-THREADSAFE": "non-Send/Sync interior mutability in pyclass fields",
+    "PYO3-INTWIDTH": "unchecked fixed-width casts on Python ints",
+}
+
+
 def cmd_review(args) -> int:
     findings: list[dict] = []
     targets: list[Path] = []
@@ -386,7 +371,7 @@ def cmd_review(args) -> int:
     for t in targets:
         if t.suffix != ".rs":
             continue
-        review_file(t, findings, args.min_severity)
+        review_file(t, findings)
 
     errors = [f for f in findings if f["severity"] == "error"]
     warnings = [f for f in findings if f["severity"] == "warning"]
@@ -407,17 +392,6 @@ def cmd_review(args) -> int:
           "rules": RULES_DOC,
           "summary": {"exit_code": code, "human": human}}, human_flag=args.human)
     return code
-
-
-RULES_DOC = {
-    "PYO3-UNWRAP": "panic-capable calls in exported functions (must become PyErr)",
-    "PYO3-SWALLOW": "let _ = / .ok() discarding fallible FFI results",
-    "PYO3-REFCOUNT": "manual refcount/provenance ops without unsafe + SAFETY",
-    "PYO3-DETACH": "GIL-bound refs inside detach/allow_threads closures",
-    "PYO3-GEN": "mixed PyO3 API generations in one scope",
-    "PYO3-THREADSAFE": "non-Send/Sync interior mutability in pyclass fields",
-    "PYO3-INTWIDTH": "unchecked fixed-width casts on Python ints",
-}
 
 
 def main(argv=None) -> int:

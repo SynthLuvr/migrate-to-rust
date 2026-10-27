@@ -136,15 +136,11 @@ def test_full_coverage_passes_when_no_dangling(monkeypatch, capsys, tmp_path):
 
 def test_dangling_tests_always_flagged(monkeypatch, capsys, tmp_path):
     proj, state, collect = _cproj(tmp_path)
-    _, out = run_tool(monkeypatch, capsys, "contract_extract.py", [
+    code, out = run_tool(monkeypatch, capsys, "contract_extract.py", [
         "extract", "--state", str(state), "--root", str(proj),
         "--pytest-collect", str(collect), "--allow-uncovered"])
     assert any(d["nodeid"] == "tests/test_orphan.py::test_env" for d in out["dangling_tests"])
-    assert code_of(out) == 2  # dangling still fails even with allow-uncovered
-
-
-def code_of(out):
-    return out["summary"]["exit_code"]
+    assert code == 2  # dangling still fails even with allow-uncovered
 
 
 def test_invariants_and_signatures_extracted(monkeypatch, capsys, tmp_path):

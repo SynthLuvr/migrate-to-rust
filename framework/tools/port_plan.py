@@ -44,7 +44,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, emit, read_json  # noqa: E402
+from _common import (  # noqa: E402
+    EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, emit, module_name_of, read_json,
+)
 
 TOOL = "port_plan.py"
 VERSION = 1
@@ -68,18 +70,6 @@ C_EXT_MODULES = {
     "gevent", "zmq", "czmq",
 }
 RISK_PATTERNS["c-extension"] = {rf"\b{re.escape(m)}\b" for m in sorted(C_EXT_MODULES)}
-
-IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
-
-
-def module_name_of(python_path: str) -> str:
-    p = Path(python_path)
-    parts = list(p.with_suffix("").parts)
-    if parts and parts[0] in ("src", "lib"):
-        parts = parts[1:]
-    if parts and parts[-1] == "__init__":
-        parts = parts[:-1]
-    return ".".join(parts)
 
 
 def unit_id_of(python_path: str, taken: set[str]) -> str:
@@ -160,53 +150,38 @@ def rank(hotspots: list[dict]) -> dict[str, dict]:
 
 def topo_order(modules: list[str], deps_of: dict[str, set[str]]) -> tuple[dict[str, int], list[str]]:
     """Leaf-first topological order. Returns (module -> order, cycles).
-    Modules in cycles (and only those) are excluded from the ordering."""
+    Modules the algorithm cannot order (cycle members and everything that
+    depends on them) are left out of `order` and flagged upstream."""
     graph = {m: set(d for d in deps_of.get(m, set()) if d in modules) for m in modules}
     order: dict[str, int] = {}
     cycles: list[str] = []
 
-    state = {}  # 0 unvisited, 1 in-stack, 2 done
+    # DFS pass purely to report cycles readably
+    state = {}  # 1 = on the DFS stack, 2 = done
     stack: list[str] = []
 
-    def visit(m: str) -> bool:
-        """Returns False if m is inside a cycle."""
+    def visit(m: str) -> None:
         state[m] = 1
         stack.append(m)
         for dep in sorted(graph[m]):
-            st = state.get(dep, 0)
-            if st == 1:
-                cyc = " -> ".join(stack[stack.index(dep):] + [dep])
-                cycles.append(cyc)
-            elif st == 0:
+            if state.get(dep) == 1:
+                cycles.append(" -> ".join(stack[stack.index(dep):] + [dep]))
+            elif dep not in state:
                 visit(dep)
         stack.pop()
         state[m] = 2
-        return True
 
-    # first pass: find acyclic set
-    in_cycle = set()
     for m in sorted(graph):
-        if state.get(m, 0) == 0:
+        if m not in state:
             visit(m)
-    # modules pulled into a cycle transitively: any module whose deps reach a
-    # cycle member and is on no acyclic path — approximate by re-walking from
-    # the recorded cycle member sets
-    def reaches_cycle(m: str, seen: set[str]) -> bool:
-        if m in seen:
-            return False
-        seen.add(m)
-        if m in in_cycle:
-            return True
-        return any(reaches_cycle(d, seen) for d in graph[m])
-    in_cycle = {m for m in graph if reaches_cycle(m, set())}
 
-    # Kahn's algorithm over the acyclic remainder (stable, deterministic)
-    remaining = {m: set(d for d in graph[m] if d not in in_cycle)
-                 for m in graph if m not in in_cycle}
+    # Kahn's algorithm over the whole graph (stable, deterministic);
+    # whatever it cannot order is stuck in or behind a cycle
+    remaining = {m: set(graph[m]) for m in graph}
     order_idx = 0
     while remaining:
         ready = sorted(m for m, deps in remaining.items() if not deps)
-        if not ready:  # defensive: shouldn't happen after cycle removal
+        if not ready:
             cycles.append(" -> ".join(sorted(remaining)))
             break
         for m in ready:
@@ -269,11 +244,7 @@ def cmd_plan(args) -> int:
         hotspot_of[str(p)] = h
 
     measured = rank(hotspots)
-    taken: set[str] = set()
-    scans: dict[str, dict] = {}
-    for path_str, p in resolved.items():
-        scan = scan_module(p)
-        scans[path_str] = scan
+    scans = {path_str: scan_module(p) for path_str, p in resolved.items()}
 
     # module names derive from the path RELATIVE to the project root, so
     # "from pkg.leaf import x" maps to src/pkg/leaf.py regardless of where
@@ -297,6 +268,7 @@ def cmd_plan(args) -> int:
                         mypy_flags.setdefault(ps, "any-heavy")
 
     units = []
+    taken: set[str] = set()
     for ps in sorted(resolved):
         h = measured[hotspot_of[ps]["path"]]
         scan = scans[ps]
