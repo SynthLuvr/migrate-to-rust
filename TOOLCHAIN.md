@@ -83,7 +83,14 @@
 
 **Tier 2 — retrieve on demand:** TLBORM (metaclass/reflection→macros) · rust-unofficial patterns (builders, registries) · exemplar codebases: **pydantic-core, orjson, ruff, polars** (real PyO3 mappings beat any prose guide).
 
-**Ecosystem substitution table** (22 crates verified active 2026-10-25; full table with dates in research/5): requests→reqwest · numpy→ndarray/nalgebra · pandas→polars · pydantic→serde+garde/validator · sqlalchemy→sqlx/sea-orm · flask/fastapi→axum · pytest→cargo-test+rstest · hypothesis→proptest · logging→tracing · dataclasses→serde structs · celery→apalis (⚠️ **no maintained Celery-wire-compatible crate exists**).
+**Ecosystem substitution table** (24 crates + builtin `cargo test` + the `serde structs` pattern; maintenance dates per crate in
+`framework/knowledge/substitutions.json`, full table in research/5 §(b)): requests/httpx→reqwest ·
+numpy→ndarray/nalgebra · pandas→polars · pydantic→serde+garde/validator ·
+sqlalchemy→sqlx/diesel/sea-orm · flask/fastapi→axum/actix-web · pytest→cargo-test+rstest ·
+hypothesis→proptest · celery→apalis/rusty-sidekiq (⚠️ **no maintained Celery-wire-compatible
+crate exists**) · logging→tracing · dataclasses/attrs→serde structs+derive_more · json→serde_json ·
+asyncio→tokio+pyo3-async-runtimes · boto3→aws-sdk-\* · unittest.mock→mockall ·
+monkey-patching→inventory.
 
 **Known no-equivalent zones (be honest with users):** SQLAlchemy/Alembic parity, numpy's full breadth, scikit-learn/matplotlib, distributed task queues with Celery wire compat.
 
