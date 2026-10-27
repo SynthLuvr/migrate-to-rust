@@ -39,28 +39,22 @@ def fail(msg: str) -> None:
 
 def resolve_instance_paths(args: list[str]) -> list[Path]:
     """CLI args (files or dirs) override the defaults; dirs expand to *.json."""
-    if not args:
-        paths = DEFAULT_INSTANCE_PATHS
-    else:
-        paths = [Path(arg) for arg in args]
-    expanded: list[Path] = []
-    for p in paths:
-        if p.is_dir():
-            expanded.extend(sorted(p.glob("*.json")))
+    roots = [Path(a) for a in args] if args else DEFAULT_INSTANCE_PATHS
+    paths = []
+    for root in roots:
+        if root.is_dir():
+            paths.extend(sorted(root.glob("*.json")))
         else:
-            expanded.append(p)
-    for p in expanded:
-        if not p.is_file():
-            fail(f"example instance {p} not found")
-    if not expanded and args:
-        fail("no example instances matched the given paths")
-    return expanded
+            paths.append(root)
+    for path in paths:
+        if not path.is_file():
+            fail(f"example instance {path} not found")
+    if not paths:
+        fail("no example instances found")
+    return paths
 
 
 def validate_examples(validator: Draft202012Validator, paths: list[Path]) -> list[dict]:
-    if not paths:
-        fail("no example instances to validate")
-
     instances = []
     for path in paths:
         instance = json.loads(path.read_text())
@@ -160,13 +154,12 @@ def require_fields_constrained(schema: dict) -> None:
     print("ok: journal/sessions required fields and gate enum are enforced")
 
 
-def main(argv: list[str] | None = None) -> None:
-    args = sys.argv[1:] if argv is None else argv
+def main() -> None:
     schema = json.loads(SCHEMA_PATH.read_text())
     Draft202012Validator.check_schema(schema)
     validator = Draft202012Validator(schema)
 
-    instances = validate_examples(validator, resolve_instance_paths(args))
+    instances = validate_examples(validator, resolve_instance_paths(sys.argv[1:]))
     require_fields_exercised(instances)
     require_all_statuses_exercised(instances, schema)
     require_fields_constrained(schema)
