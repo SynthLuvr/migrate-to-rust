@@ -133,6 +133,7 @@ Legend for maturity: **active** = releases/pushes within ~12 months of 2026-10 �
 
 | Tool | What it does | Use in framework | Maturity | License |
 |---|---|---|---|---|
+| **rust-template** (SynthLuvr, first-party) | Minimal Rust project template bundling the §H gate set: clippy (`-D warnings`; `unwrap_used`/`expect_used`/`unsafe_code` denied), rustfmt, docs gate, cargo-deny, cargo-shear, cargo-llvm-cov (80% line gate), pandoc Markdown gate, MSRV enforcement, SHA-pinned CI (ubuntu+windows). | Scaffold base for Stage 3 — start from it instead of hand-wiring the gate stack; add `cargo-nextest`, a nightly `miri` job, and the `maturin` wheel job. | **active** — created 2026-10-27 | MIT OR Apache-2.0 (SPDX in Cargo.toml) |
 | **clippy** | Rust linting (idiomatic, correctness, perf lints). | Every generated crate must pass `cargo clippy -- -D warnings` before acceptance. | ships with Rust toolchain; very active | Apache-2.0/MIT |
 | **rustfmt** | Canonical formatting. | Normalize all generated Rust; stable diffs. | toolchain; active | Apache-2.0/MIT |
 | **cargo-machete** (bnjbvr) | Finds unused Cargo dependencies (fast, stable toolchain, `--fix`). | Clean up LLM-generated `Cargo.toml` bloat automatically. | **active** — v0.9.2 (2026-04-15), ~1.4k stars | MIT |

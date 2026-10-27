@@ -48,6 +48,8 @@ agent can execute directly, rather than merely read.
 
 - [ ] Re-verify crate maintenance in `knowledge/substitutions.json` (verified
       2026-10-25; ecosystems move)
+- [ ] Scaffold Stage 3 from [SynthLuvr/rust-template](https://github.com/SynthLuvr/rust-template)
+      — the gates come pre-wired; add nextest/miri/maturin per `stages/3-scaffold.md`
 - [ ] Build or stub the `tools/*.py` helpers to their acceptance criteria —
       the parity oracle (gap #1) is non-negotiable before any translation
 - [ ] Point `recipe.yaml` at your target project and provider/model

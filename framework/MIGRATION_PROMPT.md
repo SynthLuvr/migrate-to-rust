@@ -59,7 +59,7 @@ operate a pipeline; the gates decide, not you.
 | 0 Feasibility | profile + go/no-go | signed scope; projection ≥ 50% end-to-end saving |
 | 1 Plan | dependency-ordered unit backlog | every unit: deps, order, contract, risk flags |
 | 2 Contracts | parity harness validated judge-first | injected bugs caught 5/5; baseline recorded |
-| 3 Scaffold | Cargo + PyO3 + CI green on empty crate | `maturin develop` works; gates red-blocking |
+| 3 Scaffold | [rust-template](https://github.com/SynthLuvr/rust-template) scaffold + PyO3; CI green on empty crate | `maturin develop` works; gates red-blocking |
 | 4 Translate | oracle-ranked repair loop per unit | every unit Equivalent, or escalated with explanation |
 | 5 Gates | full suite, property/fuzz, Miri, benchmarks, attribution | green — or divergences classified & explained |
 | 6 Integrate | wheel, shadow/canary with production diffing | clean diff window; documented rollback |
