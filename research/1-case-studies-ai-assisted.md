@@ -97,18 +97,20 @@ They note the earlier Rust→Wasm attempt "fizzled out" because the **WebAssembl
 
 ### 5.1 Volatility3 → Rust ("Rusting Volatility") — **the flagship quantified AI-assisted Python→Rust case**
 
-- **What:** LLM-assisted migration of Volatility3's Linux plugin stack (memory forensics) from Python to Rust. **38 plugins, 29,028 LOC across 8 Rust crates**, preserving Volatility3's plugin architecture. ([DFRWS USA 2026 camera-ready PDF](https://dfrws.org/wp-content/uploads/2026/04/DFRWS_USA_2026_Camera_Ready_Paper_81.pdf); [presentation page](https://dfrws.org/presentation/rusting-volatility-accelerating-memory-forensics-through-llm-assisted-cross-language-migration)) — Gharaibeh & Baggili, LSU BiT Lab.
+- **What:** LLM-assisted migration of Volatility3's Linux plugin stack (memory forensics) from Python to Rust. **38 plugins, 29,028 LOC across 8 Rust crates**, preserving Volatility3's plugin architecture. ([published version, *FSI: Digital Investigation* 57:302129 — DOI](https://doi.org/10.1016/j.fsidi.2026.302129); [DFRWS camera-ready PDF](https://dfrws.org/wp-content/uploads/2026/04/DFRWS_USA_2026_Camera_Ready_Paper_81.pdf); [presentation page](https://dfrws.org/presentation/rusting-volatility-accelerating-memory-forensics-through-llm-assisted-cross-language-migration)) — Gharaibeh & Baggili, LSU BiT Lab (DFRWS USA 2026).
 - **Why:** "practical workflows are often constrained by the runtime costs of Python-based tooling"; hypothesis that compiled reimplementation improves robustness and throughput.
 - **How:**
   - Two-model division of labor: **GPT-5.2-Codex** (~400M tokens, **$812**) for iterative plugin implementation; **Claude Opus 4.5** (~500M tokens, **$2,150**) for "planning & skeleton building", structural refinement, debugging, parity-focused review. **Total ≈ 900M tokens, ~$2,962.**
   - **TDD-style loop:** "implement a plugin, run against representative samples, compare output with Python, diagnose mismatches, and iterate until equivalence or *explainable divergence*."
   - **Hash-based parity validation** classifying each plugin-sample pair as *Equivalent / Divergent / Incomparable* against the Python reference — systematic functional-equivalence checking.
-- **Results (quantified, all from the PDF above):**
+- **Results (quantified, all from the paper; headline figures re-verified against the published version's abstract via the DOI's Crossref/OpenAlex records on 2026-10-27):**
   - **68 hours** active development effort (measured from file-modification timestamps) → **~427 LOC/hour** including agent time.
   - **2.50× median speedup** across **834 analyzed benchmark runs**; **up to 210×** for structure-traversal plugins.
   - **Reliability flip:** Rust completed all **417** analyzed plugin-sample executions; Python **failed 47 (11.3%)** with runtime/symbol-compatibility errors.
   - **Exact output equivalence: 68.9%** among comparable executions (rest = explainable divergence/incomparable).
 - **Lessons:** (a) an explicit three-way parity taxonomy converts "LLM correctness" into measurable engineering; (b) two specialized model roles beat one; (c) even at ~69% exact parity, the migration shipped because divergences were *explained*, not ignored.
+
+> **Link note (2026-10-27, #10):** `dfrws.org` sits behind Cloudflare and returns 403 to automated checks (curl, including with a browser User-Agent) though its pages render in browsers — the presentation page was confirmed live via a reader proxy. The host is allowlisted in CI (`--allow-host dfrws.org`, non-blocking job). The **DOI** above is now the primary citation: it is the stable publisher link and resolves to the hybrid open-access (CC BY-NC-ND) published version, so the flagship citation no longer depends on a bot-blocked host.
 
 ### 5.2 Pydantic v1 (Python/Cython) → pydantic-core (Rust)
 
@@ -186,19 +188,20 @@ They note the earlier Rust→Wasm attempt "fizzled out" because the **WebAssembl
 12. https://zed.dev/docs/extensions/developing-extensions — Zed extension docs (Rust/Wasm requirements)
 13. https://zed.dev/blog/mcp — "The Context Outside the Code" (MCP context servers)
 14. https://www.devclass.com/software/2026/05/07/zed-team-releases-version-10-of-rust-built-editor/5234770 — Zed 1.0 coverage
-15. https://dfrws.org/wp-content/uploads/2026/04/DFRWS_USA_2026_Camera_Ready_Paper_81.pdf — "Rusting Volatility" camera-ready paper (DFRWS USA 2026)
-16. https://dfrws.org/presentation/rusting-volatility-accelerating-memory-forensics-through-llm-assisted-cross-language-migration — DFRWS presentation page
-17. https://docs.pydantic.dev/latest/blog/pydantic-v2/ — "Introducing Pydantic V2" (official motivation & benchmarks)
-18. https://talkpython.fm/episodes/show/376/pydantic-v2-the-plan — Talk Python #376 (17x pre-release benchmark)
-19. https://www.gregorykapfhammer.com/blog/se-radio-samuel-colvin-pydantic-ecosystem — Colvin SE Radio quotes (PyO3, 2022 start)
-20. https://www.birjob.com/blog/rust-eating-python-tooling-good-thing — "Rust is eating Python's tooling" (secondary survey)
-21. https://github.com/ijl/orjson — orjson README (Rust/maturin, benchmark tables)
-22. https://pypi.org/project/orjson/2.0.1 — orjson 2.0.1 PyPI page (Rust release files)
-23. https://www.reddit.com/r/Python/comments/1ii64gp/how_rust_is_quietly_taking_over_the_python — secondary: orjson Rust-since-v2.0 claim (uncited primary)
-24. https://codspeed.io/blog — CodSpeed blog index (checked; no Python→Rust migration post)
-25. https://www.theregister.com/devops/2026/09/18/microsoft-agentically-ports-copilot-runtime-to-rust-for-120k/5297549 — Microsoft Copilot runtime TS→Rust agentic port
-26. https://arxiv.org/html/2604.11518v1 — "From Translation to Superset" (Codex CLI Rust→Python, benchmark-driven)
-27. https://www.buildmvpfast.com/blog/ai-code-migration-legacy-modernization-salesforce-2026 — third-party Salesforce Apex→Java case (context only)
+15. https://doi.org/10.1016/j.fsidi.2026.302129 — "Rusting Volatility", *Forensic Science International: Digital Investigation* 57:302129 (June 2026), Gharaibeh & Baggili — stable published version (hybrid OA, CC BY-NC-ND); primary citation since dfrws.org bot-blocks automated checks (#10); quoted figures re-verified against this version's abstract 2026-10-27
+16. https://dfrws.org/wp-content/uploads/2026/04/DFRWS_USA_2026_Camera_Ready_Paper_81.pdf — "Rusting Volatility" camera-ready paper (DFRWS USA 2026) — live but Cloudflare 403s automated checks incl. browser UA (verified 2026-10-27, #10); allowlisted in CI
+17. https://dfrws.org/presentation/rusting-volatility-accelerating-memory-forensics-through-llm-assisted-cross-language-migration — DFRWS presentation page — same bot-block; confirmed live via reader proxy 2026-10-27 (#10)
+18. https://docs.pydantic.dev/latest/blog/pydantic-v2/ — "Introducing Pydantic V2" (official motivation & benchmarks)
+19. https://talkpython.fm/episodes/show/376/pydantic-v2-the-plan — Talk Python #376 (17x pre-release benchmark)
+20. https://www.gregorykapfhammer.com/blog/se-radio-samuel-colvin-pydantic-ecosystem — Colvin SE Radio quotes (PyO3, 2022 start)
+21. https://www.birjob.com/blog/rust-eating-python-tooling-good-thing — "Rust is eating Python's tooling" (secondary survey)
+22. https://github.com/ijl/orjson — orjson README (Rust/maturin, benchmark tables)
+23. https://pypi.org/project/orjson/2.0.1 — orjson 2.0.1 PyPI page (Rust release files)
+24. https://www.reddit.com/r/Python/comments/1ii64gp/how_rust_is_quietly_taking_over_the_python — secondary: orjson Rust-since-v2.0 claim (uncited primary)
+25. https://codspeed.io/blog — CodSpeed blog index (checked; no Python→Rust migration post)
+26. https://www.theregister.com/devops/2026/09/18/microsoft-agentically-ports-copilot-runtime-to-rust-for-120k/5297549 — Microsoft Copilot runtime TS→Rust agentic port
+27. https://arxiv.org/html/2604.11518v1 — "From Translation to Superset" (Codex CLI Rust→Python, benchmark-driven)
+28. https://www.buildmvpfast.com/blog/ai-code-migration-legacy-modernization-salesforce-2026 — third-party Salesforce Apex→Java case (context only)
 
 ### UNVERIFIED items register
 - Cloudflare "PyPy-based implementation migrated to Rust" — no PyPy mention in the primary post (full-text checked) and no supporting post found.
