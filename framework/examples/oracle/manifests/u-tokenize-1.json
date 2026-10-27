@@ -1,0 +1,16 @@
+{
+  "$comment": "Worked example (issue #7): oracle judge manifest for u-tokenize-1 (Stage 2 judge-first demo; the same manifest shape ranks Stage-4 candidates). Entries resolve with the manifest's directory as cwd, which is why the two stand-in modules sit next to this file; the corpus path is resolved relative to the manifest too. Reproduce: python framework/tools/oracle.py judge --manifest framework/examples/oracle/manifests/u-tokenize-1.json (expected exit 2 — findings)",
+  "unit": "u-tokenize-1",
+  "reference": {
+    "entry": "reference_tokenizer:run",
+    "$comment": "real run: the live Python module, e.g. duplifind.tokenize:run"
+  },
+  "candidate": {
+    "entry": "candidate_wheel:run",
+    "$comment": "real run: the PyO3 wheel's frozen API, e.g. duplifind.tokenize:run from the installed wheel"
+  },
+  "corpus": "../corpora/tokenize-probe.jsonl",
+  "normalization": {
+    "error_compare": "type-and-message"
+  }
+}

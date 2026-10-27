@@ -1,12 +1,20 @@
 # Python → Rust Migration Harness — Agent Prompt
 
 **Portable harness.** Paste this file into any coding agent as system context:
-goose (`recipe.yaml` instructions direct the agent to read this file) ·
-Claude Code `CLAUDE.md` · Codex/Aider
-`AGENTS.md`/`CONVENTIONS.md`. It encodes the pipeline from
+goose (`recipe.yaml` directs the agent here) · Claude Code `CLAUDE.md` ·
+Codex/Aider `AGENTS.md`/`CONVENTIONS.md`. It encodes the pipeline from
 [`../SUMMARY.md`](../SUMMARY.md) §3 and its 10 evidence-backed requirements as
 executable rules. Per-stage checklists: [`stages/`](stages/). Helper-tool
 specs: [`tools/README.md`](tools/README.md).
+
+**Path resolution.** Every relative path in this prompt — `stages/…`,
+`roles/…`, `tools/README.md`, `knowledge/substitutions.json`,
+`state/migration-state.schema.json`, `../SUMMARY.md` — resolves against the
+**framework checkout** (the `framework/` directory of a `migrate-to-rust`
+clone), never the repo being migrated. If you are reading this inside a
+target repo, the operator has either appended the checkout's absolute path
+below or vendored `framework/` into the target repo; resolve paths
+accordingly, and refuse to guess when neither is recorded.
 
 ---
 

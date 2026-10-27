@@ -1,0 +1,415 @@
+{
+  "$comment": "Worked example (issue #7): a filled migration-state.json for the fictional project 'duplifind', snapshot mid-Stage 7, deliberately showing one unit in each of the six statuses. Validates against migration-state.schema.json (CI: framework/state/check_examples.py) and passes the coherence checks of tools/state.py validate. Walkthrough: README.md next to this file.",
+  "project": {
+    "name": "duplifind",
+    "python_path": "src/duplifind",
+    "workload": "nightly near-duplicate sweep over the 10k-doc corpus (1.4 GB)"
+  },
+  "stage": 7,
+  "go_no_go": {
+    "decision": "go",
+    "scope": [
+      "duplifind.tokenize",
+      "duplifind.dedupe",
+      "duplifind.shingle",
+      "duplifind.index",
+      "duplifind.score"
+    ],
+    "projection": {
+      "scoped_loc": 6400,
+      "token_cost_usd": 1150.0,
+      "end_to_end_saving_pct": 58.0
+    },
+    "no_equivalent_deps": [],
+    "approved_by": "mreyes"
+  },
+  "judge_validation": {
+    "injected_bugs": 5,
+    "caught": 5,
+    "mutation_sample_killed": 88,
+    "normalization_rules": "contracts/normalization.md",
+    "date": "2026-06-03"
+  },
+  "units": [
+    {
+      "id": "u-tokenize-1",
+      "python_path": "src/duplifind/tokenize.py",
+      "rust_path": "crates/duplifind-core/src/units/u_tokenize_1.rs",
+      "deps": [],
+      "order": 1,
+      "contract": {
+        "covering_tests": [
+          "tests/test_tokenize.py::test_ascii_basic",
+          "tests/test_tokenize.py::test_case_fold",
+          "tests/test_tokenize.py::test_empty_raises",
+          "tests/test_tokenize.py::test_legacy_set_api"
+        ],
+        "type_signature": "duplifind.tokenize.tokenize(text: str) -> list[str]",
+        "invariants": [
+          "Invariant: tokens are lowercased, NFC-normalized, split on whitespace",
+          "Invariant: empty input raises ValueError (never returns [])",
+          "Postcondition: duplicates and input order are preserved — dedupe is a separate unit"
+        ],
+        "golden_corpus": "corpora/tokenize-golden.jsonl"
+      },
+      "risk_flags": [],
+      "status": "retired",
+      "parity": {
+        "runs": 250,
+        "equivalent": 250,
+        "divergent": 0,
+        "incomparable": 0,
+        "last_verdict": "equivalent"
+      },
+      "attempts": 2,
+      "budget": { "max_rounds": 5, "tokens_spent": 52000, "exhausted": false },
+      "attribution": { "header_preserved": true, "notice_ok": true },
+      "review_verdict": "approve",
+      "notes": "First unit ported (Stage 4, candidate c2; c1 missed NFC normalization, 2/250 divergent). Stable in Rust since 2026-06-18; Python fallback retired 2026-10-15 after the agreed two-quarter stability window (Stage 7 step 4) — the rust side is now the only side. The Stage-2 judge-first demo for this unit is preserved in oracle/u-tokenize-1.verdict.json.",
+      "sessions": [
+        {
+          "id": "sess_01hwq0t5d2k",
+          "name": "unit-u-tokenize-1-translator-c1",
+          "role": "translator",
+          "outcome": "candidate submitted, 2/250 divergent (missing NFC)"
+        },
+        {
+          "id": "sess_01hwq1m8x4r",
+          "name": "unit-u-tokenize-1-translator-c2",
+          "role": "translator",
+          "outcome": "candidate submitted, 0/250 divergent"
+        },
+        {
+          "id": "sess_01hwq3b2n9v",
+          "name": "unit-u-tokenize-1-reviewer-r1",
+          "role": "reviewer",
+          "outcome": "APPROVE (fresh-input oracle rerun + attribution diff clean)"
+        }
+      ]
+    },
+    {
+      "id": "u-dedupe-2",
+      "python_path": "src/duplifind/dedupe.py",
+      "rust_path": "crates/duplifind-core/src/units/u_dedupe_2.rs",
+      "deps": ["u-tokenize-1"],
+      "order": 2,
+      "contract": {
+        "covering_tests": [
+          "tests/test_dedupe.py::test_preserves_first",
+          "tests/test_dedupe.py::test_all_dupes"
+        ],
+        "type_signature": "duplifind.dedupe.dedupe(tokens: list[str]) -> list[str]",
+        "invariants": [
+          "Invariant: first occurrence wins",
+          "Invariant: output preserves input order of first occurrences"
+        ],
+        "golden_corpus": "corpora/dedupe-golden.jsonl"
+      },
+      "risk_flags": ["dict-ordering dependence"],
+      "status": "ported",
+      "parity": {
+        "runs": 240,
+        "equivalent": 240,
+        "divergent": 0,
+        "incomparable": 0,
+        "last_verdict": "equivalent"
+      },
+      "attempts": 1,
+      "budget": { "max_rounds": 5, "tokens_spent": 29000, "exhausted": false },
+      "attribution": { "header_preserved": true, "notice_ok": true },
+      "review_verdict": "approve",
+      "notes": "BTreeSet replaces the CPython dict used as an ordered set; first-occurrence order carried by an index vector, so dict-ordering risk never materialized. Oracle equivalent 240/240 on the first candidate. Python fallback still live (Stage 7 retires it deliberately, unit by unit)."
+    },
+    {
+      "id": "u-shingle-3",
+      "python_path": "src/duplifind/shingle.py",
+      "rust_path": "crates/duplifind-core/src/units/u_shingle_3.rs",
+      "deps": ["u-tokenize-1"],
+      "order": 3,
+      "contract": {
+        "covering_tests": [
+          "tests/test_shingle.py::test_kgram_bounds",
+          "tests/test_shingle.py::test_nan_weight_rejected"
+        ],
+        "type_signature": "duplifind.shingle.shingles(tokens: list[str], k: int, weights: dict[str, float]) -> list[tuple[int, float]]",
+        "invariants": [
+          "Invariant: shingles are k-grams hashed to u64 (Stage-1 redesign)",
+          "Invariant: non-finite weights are rejected (human ruling 2026-07-21)"
+        ],
+        "golden_corpus": "corpora/shingle-golden.jsonl"
+      },
+      "risk_flags": ["float semantics"],
+      "status": "divergent_explained",
+      "parity": {
+        "runs": 210,
+        "equivalent": 209,
+        "divergent": 1,
+        "incomparable": 0,
+        "last_verdict": "divergent",
+        "divergence_note": "Corpus run i=137 feeds a NaN shingle weight: the Python reference propagates it into a NaN-poisoned score, the Rust candidate raises ValueError (int/float semantics were not the issue; error-vs-value is). Human ruling 2026-07-21: rejecting non-finite weights is the contract going forward — reference updated after cutover planning, release note written. Divergence recorded, never normalized away."
+      },
+      "attempts": 3,
+      "budget": { "max_rounds": 5, "tokens_spent": 71000, "exhausted": false },
+      "attribution": { "header_preserved": true, "notice_ok": true },
+      "review_verdict": "approve",
+      "notes": "Ships with one explained divergence (209/210 exact) — the Volatility3 pattern: exact parity everywhere except where a written, human-ruled explanation exists. Oracle verdict stays 'divergent' honestly; the explanation is the deliverable, not a silenced judge. Python fallback live.",
+      "sessions": [
+        {
+          "id": "sess_01hww7c4p8t",
+          "name": "unit-u-shingle-3-translator-c3",
+          "role": "translator",
+          "outcome": "candidate submitted, 1/210 divergent (NaN weight handling)"
+        },
+        {
+          "id": "sess_01hww9f6q2w",
+          "name": "unit-u-shingle-3-reviewer-r1",
+          "role": "reviewer",
+          "outcome": "ESCALATE the divergence; human ruled it acceptable -> APPROVE with note"
+        }
+      ]
+    },
+    {
+      "id": "u-index-4",
+      "python_path": "src/duplifind/index.py",
+      "rust_path": "crates/duplifind-core/src/units/u_index_4.rs",
+      "deps": ["u-tokenize-1", "u-dedupe-2"],
+      "order": 4,
+      "contract": {
+        "covering_tests": [
+          "tests/test_index.py::test_incremental_insert",
+          "tests/test_index.py::test_bloom_bytes_stable"
+        ],
+        "type_signature": "duplifind.index.build_index(docs: Iterable[Doc]) -> Index",
+        "invariants": [
+          "Invariant: serialized bloom-filter bytes are a deterministic function of inserted docs",
+          "Invariant: queries never observe partial inserts"
+        ],
+        "golden_corpus": "corpora/index-golden.jsonl"
+      },
+      "risk_flags": ["iteration-order dependence", "serialization determinism"],
+      "status": "escalated",
+      "parity": {
+        "runs": 180,
+        "equivalent": 161,
+        "divergent": 19,
+        "incomparable": 0,
+        "last_verdict": "divergent",
+        "divergence_note": "19/180 corpus runs serialize the bloom filter with different bytes: FxHashMap iteration order leaks into the byte stream where the reference emits CPython dict insertion order. Query-level parity is 180/180 — the divergence is serialization-only. Minimal repro: escalations/u-index-4.md."
+      },
+      "attempts": 5,
+      "budget": { "max_rounds": 5, "tokens_spent": 124000, "exhausted": true },
+      "attribution": { "header_preserved": true, "notice_ok": true },
+      "review_verdict": "escalate",
+      "notes": "Budget exhausted at round 5 (MAX_ROUNDS hit twice — mandatory escalation). Fix requires a deterministic serializer over a BTreeMap: a data-structure redesign, which is a Stage-1-semantics proposal needing human sign-off, never improvised mid-loop. Python fallback is the live side for this unit.",
+      "sessions": [
+        {
+          "id": "sess_01hx2k9r7m3d",
+          "name": "unit-u-index-4-translator-c1",
+          "role": "translator",
+          "outcome": "candidate submitted, 19/180 divergent (bloom bytes)"
+        },
+        {
+          "id": "sess_01hx4n2t8v6y",
+          "name": "unit-u-index-4-reviewer-r1",
+          "role": "reviewer",
+          "outcome": "ESCALATE — redesign required, out of unit scope"
+        }
+      ]
+    },
+    {
+      "id": "u-score-5",
+      "python_path": "src/duplifind/score.py",
+      "rust_path": "crates/duplifind-core/src/units/u_score_5.rs",
+      "deps": ["u-shingle-3"],
+      "order": 5,
+      "contract": {
+        "covering_tests": [
+          "tests/test_score.py::test_symmetry",
+          "tests/test_score.py::test_bounds"
+        ],
+        "type_signature": "duplifind.score.score(a: Shingles, b: Shingles) -> float",
+        "invariants": [
+          "Invariant: 0.0 <= score <= 1.0",
+          "Invariant: symmetric in its arguments"
+        ],
+        "golden_corpus": "corpora/score-golden.jsonl"
+      },
+      "risk_flags": ["numpy SIMD already near-optimal"],
+      "status": "fallback_python",
+      "parity": {
+        "runs": 120,
+        "equivalent": 120,
+        "divergent": 0,
+        "incomparable": 0,
+        "last_verdict": "equivalent"
+      },
+      "attempts": 1,
+      "budget": { "max_rounds": 5, "tokens_spent": 31000, "exhausted": false },
+      "attribution": { "header_preserved": true, "notice_ok": true },
+      "review_verdict": "approve",
+      "notes": "The Rust port passed every correctness gate (oracle 120/120 equivalent, miri + clippy green), but the Stage-5 matched-corpus benchmark showed the numpy-vectorized Python side matches it within overlapping confidence intervals (bench verdict + repro corpus committed). Human decision 2026-09-30: keep Python as the live side — 'optimized Python matches the port' is the documented no-win outcome, and keeping Python is a success, not a failure (MIGRATION_PROMPT.md failure-mode table). Rust candidate stays behind the per-unit fallback switch for revisit."
+    },
+    {
+      "id": "u-featurize-6",
+      "python_path": "src/duplifind/featurize.py",
+      "rust_path": null,
+      "deps": ["u-dedupe-2", "u-shingle-3"],
+      "order": 6,
+      "contract": {
+        "covering_tests": ["tests/test_featurize.py::test_feature_vector_len"],
+        "type_signature": "duplifind.featurize.featurize(tokens: list[str]) -> list[float]",
+        "invariants": ["Invariant: vector length fixed by config.featurize.dim"],
+        "golden_corpus": "corpora/featurize-golden.jsonl"
+      },
+      "risk_flags": [],
+      "status": "pending",
+      "notes": "Added 2026-10-24 via an approved scope_change (upstream feature request duplifind#331, surfaced by the Stage-7 upstream watcher). Contract extraction is queued; translation has not started. Units can legitimately be pending during Stage 7 — maintenance mode re-opens the backlog, it does not freeze it."
+    }
+  ],
+  "human_gates": [
+    {
+      "gate": "go_no_go",
+      "state": "approved",
+      "note": "Stage 0: go — 58% projected end-to-end saving on the nightly sweep; I/O share 11% (under the no-go bar)"
+    },
+    {
+      "gate": "redesign_approval",
+      "state": "approved",
+      "note": "Stage 1: k-gram shingles hashed to u64 (dict-of-dicts -> typed struct)"
+    },
+    {
+      "gate": "cutover",
+      "state": "approved",
+      "note": "Stage 6: clean shadow window 2026-09-05..09-08 (0 divergent / 0.4M sampled requests); rollback pin kept in the release notes"
+    },
+    {
+      "gate": "unit_escalation",
+      "state": "open",
+      "note": "u-index-4 divergent after 5 rounds (bloom-filter bytes); repro + BTreeMap serializer redesign proposal in escalations/u-index-4.md"
+    },
+    {
+      "gate": "scope_change",
+      "state": "approved",
+      "note": "2026-10-24: add duplifind.featurize to scope (upstream #331) — the 'any scope change later' mandatory gate"
+    }
+  ],
+  "journal": [
+    {
+      "timestamp": "2026-06-10T09:00:00Z",
+      "unit": null,
+      "field": "stage",
+      "from": 3,
+      "to": 4,
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-06-18T16:41:00Z",
+      "unit": "u-tokenize-1",
+      "field": "units[u-tokenize-1].status",
+      "from": "pending",
+      "to": "ported",
+      "actor": "state.py"
+    },
+    {
+      "timestamp": "2026-07-02T10:12:00Z",
+      "unit": "u-dedupe-2",
+      "field": "units[u-dedupe-2].status",
+      "from": "pending",
+      "to": "ported",
+      "actor": "state.py"
+    },
+    {
+      "timestamp": "2026-07-21T14:05:00Z",
+      "unit": "u-shingle-3",
+      "field": "units[u-shingle-3].status",
+      "from": "pending",
+      "to": "divergent_explained",
+      "actor": "state.py"
+    },
+    {
+      "timestamp": "2026-08-05T18:30:00Z",
+      "unit": "u-index-4",
+      "field": "units[u-index-4].status",
+      "from": "pending",
+      "to": "escalated",
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-08-05T18:31:00Z",
+      "unit": null,
+      "field": "human_gates[gate=unit_escalation].state",
+      "from": null,
+      "to": "open",
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-09-02T08:30:00Z",
+      "unit": null,
+      "field": "stage",
+      "from": 5,
+      "to": 6,
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-09-08T09:15:00Z",
+      "unit": null,
+      "field": "human_gates[gate=cutover].state",
+      "from": null,
+      "to": "approved",
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-09-22T07:45:00Z",
+      "unit": null,
+      "field": "stage",
+      "from": 6,
+      "to": 7,
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-09-30T11:20:00Z",
+      "unit": "u-score-5",
+      "field": "units[u-score-5].status",
+      "from": "ported",
+      "to": "fallback_python",
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-10-15T08:00:00Z",
+      "unit": "u-tokenize-1",
+      "field": "units[u-tokenize-1].status",
+      "from": "ported",
+      "to": "retired",
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-10-20T10:02:00Z",
+      "unit": null,
+      "field": "human_gates[gate=scope_change].state",
+      "from": null,
+      "to": "open",
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-10-24T15:47:00Z",
+      "unit": null,
+      "field": "human_gates[gate=scope_change].state",
+      "from": "open",
+      "to": "approved",
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-10-24T15:48:00Z",
+      "unit": "u-featurize-6",
+      "field": "units[u-featurize-6].status",
+      "from": null,
+      "to": "pending",
+      "actor": "state.py"
+    }
+  ],
+  "budget_ledger": {
+    "tokens_total": 1890000,
+    "hours_human_total": 15.5,
+    "regression_triage_hours": 31.0
+  }
+}

@@ -1,0 +1,107 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Pinned goose for the recipe checks. The recipe format changed across goose
+# versions (early versions had a `context` block; 1.53 does not), so validate
+# against one known-good version and bump deliberately.
+env:
+  GOOSE_VERSION: 1.53.0
+
+jobs:
+  recipe:
+    name: recipe validate + render smoke test (pinned goose)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned goose
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL \
+            "https://github.com/block/goose/releases/download/v${GOOSE_VERSION}/goose-x86_64-unknown-linux-gnu.tar.gz" \
+            -o goose.tgz
+          tar -xzf goose.tgz
+          install -m 0755 goose "$HOME/.local/bin/goose"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Verify goose version matches the pin
+        run: |
+          version="$(goose --version | tr -d '[:space:]')"
+          echo "goose ${version} (pinned: ${GOOSE_VERSION})"
+          test "$version" = "$GOOSE_VERSION"
+      - name: Recipe validates
+        run: goose recipe validate framework/recipe.yaml
+      - name: Render smoke test
+        run: |
+          goose run --recipe framework/recipe.yaml \
+            --params TARGET_PYTHON_PROJECT=/tmp/example-project \
+            --render-recipe > rendered.yaml
+          test -s rendered.yaml
+          echo "--- rendered recipe:"
+          cat rendered.yaml
+          echo "--- placeholder scan:"
+          grep -n '/tmp/example-project' rendered.yaml
+          # no $VAR or {{ mustache }} template syntax may remain
+          ! grep -nE '\{\{|[$][A-Za-z_][A-Za-z0-9_]*' rendered.yaml
+
+  json-and-links:
+    name: JSON validity + internal markdown links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Every JSON file parses
+        run: python scripts/check_json.py
+      - name: Internal markdown links resolve
+        run: python scripts/check_links.py
+
+  citation-spot-check:
+    name: citation URL spot-check (optional, non-blocking)
+    # Best-effort HEAD check per the CI issue; continue-on-error keeps
+    # bot-blocked/transient hosts from failing CI.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: HEAD-check cited URLs
+        # dfrws.org 403s automated checks (Cloudflare bot-block; pages verified
+        # live 2026-10-27, #10); reddit 403s datacenter IPs (GitHub runners)
+        # while serving residential requests fine.
+        run: python scripts/check_links.py --external --allow-host dfrws.org --allow-host www.reddit.com
+
+  state-schema:
+    name: state schema + examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install jsonschema
+        run: pip install "jsonschema>=4.18"
+      - name: Validate examples against migration-state.schema.json
+        run: python framework/state/check_examples.py
+      - name: Coherence-validate the worked example (state.py, stdlib-only)
+        run: python framework/tools/state.py validate framework/examples/migration-state.json
+
+  tools:
+    name: tools acceptance tests (8 helpers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test deps
+        run: pip install pytest "jsonschema>=4.18"
+      - name: Run the tools test-suite (oracle 5/5 gate, journaling, attribution, ...)
+        run: python -m pytest framework/tools/tests/ -v
+      - name: Oracle judge-first self-test (the Stage 2 hard gate)
+        run: python framework/tools/oracle.py self-test

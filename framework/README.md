@@ -5,14 +5,41 @@ agent can execute directly, rather than merely read.
 
 ## Run it one of three ways
 
+All relative paths in these artifacts — `stages/<n>-*.md`, `roles/*.md`,
+`tools/README.md`, `knowledge/substitutions.json`,
+`state/migration-state.schema.json` — live in **this framework checkout**,
+not in the repo being migrated.
+
 1. **goose (recommended)** — `goose run --recipe framework/recipe.yaml`
    The recipe is the orchestrator; it enforces stage order, human gates, and
-   the state file. Adjust `settings:` to your provider/model.
+   the state file. Adjust `settings:` to your provider/model. Run it from
+   the **root of this `migrate-to-rust` checkout** — the recipe references
+   `framework/...`, `SUMMARY.md`, `TOOLCHAIN.md`, and `research/...`
+   relative to that root — and point at a target project elsewhere on disk
+   via the recipe's `TARGET_PYTHON_PROJECT` parameter (absolute path), not
+   by `cd`-ing into the target repo.
 2. **Any CLI agent** (Claude Code, Codex, Aider) — paste
    [`MIGRATION_PROMPT.md`](MIGRATION_PROMPT.md) as the agent's system context
    (`CLAUDE.md` / `AGENTS.md` / `CONVENTIONS.md` in the target repo), and tell
    the agent to load the current `stages/<n>-*.md` checklist when it enters a
-   stage.
+   stage. The prompt's paths resolve only inside this framework checkout, so
+   pick **one**:
+   - **(a) Record the checkout's absolute path.** Append to the same file
+     you pasted the prompt into, e.g.:
+
+     ```markdown
+     ## Framework checkout
+     Every framework-relative path in the prompt above (`stages/…`, `roles/…`,
+     `tools/…`, `knowledge/…`, `state/…`, `../SUMMARY.md`) resolves against:
+     `/abs/path/to/migrate-to-rust/framework`
+     ```
+
+     The agent then reads every framework file from that path; the target
+     repo holds only the code under migration.
+   - **(b) Vendor the framework into the target repo** —
+     `cp -r /abs/path/to/migrate-to-rust/framework ./framework/` (or a git
+     subtree). The prompt's relative references then resolve as-is; keep
+     the copy in sync when the framework changes.
 3. **Manual / hybrid** — a human orchestrates stage-by-stage using the same
    checklists, with the agent doing stages 3–4 under supervision.
 
@@ -25,9 +52,10 @@ agent can execute directly, rather than merely read.
 | `stages/0..7-*.md` | Per-stage checklists: purpose, steps, **exit criteria**, escalation triggers |
 | `roles/translator.md` | Subagent instructions for mechanical per-unit translation |
 | `roles/reviewer.md` | Subagent instructions for adversarial parity + PyO3-FFI review |
-| `tools/README.md` | Build specs for the 8 verified gaps — deterministic helpers to build **before** migrating |
+| `tools/*.py` + `tools/README.md` | The 8 deterministic helpers — implemented, stdlib-only, JSON-in/JSON-out, acceptance-tested in `tools/tests/` (specs, conventions, and quick reference in `tools/README.md`) |
 | `knowledge/substitutions.json` | Machine-readable crate mapping + no-equivalent zones (from `research/5`) |
 | `state/migration-state.schema.json` | The dual-build state manager schema — the resumable, per-unit-reversible record |
+| `examples/` | **The worked example** — a filled `migration-state.json` (one unit in each of the six statuses), a Stage-2 `contract.json`, a real oracle verdict showing the 3-way classification, and a stage-by-stage walkthrough ([`examples/README.md`](examples/README.md)) |
 
 ## How the research became a framework (the transformation)
 
@@ -46,13 +74,20 @@ agent can execute directly, rather than merely read.
 
 ## Before first use
 
+- [ ] Skim the worked example — [`examples/README.md`](examples/README.md)
+      walks one fictional project through every artifact the stages
+      produce (a filled state file, a per-unit contract, an oracle verdict
+      showing all three classifications)
 - [ ] Re-verify crate maintenance in `knowledge/substitutions.json` (verified
       2026-10-25; ecosystems move)
 - [ ] Confirm rust-template is reachable — `git clone
       https://github.com/SynthLuvr/rust-template` must work (Stage 3
       instantiates the crate from it; see `stages/3-scaffold.md`)
-- [ ] Build or stub the `tools/*.py` helpers to their acceptance criteria —
-      the parity oracle (gap #1) is non-negotiable before any translation
+- [x] The `tools/*.py` helpers are implemented and acceptance-tested
+      (`python -m pytest framework/tools/tests/`); verify your environment
+      runs them (Python ≥ 3.10, stdlib only) and re-run
+      `python framework/tools/oracle.py self-test` — the parity oracle
+      (gap #1) is non-negotiable before any translation
 - [ ] Point `recipe.yaml` at your target project and provider/model
 - [ ] Confirm the target's test suite is green and substantive enough to act
       as the spec (Stage 2 will stop you if not)
