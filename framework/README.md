@@ -28,6 +28,7 @@ agent can execute directly, rather than merely read.
 | `tools/*.py` + `tools/README.md` | The 8 deterministic helpers — implemented, stdlib-only, JSON-in/JSON-out, acceptance-tested in `tools/tests/` (specs, conventions, and quick reference in `tools/README.md`) |
 | `knowledge/substitutions.json` | Machine-readable crate mapping + no-equivalent zones (from `research/5`) |
 | `state/migration-state.schema.json` | The dual-build state manager schema — the resumable, per-unit-reversible record |
+| `examples/` | **The worked example** — a filled `migration-state.json` (one unit in each of the six statuses), a Stage-2 `contract.json`, a real oracle verdict showing the 3-way classification, and a stage-by-stage walkthrough ([`examples/README.md`](examples/README.md)) |
 
 ## How the research became a framework (the transformation)
 
@@ -46,6 +47,10 @@ agent can execute directly, rather than merely read.
 
 ## Before first use
 
+- [ ] Skim the worked example — [`examples/README.md`](examples/README.md)
+      walks one fictional project through every artifact the stages
+      produce (a filled state file, a per-unit contract, an oracle verdict
+      showing all three classifications)
 - [ ] Re-verify crate maintenance in `knowledge/substitutions.json` (verified
       2026-10-25; ecosystems move)
 - [ ] Confirm rust-template is reachable — `git clone
