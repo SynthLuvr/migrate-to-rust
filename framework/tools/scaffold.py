@@ -94,6 +94,7 @@ DEFAULT_RANDOM_ROWS = 96
 DRY_RUN_TIMEOUT = 120.0
 
 JSON_SCALARS = {"str": "str", "int": "int", "float": "float", "bool": "bool"}
+JSON_DICT_KEYS = {"str", "int", "float", "any", "unknown"}  # round-trip through JSON object keys
 CONTAINER_BASES = {
     "list": "list", "List": "list", "Sequence": "list", "Iterable": "list",
     "Collection": "list", "MutableSequence": "list",
@@ -164,11 +165,10 @@ class FileCtx:
                     self.import_binds[a.asname or a.name.split(".")[0]] = a.name
 
     def _add_import_from(self, node: ast.ImportFrom) -> None:
+        names = [a for a in node.names if a.name != "*"]
         if node.level == 0:
-            if not node.module:
-                return
-            for a in node.names:
-                if a.name != "*":
+            if node.module:
+                for a in names:
                     self.from_imports[a.asname or a.name] = ("module", node.module, a.name)
             return
         # relative import: resolve against this file's package directory
@@ -181,9 +181,8 @@ class FileCtx:
         else:  # `from . import X` — X is a sibling module or a name in __init__
             cands = [base / "__init__.py"]
         target = next((c for c in cands if c.is_file()), None)
-        for a in node.names:
-            if a.name != "*":
-                self.from_imports[a.asname or a.name] = ("file", target, a.name)
+        for a in names:
+            self.from_imports[a.asname or a.name] = ("file", target, a.name)
 
     def ctx_for(self, path: Path) -> "FileCtx | None":
         rp = path.resolve()
@@ -427,17 +426,19 @@ def _pick_function(tree: ast.Module, module_stem: str, override: str | None):
                     "(classes and private helpers are not oracle entries)", kind="usage")
 
 
-def _params_of(fn) -> tuple[list[dict], list[str]]:
-    """(positional+keyword-only params, notes for *args/**kwargs)."""
+def _signature_params(fn) -> tuple[dict[str, dict], list[str]]:
+    """{param name: {"annotation": node or None, "has_default": bool}} for
+    positional and keyword-only params, plus hand-tune notes for *args /
+    **kwargs (which JSON kwargs rows cannot express)."""
     a = fn.args
-    params, notes = [], []
-    pos = (a.posonlyargs or []) + a.args
-    defaults = [None] * (len(pos) - len(a.defaults or [])) + list(a.defaults or [])
+    params: dict[str, dict] = {}
+    pos = a.posonlyargs + a.args
+    defaults = [None] * (len(pos) - len(a.defaults)) + a.defaults
     for arg, default in zip(pos, defaults):
-        params.append({"name": arg.arg, "has_default": default is not None})
-    kw_defaults = a.kw_defaults or []
-    for arg, default in zip(a.kwonlyargs or [], kw_defaults):
-        params.append({"name": arg.arg, "has_default": default is not None})
+        params[arg.arg] = {"annotation": arg.annotation, "has_default": default is not None}
+    for arg, default in zip(a.kwonlyargs, a.kw_defaults):
+        params[arg.arg] = {"annotation": arg.annotation, "has_default": default is not None}
+    notes = []
     if a.vararg:
         notes.append(f"*{a.vararg.arg} cannot be expressed as JSON kwargs rows — hand-complete")
     if a.kwarg:
@@ -459,8 +460,10 @@ def _zero(spec: dict, depth: int = 0):
         return False
     if k == "literal":
         return spec["values"][0] if spec.get("values") else None
-    if k in ("list", "set", "dict"):
-        return [] if k != "dict" else {}
+    if k == "dict":
+        return {}
+    if k in ("list", "set"):
+        return []
     if k == "tuple":
         return [] if spec.get("variadic") else [_zero(s, depth + 1) for s in spec["items"]]
     if k == "union":
@@ -867,7 +870,7 @@ in {"i", "input"} framing; oracle.py adds that envelope itself (issue #29).
 Edge rows cover zero-values and signature boundaries (often the documented
 error path); random rows follow the baked-in specs.
 
-@@INVARINTS@@Flagged parameters generate None until hand-completed:
+@@INVARIANTS@@Flagged parameters generate None until hand-completed:
 @@FLAGGED@@
 """
 
@@ -1077,7 +1080,17 @@ if __name__ == "__main__":
 # ------------------------------------------------------------- rendering --
 
 def _sanitize_stem(unit_id: str) -> str:
-    return "".join(c if c.isalnum() or c == "_" else "_" for c in unit_id)
+    return re.sub(r"[^A-Za-z0-9_]", "_", unit_id)
+
+
+def _fill_template(text: str, tokens: dict[str, str], what: str) -> str:
+    """@@TOKEN@@ substitution; refuses to ship an unresolved token — a
+    template bug must never become a broken artifact."""
+    for token, value in tokens.items():
+        text = text.replace(token, value)
+    if "@@" in text:
+        raise ToolError(f"internal: unresolved template token in {what}", kind="setup")
+    return text
 
 
 def _hand_tune_block(items: list[dict]) -> str:
@@ -1094,17 +1107,16 @@ def _render_adapter(*, side: str, unit: str, function: str, param_specs: dict,
     the has_default wrapper instead)."""
     stem = _sanitize_stem(unit)
     if side == "ref":
-        backend = REF_BACKEND
-        backend = backend.replace("@@ROOT_REPR@@", repr(str(project_root)))
-        backend = backend.replace("@@MODULE_CANDIDATES@@", repr(module_candidates))
-        backend = backend.replace("@@UNIT_PATH_REPR@@", repr(unit_path))
+        backend = (REF_BACKEND
+                   .replace("@@ROOT_REPR@@", repr(str(project_root)))
+                   .replace("@@MODULE_CANDIDATES@@", repr(module_candidates))
+                   .replace("@@UNIT_PATH_REPR@@", repr(unit_path)))
     else:
-        backend = CAND_BACKEND.replace("@@CANDIDATE_MODULE@@",
-                                       repr(candidate_module))
-        backend = backend.replace("@@ROOT_REPR@@", repr(str(project_root)))
-    backend = backend.replace("@@FUNCTION_REPR@@", repr(function))
-    text = ADAPTER_TEMPLATE
-    for token, value in {
+        backend = (CAND_BACKEND
+                   .replace("@@CANDIDATE_MODULE@@", repr(candidate_module))
+                   .replace("@@ROOT_REPR@@", repr(str(project_root))))
+    backend = backend.replace("@@FUNCTION_REPR@@", repr(function)).rstrip("\n")
+    return _fill_template(ADAPTER_TEMPLATE, {
         "@@UNIT@@": unit,
         "@@UNIT_REPR@@": repr(unit),
         "@@FUNCTION@@": function,
@@ -1114,13 +1126,8 @@ def _render_adapter(*, side: str, unit: str, function: str, param_specs: dict,
         "@@RESULT_SPEC@@": pformat(result_spec, sort_dicts=False, width=88),
         "@@HANDTUNE_MARK@@": f" ({len(hand_tune)} item(s))" if hand_tune else "",
         "@@HANDTUNE_LIST@@": _hand_tune_block(hand_tune),
-        "@@BACKEND@@": backend.rstrip("\n"),
-    }.items():
-        text = text.replace(token, value)
-    if "@@" in text:  # a template bug must never ship as a broken artifact
-        raise ToolError(f"internal: unresolved template token in {side} adapter "
-                        f"for {unit}", kind="setup")
-    return text
+        "@@BACKEND@@": backend,
+    }, f"{side} adapter for {unit}")
 
 
 def _shared_adapter_sha256(ref_text: str, cand_text: str):
@@ -1143,8 +1150,7 @@ def _render_generator(*, unit: str, function: str, specs: dict, edge_rows: list,
     invariants_block = (f"Contract invariants (from the unit's contract.json —\n"
                         f"the edge rows should exercise them, especially the "
                         f"error paths):\n{inv_lines}\n\n" if inv_lines else "")
-    text = GENERATOR_TEMPLATE
-    for token, value in {
+    return _fill_template(GENERATOR_TEMPLATE, {
         "@@STEM@@": stem,
         "@@UNIT@@": unit,
         "@@UNIT_REPR@@": repr(unit),
@@ -1154,14 +1160,9 @@ def _render_generator(*, unit: str, function: str, specs: dict, edge_rows: list,
         "@@ROWS@@": str(rows),
         "@@SPECS@@": pformat(specs, sort_dicts=False, width=88),
         "@@EDGE_ROWS@@": pformat(edge_rows, sort_dicts=False, width=88),
-        "@@INVARINTS@@": invariants_block,
+        "@@INVARIANTS@@": invariants_block,
         "@@FLAGGED@@": (", ".join(flagged) if flagged else "none"),
-    }.items():
-        text = text.replace(token, value)
-    if "@@" in text:
-        raise ToolError(f"internal: unresolved template token in generator for "
-                        f"{unit}", kind="setup")
-    return text
+    }, f"generator for {unit}")
 
 
 # --------------------------------------------------------- the scaffold ---
@@ -1183,8 +1184,27 @@ def _load_contract(path: str, unit_id: str, warnings: list[str]) -> dict | None:
     return read_json(p)
 
 
+def _param_specs(params: dict[str, dict], ctx: FileCtx) -> tuple[dict, list[dict]]:
+    """({name: {"spec", "has_default"}}, hand-tune flags) — a parameter whose
+    annotation the heuristic cannot express, or whose dict keys cannot
+    round-trip through JSON, is flagged, never guessed."""
+    specs: dict[str, dict] = {}
+    hand_tune: list[dict] = []
+    for name, info in params.items():
+        spec = _parse_ann(info["annotation"], ctx)
+        specs[name] = {"spec": spec, "has_default": info["has_default"]}
+        if spec["kind"] == "unknown":
+            hand_tune.append({"where": f"param {name}",
+                              "reason": spec.get("reason", spec.get("text", "unknown type"))})
+        if spec["kind"] == "dict" and spec["key"]["kind"] not in JSON_DICT_KEYS:
+            hand_tune.append({"where": f"param {name} (dict keys)",
+                              "reason": f"dict keys of kind {spec['key']['kind']!r} "
+                                        "cannot round-trip through JSON"})
+    return specs, hand_tune
+
+
 def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
-                   args, targets: dict, warnings: list[str]) -> dict:
+                   args, targets: set, warnings: list[str]) -> dict:
     uid = u["id"]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", uid):
         raise ToolError(f"unit id {uid!r} is not a safe file-name component — "
@@ -1195,29 +1215,12 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
                         kind="usage")
     tree = ast.parse(src.read_text(encoding="utf-8", errors="replace"))
     ctx = FileCtx(src.resolve(), root if root.is_dir() else src.parent, {})
-    module_stem = src.stem
-    fn, how = _pick_function(tree, module_stem, args.function)
-    params, notes = _params_of(fn)
+    fn, how = _pick_function(tree, src.stem, args.function)
+    params, notes = _signature_params(fn)
+    param_specs, hand_tune = _param_specs(params, ctx)
+    hand_tune += [{"where": "signature", "reason": n} for n in notes]
 
     contract = _load_contract(args.contract, uid, warnings) if args.contract else None
-    param_specs = {}
-    hand_tune = []
-    for p in params:
-        ann = None
-        for node in fn.args.posonlyargs + fn.args.args + (fn.args.kwonlyargs or []):
-            if node.arg == p["name"]:
-                ann = node.annotation
-                break
-        spec = _parse_ann(ann, ctx)
-        param_specs[p["name"]] = {"spec": spec, "has_default": p["has_default"]}
-        if spec["kind"] == "unknown":
-            hand_tune.append({"where": f"param {p['name']}",
-                              "reason": spec.get("reason", spec.get("text", "unknown type"))})
-        if spec["kind"] == "dict" and spec["key"]["kind"] not in ("str", "int", "float", "any", "unknown"):
-            hand_tune.append({"where": f"param {p['name']} (dict keys)",
-                              "reason": f"dict keys of kind {spec['key']['kind']!r} cannot round-trip through JSON"})
-    for note in notes:
-        hand_tune.append({"where": "signature", "reason": note})
     result_spec = _parse_ann(fn.returns, ctx) if fn.returns else None
     if result_spec is not None and result_spec["kind"] == "unknown":
         warnings.append(f"unit {uid}: return annotation {result_spec.get('text')!r} "
@@ -1236,11 +1239,8 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
 
     stem = _sanitize_stem(uid)
     module_candidates = import_candidates_of(u["python_path"])
-    rel = src.resolve()
-    try:
-        rel = rel.relative_to(root)
-    except ValueError:
-        pass
+    resolved = src.resolve()
+    rel = resolved.relative_to(root) if resolved.is_relative_to(root) else resolved
     raw_specs = {n: info["spec"] for n, info in param_specs.items()}
     ref_text = _render_adapter(side="ref", unit=uid, function=fn.name,
                                param_specs=raw_specs, result_spec=result_spec,
@@ -1267,12 +1267,9 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
         "corpus": out / "corpora" / f"corpus-{uid}.jsonl",
         "manifest": out / "manifests" / f"{uid}.json",
     }
-    texts = {k: (ref_text if k == "ref_adapter" else
-                 cand_text if k == "cand_adapter" else
-                 gen_text if k == "generator" else None)
-             for k in files}
-    for k, p in files.items():
-        targets[p] = (uid, k)
+    texts = {"ref_adapter": ref_text, "cand_adapter": cand_text,
+             "generator": gen_text}
+    targets.update(files.values())
 
     manifest = {
         "unit": uid,
@@ -1301,10 +1298,10 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
 
 
 def _write_unit(result: dict) -> None:
-    for key, path in ((k, Path(v)) for k, v in result["files"].items()):
+    for key, text in result["texts"].items():
+        path = Path(result["files"][key])
         path.parent.mkdir(parents=True, exist_ok=True)
-        if key in ("ref_adapter", "cand_adapter", "generator"):
-            path.write_text(result["texts"][key], encoding="utf-8")
+        path.write_text(text, encoding="utf-8")
     write_json_atomic(result["files"]["manifest"], result["manifest"])
 
 
@@ -1360,6 +1357,62 @@ def _dry_run_corpus(result: dict, out_dir: Path, timeout: float) -> dict:
     }
 
 
+def _select_units(units: list, chunks: list[str] | None) -> list[dict]:
+    """Units the user asked for (--unit repeatable / comma-separated), or
+    all of them; unknown ids are a usage error, not silence."""
+    wanted = [w for chunk in chunks or []
+              for w in (p.strip() for p in chunk.split(",")) if w]
+    if not wanted:
+        return units
+    known = {u["id"] for u in units}
+    unknown = [w for w in wanted if w not in known]
+    if unknown:
+        raise ToolError(f"unknown unit id(s) {unknown}; state has {sorted(known)}",
+                        kind="usage")
+    return [u for u in units if u["id"] in wanted]
+
+
+def _classify_dry_run(result: dict, dry: dict, findings: list, warnings: list) -> None:
+    """Turn the dry-run record into findings/warnings per tools/README.md:
+    hand-tune flags and a reference that cannot run (or errors on every
+    row) are findings; a thin-but-alive reference and non-ok rows are
+    warnings."""
+    unit = result["unit"]
+    if result["hand_tune"]:
+        findings.append({"unit": unit, "kind": "hand_tune",
+                         "items": result["hand_tune"]})
+    if dry.get("setup_error"):
+        findings.append({
+            "unit": unit, "kind": "reference_setup_error",
+            "detail": f"the reference adapter failed to run, so the corpus "
+                      f"could not be validated: {dry['setup_error']}"})
+    elif dry["degenerate"]:
+        findings.append({
+            "unit": unit, "kind": "degenerate_corpus",
+            "detail": "the reference adapter errors on every corpus row — a judge "
+                      "run would be hollow/INCOMPARABLE (issue #30); fix the corpus "
+                      "or the flagged parameters"})
+    elif dry["warning"]:
+        warnings.append(f"unit {unit}: {dry['warning']}")
+    for status, n in sorted(dry["counts"].items()):
+        if status != "ok" and n:
+            warnings.append(f"unit {unit}: {n}/{len(dry['rows'])} "
+                            f"reference dry-run rows {status} (some error-path "
+                            "rows are coverage; a wall of identical errors is not)")
+
+
+def _finish_unit(result: dict, out: Path, args, findings: list, warnings: list) -> None:
+    """Write the artifacts, generate the corpus, dry-run it through
+    oracle.py's runner, and record findings/warnings."""
+    _write_unit(result)
+    result["corpus"] = _generate_corpus(result, args.seed, args.rows)
+    dry = _dry_run_corpus(result, out, args.timeout)
+    result["corpus_dry_run"] = {k: v for k, v in dry.items() if k != "rows"}
+    result["corpus_dry_run"]["sample_rows"] = dry["rows"][:5]
+    _classify_dry_run(result, dry, findings, warnings)
+    del result["texts"]
+
+
 def cmd_scaffold(args) -> int:
     if not (args.state or args.state_pos):
         raise ToolError("a migration-state.json path is required (positional or --state)",
@@ -1380,25 +1433,14 @@ def cmd_scaffold(args) -> int:
             "corpora name the target project's private code and runs/ is "
             "gitignored precisely so they never reach the repo (issue #32)")
 
-    wanted: list[str] = []
-    for chunk in args.unit or []:
-        wanted.extend(p.strip() for p in chunk.split(",") if p.strip())
-    if wanted:
-        known = {u["id"] for u in units}
-        unknown = [w for w in wanted if w not in known]
-        if unknown:
-            raise ToolError(f"unknown unit id(s) {unknown}; state has {sorted(known)}",
-                            kind="usage")
-        selected = [u for u in units if u["id"] in wanted]
-    else:
-        selected = units
+    selected = _select_units(units, args.unit)
 
     # analyze every unit first, then refuse-before-write: hand-tuned
     # scaffolds must not be half-overwritten
-    targets: dict = {}
+    targets: set = set()
     results = [_scaffold_unit(u, root, project_root, out, args, targets, warnings)
                for u in selected]
-    existing = sorted(str(p) for p in targets if Path(p).exists())
+    existing = sorted(str(p) for p in targets if p.exists())
     if existing and not args.force:
         raise ToolError(
             "refusing to overwrite existing scaffold output (hand-tuned edits "
@@ -1407,34 +1449,7 @@ def cmd_scaffold(args) -> int:
 
     findings: list[dict] = []
     for result in results:
-        _write_unit(result)
-        corpus = _generate_corpus(result, args.seed, args.rows)
-        dry = _dry_run_corpus(result, out, args.timeout)
-        result["corpus"] = corpus
-        result["corpus_dry_run"] = {k: v for k, v in dry.items() if k != "rows"}
-        result["corpus_dry_run"]["sample_rows"] = dry["rows"][:5]
-        if result["hand_tune"]:
-            findings.append({"unit": result["unit"], "kind": "hand_tune",
-                             "items": result["hand_tune"]})
-        if dry.get("setup_error"):
-            findings.append({
-                "unit": result["unit"], "kind": "reference_setup_error",
-                "detail": f"the reference adapter failed to run, so the corpus "
-                          f"could not be validated: {dry['setup_error']}"})
-        elif dry["degenerate"]:
-            findings.append({
-                "unit": result["unit"], "kind": "degenerate_corpus",
-                "detail": "the reference adapter errors on every corpus row — a judge "
-                          "run would be hollow/INCOMPARABLE (issue #30); fix the corpus "
-                          "or the flagged parameters"})
-        elif dry["warning"]:
-            warnings.append(f"unit {result['unit']}: {dry['warning']}")
-        for status, n in sorted(dry["counts"].items()):
-            if status != "ok" and n:
-                warnings.append(f"unit {result['unit']}: {n}/{len(dry['rows'])} "
-                                f"reference dry-run rows {status} (some error-path "
-                                "rows are coverage; a wall of identical errors is not)")
-        del result["texts"]
+        _finish_unit(result, out, args, findings, warnings)
 
     code = EXIT_FINDINGS if findings else EXIT_OK
     ok_units = sum(1 for r in results if not r["hand_tune"])

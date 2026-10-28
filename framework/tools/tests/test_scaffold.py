@@ -16,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from conftest import run_tool
 
 
@@ -181,7 +183,7 @@ def test_placeholder_candidate_is_an_honest_setup_failure(monkeypatch, capsys, t
 
 # --------------------------------------------- seeded fresh-inputs (#32) --
 
-def _load_generator(path: Path):
+def _load_module(path: Path):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -192,7 +194,7 @@ def test_generator_same_seed_is_byte_identical(monkeypatch, capsys, tmp_path):
     proj, state = _project(tmp_path)
     out = tmp_path / "runs"
     _, payload = _scaffold(monkeypatch, capsys, state, proj, out)
-    gen = _load_generator(Path(payload["units"][0]["files"]["generator"]))
+    gen = _load_module(Path(payload["units"][0]["files"]["generator"]))
     a = gen.build_rows(20261028, 8)
     b = gen.build_rows(20261028, 8)
     assert a == b
@@ -338,11 +340,7 @@ def test_int_float_distinction_survives_the_adapter(monkeypatch, capsys, tmp_pat
     proj, state = _project(tmp_path, name="w", unit="u-twice", module="twice", body=body)
     out = tmp_path / "runs"
     _, payload = _scaffold(monkeypatch, capsys, state, proj, out)
-    adapter = _load_generator(Path(payload["units"][0]["files"]["ref_adapter"]))
-    try:
+    adapter = _load_module(Path(payload["units"][0]["files"]["ref_adapter"]))
+    with pytest.raises(TypeError, match=r"\$\.n: expected int"):  # never silently coerce
         adapter.run({"n": 1.0})
-        raised = False
-    except TypeError:
-        raised = True
-    assert raised, "float-for-int must raise, never silently coerce"
     assert adapter.run({"n": 21}) == 42
