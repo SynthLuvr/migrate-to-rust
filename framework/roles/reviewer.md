@@ -7,7 +7,10 @@ and better).
 
 ## Checklist
 1. **Parity, independently:** re-run the oracle yourself on **fresh inputs**
-   (new Hypothesis seeds). Never trust a reported verdict.
+   (new Hypothesis seeds). Never trust a reported verdict. With a
+   scaffolded corpus (issue #32), fresh inputs are one command:
+   `python runs/corpora/gen_<unit>.py --seed <fresh> --out corpus-fresh.jsonl`
+   — never re-judge the translator's own corpus.
 2. **PyO3-FFI hazards** (classes miri/clippy don't cover):
    - refcount handling on returned/borrowed objects
    - error conversion paths — is any error silently swallowed?

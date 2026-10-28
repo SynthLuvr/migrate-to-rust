@@ -10,7 +10,12 @@ How it runs code
 ----------------
 The unit under migration ships as a PyO3 wheel whose Python API is frozen,
 so *both* sides are Python callables: an "entry" is ``module:function``
-(runner default function name: ``run``).
+(runner default function name: ``run``). An entry may also be a relative
+or absolute ``*.py:function`` file path, resolved against the child's cwd —
+the manifest's directory for ``judge``, the corpus's directory for
+``corpus`` — which is how ``scaffold.py`` (issue #32) ships adapters that
+live in their own directory next to the manifest while the manifest stays
+judge-ready verbatim.
 
 **Corpus file format (what you write)** — JSONL, **one raw JSON value per
 line = one input**, exactly as the entry function should receive it.
@@ -84,11 +89,12 @@ Subcommands
   rules       print the normalization rules (machine-readable documentation)
 
 judge manifest shape (relative paths resolve against the manifest's
-directory)::
+directory; entries are ``module:function`` or relative ``*.py:function``
+file paths — issue #32)::
 
     {"unit": "u-1",
      "reference": {"entry": "impl:run"},
-     "candidate": {"entry": "cand:run"},
+     "candidate": {"entry": "../adapters/u_1_cand.py:run"},
      "corpus": "corpus.jsonl",
      "normalization": {...}}          # optional rule overrides
 
@@ -478,14 +484,34 @@ def _degenerate_note(counts: dict) -> str:
 # --------------------------------------------------------------- runner ----
 
 RUNNER_SRC = r"""
-import json, sys
+import importlib.util, json, os, sys
+
+def _load(entry):
+    # entry is "module:function" (module imported with the child's cwd on
+    # sys.path) or a "*.py:function" file path, resolved against the cwd —
+    # the manifest/corpus directory. scaffold.py (issue #32) emits path
+    # entries so adapters can live in their own directory next to the
+    # manifest; rpartition keeps Windows drive prefixes intact.
+    if ":" in entry:
+        mod, _, attr = entry.rpartition(":")
+    else:
+        mod, attr = entry, "run"
+    attr = attr or "run"
+    if mod.endswith(".py"):
+        path = os.path.abspath(mod)
+        if not os.path.isfile(path):
+            raise ImportError(f"entry file not found: {mod}")
+        spec = importlib.util.spec_from_file_location("__oracle_entry__", path)
+        m = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = m
+        spec.loader.exec_module(m)
+    else:
+        m = __import__(mod, fromlist=[attr])
+    return getattr(m, attr)
 
 def main(entry):
-    mod, _, attr = entry.partition(":")
-    attr = attr or "run"
     try:
-        m = __import__(mod, fromlist=[attr])
-        fn = getattr(m, attr)
+        fn = _load(entry)
     except Exception as e:  # setup failure: nothing on this side is judgeable
         print(json.dumps({"setup_error": f"{type(e).__name__}: {e}"}), flush=True)
         return
@@ -516,16 +542,37 @@ main(sys.argv[1])
 """
 
 
+def _load_entry_callable(entry: str):
+    """Resolve an entry for in-process execution (the self-test path) with
+    the SAME semantics as the child runner's loader: ``module:function`` or
+    a ``*.py:function`` file path (resolved against the process cwd), the
+    attribute defaulting to ``run``."""
+    if ":" in entry:
+        mod, _, attr = entry.rpartition(":")
+    else:
+        mod, attr = entry, "run"
+    attr = attr or "run"
+    if mod.endswith(".py"):
+        import importlib.util
+        path = Path(mod).resolve()
+        if not path.is_file():
+            raise ImportError(f"entry file not found: {mod}")
+        spec = importlib.util.spec_from_file_location("__oracle_entry__", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    else:
+        module = __import__(mod, fromlist=[attr])
+    return getattr(module, attr)
+
+
 def _execute_entry_local(entry: str, inputs: list) -> list[dict]:
     """In-process execution used by self-test — the SAME record protocol the
     subprocess runner produces, so self-test judges through the identical
     path (no special-cased verdicts)."""
-    mod_name, _, attr = entry.partition(":")
-    attr = attr or "run"
     records = []
     try:
-        module = __import__(mod_name, fromlist=[attr])
-        fn = getattr(module, attr)
+        fn = _load_entry_callable(entry)
     except Exception as e:
         return [{"setup_error": f"{type(e).__name__}: {e}"}]
     for i, value in enumerate(inputs):
@@ -991,8 +1038,9 @@ def main(argv=None) -> int:
                    help="corpus file to dry-run (one raw JSON value per line — "
                         "see module docstring; NOT pre-wrapped in {\"i\",\"input\"})")
     p.add_argument("--entry", required=True,
-                   help="module:function to execute (default fn: run); module "
-                        "resolves with the corpus file's directory as cwd")
+                   help="module:function or path/to/file.py:function to execute "
+                        "(default fn: run); resolves with the corpus file's "
+                        "directory as cwd")
     p.add_argument("--runs", type=int, default=0, help="cap the corpus (0 = all)")
     p.add_argument("--timeout", type=float, default=120.0, help="per-side timeout (s)")
     p.set_defaults(func=cmd_corpus)

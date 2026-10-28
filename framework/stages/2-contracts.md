@@ -10,7 +10,12 @@ is the spec; the judge is what makes "correct" decidable.
    invariants, golden corpora.
 3. Build the equivalence oracle (implemented: `tools/oracle.py`; see
    `tools/README.md` "Implementation notes"):
-   - generate inputs with Hypothesis strategies derived from contracts
+   - generate inputs from the contracts — `tools/scaffold.py` (issue #32)
+     scaffolds per unit, under gitignored `runs/`: a seeded corpus in the
+     documented raw-value format, *symmetric* reference/candidate
+     adapters (JSON → typed objects → call → canonical JSON), and a
+     judge-ready manifest; types the heuristic can't express are flagged
+     for hand-completion, never guessed
    - run the Python reference; capture structured output + hash
    - classify every run **Equivalent / Divergent / Incomparable**
    - document normalization rules — `python framework/tools/oracle.py rules`
