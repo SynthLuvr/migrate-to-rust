@@ -14,6 +14,10 @@ from conftest import run_tool
 
 CTX = {"today": date(2026, 10, 27), "substitutions": {}}
 
+# payload that prints the shim value each side actually ran under — used by
+# the leak/divergence/refusal tests to prove sides apart
+ECHO_SIDE = 'print("side", os.environ["DEMO_FALLBACK"])'
+
 
 def _script(slow_n: int, fast_n: int, payload: str = 'print("payload ok")',
             tail: str = "") -> str:
@@ -113,9 +117,7 @@ def test_ambient_env_var_does_not_leak_into_the_ported_side(
     # an inherited DEMO_FALLBACK=all must not flip the ported side: the
     # harness sets the var explicitly on both sides (the command echoes it,
     # so the artifacts prove which value each side saw)
-    target = _target(tmp_path / "target",
-                     _script(10, 10, payload='print("side", '
-                                            'os.environ["DEMO_FALLBACK"])'))
+    target = _target(tmp_path / "target", _script(10, 10, payload=ECHO_SIDE))
     state = _state(tmp_path, target)
     monkeypatch.setenv("DEMO_FALLBACK", "all")
     code, out = _run(monkeypatch, capsys, state)
@@ -126,9 +128,7 @@ def test_ambient_env_var_does_not_leak_into_the_ported_side(
 
 
 def test_divergent_outputs_abort_without_ratio(monkeypatch, capsys, tmp_path):
-    target = _target(tmp_path / "target",
-                     _script(10, 10, payload='print("side", '
-                                            'os.environ["DEMO_FALLBACK"])'))
+    target = _target(tmp_path / "target", _script(10, 10, payload=ECHO_SIDE))
     state = _state(tmp_path, target)
     code, out = _run(monkeypatch, capsys, state)
     assert code == 2
@@ -272,9 +272,7 @@ def test_gate_go_no_go_measurement_outranks_the_projection(
 
 
 def test_gate_refuses_to_write_when_outputs_diverge(monkeypatch, capsys, tmp_path):
-    target = _target(tmp_path / "target",
-                     _script(10, 10, payload='print("side", '
-                                            'os.environ["DEMO_FALLBACK"])'))
+    target = _target(tmp_path / "target", _script(10, 10, payload=ECHO_SIDE))
     state = _state(tmp_path, target, gates=[{
         "gate": "redesign_approval", "state": "open",
         "evidence": ["spike_verdict=equivalent"]}])
