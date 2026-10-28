@@ -26,9 +26,11 @@ the existing dual-build design: per-unit Python fallback, one-env-var shim,
 rollback pin — every autonomous decision stays reversible per unit.
 Session-level ``budget_exhausted`` (the orchestrator session's context
 window, not these run-level ceilings) is handled by ``succession.py``
-(issue #25), which chains successor GLV sessions automatically; this
-driver's own ``budget_exhausted`` exit therefore means the run-level
-bound hit — raise the ceiling to resume.
+(issue #25), which chains successor GLV sessions automatically and
+bootstraps GLV itself (issue #47: serve + its own named token — no
+alternate transport); this driver's own ``budget_exhausted`` exit
+therefore means the run-level bound hit — the pre-authorized budget is
+spent, and raising it is the operator's between-runs decision.
 
 Autonomy levels (pre-authorized BEFORE the run; zero mid-run questions at
 any level — the agent never asks): L0 supervised (gates are hard stops: the
@@ -1392,9 +1394,10 @@ def cmd_run(args) -> int:
         return _emit_refusal(
             f"run_status={run_status} is a finished run — start a fresh run "
             f"(state.py init) to migrate again; resume is only for "
-            f"budget_exhausted/failed_safely after raising the ceiling "
-            f"(or, when GLV is reachable, tools/succession.py chains "
-            f"successor sessions automatically — issue #25)",
+            f"budget_exhausted/failed_safely after the operator raises the "
+            f"ceiling between runs (tools/succession.py chains successor "
+            f"sessions automatically and bootstraps GLV itself — issues "
+            f"#25/#47)",
             args.human, file=str(path))
     if not args.dry_run and not args.agent_cmd:
         return _emit_refusal(
@@ -1491,11 +1494,12 @@ def cmd_run(args) -> int:
              + (f" — {terminal.reason}" if terminal is not None else
                 f" (--once: resume with another pipeline.py run)")
              + f"; report: {rp}"
-             + ("; session-level exhaustion chains a successor automatically "
-                "via tools/succession.py (GLV transport, issue #25) — this "
-                "manual resume path is only for run-level ceilings the "
-                "operator has raised" if run_status == "budget_exhausted"
-                else ""))
+             + ("; the run-level budget is spent: session-level exhaustion "
+                "never appears as a run result (tools/succession.py chains "
+                "GLV successor sessions automatically and bootstraps GLV "
+                "itself, issues #25/#47); raising autonomy.budget is an "
+                "operator decision between runs, never a mid-run ask"
+                if run_status == "budget_exhausted" else ""))
     emit({"tool": TOOL, "version": VERSION, "file": str(path),
           "run_status": run_status, "stage": state.get("stage"),
           "autonomy": state.get("autonomy"),

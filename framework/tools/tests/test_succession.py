@@ -8,12 +8,18 @@ bound the chain, and only genuine terminals — or the run-level ceilings —
 end it. A scripted fake GLV client stands in for the transport (the real
 one is HTTP per tools/glv-subagents.md); the "agent work" each fake
 session performs is a journaled mutation of the state file through
-state.py, exactly what a real session does."""
+state.py, exactly what a real session does.
+
+Issue #47: GLV is the unconditional transport — the harness bootstraps
+it itself (probe/start `glv serve`, mint run-<project>-s<n> per
+session, re-mint on 401, revive on connection loss); no alternate
+operating mode exists anywhere in the framework (the grep-clean test
+below pins that)."""
 
 from __future__ import annotations
 
 import json
-import sys
+import os
 from pathlib import Path
 
 import pytest
@@ -30,7 +36,6 @@ class FakeGlv:
     """Scripted transport: start_session records the brief; wait_settled
     applies the next scripted mutation to the state file (the session's
     "work") and reports the session completed."""
-
     def __init__(self, state_path, script):
         self.state_path = Path(state_path)
         self.script = list(script)   # consumed by wait_settled, in order
@@ -56,19 +61,6 @@ class FakeGlv:
     def stop(self, session_id):
         self.stopped.append(session_id)
         return {"status": "stopped"}
-
-
-class FailingStartGlv(FakeGlv):
-    """Session 1 runs; every later start_session fails (GLV died)."""
-
-    def __init__(self, state_path, script, fail_from=2):
-        super().__init__(state_path, script)
-        self.fail_from = fail_from
-
-    def start_session(self, **kw):
-        if len(self.started) + 1 >= self.fail_from:
-            raise succession_tool.GlvError("connection refused (fake)")
-        return super().start_session(**kw)
 
 
 def _wire_fake(monkeypatch, fake):
@@ -302,7 +294,7 @@ def test_chain_reaches_complete_from_one_prompt_with_mid_run_succession(
                          ["chain", str(p), "--prompt-file", str(prompt),
                           "--working-dir", str(target)])
     assert code == 0, out
-    assert out["run_status"] == "complete" and out["degraded"] is False
+    assert out["run_status"] == "complete"
     assert out["chain"]["depth"] == 1 and len(out["chain"]["sessions"]) == 2
 
     # two GLV sessions, successor named per convention, both in the target
@@ -314,6 +306,7 @@ def test_chain_reaches_complete_from_one_prompt_with_mid_run_succession(
     first = fake.started[0]["prompt"]
     assert "Migrate demo per the framework prompt" in first
     assert str(p) in first and "successor session" in first.lower()
+    assert "GLV bootstrap" in first        # issue #47: bootstrap first act
 
     # the successor's brief is the full resume context (issue #25 list)
     brief = fake.started[1]["prompt"]
@@ -325,6 +318,7 @@ def test_chain_reaches_complete_from_one_prompt_with_mid_run_succession(
     assert "4400000 remaining" in brief         # run-level budget remaining
     assert "never asks a human" in brief        # resume instructions
     assert "crates/demo-core/src/u_bars.rs" in brief  # hygiene finding
+    assert "GLV bootstrap" in brief             # re-bootstrap from cold start
 
     # resume hygiene repaired the mis-recorded rust path (journaled)
     st = _load(p)
@@ -423,35 +417,284 @@ def test_chain_monotonic_progress_guard_kills_resume_loops(
     assert "no observable state" in out["summary"]["human"]
 
 
-# -------------------------------------------------------- degraded mode ----
+# ---------------------------------------------- GLV self-bootstrap (#47) ----
 
-def test_chain_refuses_to_start_without_glv_degraded_mode_documented(
-        monkeypatch, capsys, tmp_path):
-    p = _midrun_state(tmp_path)
+def _wire_selfbootstrap(monkeypatch, fake, *, ensure=None):
+    """Wire the chain for the issue-#47 cold-start path: NO GLV_* env,
+    nothing assumed — the harness must bootstrap itself. The transport
+    seams (_ensure_server / _mint_token / GlvClient) are faked; returns
+    the minted token names (the `glv token list` audit trail)."""
     monkeypatch.delenv("GLV_BASE_URL", raising=False)
     monkeypatch.delenv("GLV_API_TOKEN", raising=False)
-    code, out = run_tool(monkeypatch, capsys, "succession.py",
-                         ["chain", str(p), "--prompt-file", "/dev/null"])
-    assert code == 2 and "GLV" in out["error"]
-    assert "degraded" in out["error"]
-    # the state file is untouched: no chain recorded, nothing spawned
-    assert "session_chain" not in _load(p)
+    monkeypatch.setattr(succession_tool, "GlvClient",
+                        lambda url, token: fake)
+    monkeypatch.setattr(succession_tool, "_ensure_server",
+                        ensure or (lambda url, **kw: "up"))
+    minted = []
+
+    def fake_mint(base_url, name):
+        minted.append(name)
+        return f"glv_at_fake_{name}"
+
+    monkeypatch.setattr(succession_tool, "_mint_token", fake_mint)
+    return minted
 
 
-def test_chain_mid_run_glv_loss_parks_degraded_in_budget_exhausted(
+def test_chain_bootstraps_glv_and_mints_a_token_per_session(
         monkeypatch, capsys, tmp_path):
+    """Cold start (issue #47 acceptance): no server configured, no env —
+    the harness itself ensures the server, mints run-<project>-s<n> per
+    chain session (the audit trail), exports the env vars, and the run
+    still reaches complete from the one prompt."""
     p = _midrun_state(tmp_path)
-    fake = FailingStartGlv(p, [
+    fake = FakeGlv(p, [
         _session_exhausts(stage=4, unit_status={"u1": "ported"}),
+        _session_completes(unit_status={"u2": "ported", "u3": "ported"}),
     ])
-    _wire_fake(monkeypatch, fake)
+    minted = _wire_selfbootstrap(monkeypatch, fake)
+
     code, out = run_tool(monkeypatch, capsys, "succession.py",
                          ["chain", str(p), "--prompt-file", "/dev/null"])
-    assert code == 0  # a terminal state, never a hang
-    assert out["run_status"] == "budget_exhausted" and out["degraded"] is True
+    assert code == 0, out
+    assert out["run_status"] == "complete"
+    # one named token per chain session — the `glv token list` trail
+    assert minted == ["run-demo-s1", "run-demo-s2"]
+    assert out["glv"] == {"base_url": "http://localhost:3000",
+                          "token_source": "self-minted",
+                          "tokens_minted": ["run-demo-s1", "run-demo-s2"]}
+    boot = [e for e in out["events"] if e["event"] == "glv-bootstrap"]
+    assert boot and boot[0]["mode"] == "self"
+    assert boot[0]["token_name"] == "run-demo-s1"
+    assert {"event": "glv-token-minted",
+            "token_name": "run-demo-s2"} in out["events"]
+    # the harness exported the transport it provisioned itself
+    assert os.environ["GLV_BASE_URL"] == "http://localhost:3000"
+    assert os.environ["GLV_API_TOKEN"].startswith("glv_at_fake_run-demo-s2")
+    # a raw token never leaks into the tool output
+    assert "glv_at_fake" not in json.dumps(out)
+
+
+def test_chain_starts_the_server_when_nothing_answers(monkeypatch, capsys,
+                                                      tmp_path):
+    """Probe says down → the harness starts `glv serve` itself and waits
+    for the probe to turn green before the first session (issue #47)."""
+    p = _midrun_state(tmp_path)
+    fake = FakeGlv(p, [_session_completes()])
+    started = []
+
+    def ensure(url, **kw):
+        started.append(url)
+        return "started"
+
+    _wire_selfbootstrap(monkeypatch, fake, ensure=ensure)
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["chain", str(p), "--prompt-file", "/dev/null"])
+    assert code == 0, out
+    assert started == ["http://localhost:3000"]
+    boot = next(e for e in out["events"] if e["event"] == "glv-bootstrap")
+    assert boot["server"] == "started"
+
+
+def test_ensure_server_starts_serve_then_waits_for_the_probe(monkeypatch):
+    probes, started = [], []
+
+    def fake_probe(url, **kw):
+        probes.append(url)
+        return len(probes) > 1           # down first, up after the start
+
+    monkeypatch.setattr(succession_tool, "_probe_server", fake_probe)
+    monkeypatch.setattr(succession_tool, "_serve_start",
+                        lambda: started.append(1) or True)
+    monkeypatch.setattr(succession_tool.time, "sleep", lambda s: None)
+    assert succession_tool._ensure_server("http://x:1") == "started"
+    assert started == [1] and len(probes) == 2
+    # already serving: the probe answers on the first call, no start
+    monkeypatch.setattr(succession_tool, "_probe_server",
+                        lambda url, **kw: probes.append(url) or True)
+    n_probes, n_started = len(probes), len(started)
+    assert succession_tool._ensure_server("http://x:1") == "up"
+    assert len(probes) == n_probes + 1 and len(started) == n_started
+
+
+def test_ensure_server_without_the_cli_is_an_environment_error(monkeypatch):
+    """Nothing answering + no glv CLI to start one: an environment
+    failure naming what is missing — never a fallback mode, never a
+    human-resume instruction."""
+    monkeypatch.setattr(succession_tool, "_probe_server",
+                        lambda url, **kw: False)
+    monkeypatch.setattr(succession_tool, "_glv_cli_path", lambda: None)
+    with pytest.raises(state_tool.ToolError) as exc:
+        succession_tool._ensure_server("http://localhost:3000")
+    msg = str(exc.value)
+    assert "glv" in msg and "install" in msg
+    assert "degraded" not in msg and "fallback" not in msg
+
+
+def test_mint_token_cli_and_loopback_paths(monkeypatch):
+    # CLI path: glv token create --name <label>, raw token parsed once
+    monkeypatch.setattr(succession_tool, "_glv_cli_path",
+                        lambda: "/usr/bin/glv")
+    calls = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "created run-demo-s1\nglv_at_Ab3_-z9\n"
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(succession_tool.subprocess, "run", fake_run)
+    assert succession_tool._mint_token("http://x:1", "run-demo-s1") == \
+        "glv_at_Ab3_-z9"
+    assert calls[0][1:] == ["token", "create", "--name", "run-demo-s1"]
+    # loopback path: POST /api/tokens (no CLI on the host)
+    monkeypatch.setattr(succession_tool, "_glv_cli_path", lambda: None)
+    reqs = []
+
+    class _Resp:
+        def read(self):
+            return b'{"token": "glv_at_loop1", "name": "run-demo-s1"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        reqs.append(req)
+        return _Resp()
+
+    monkeypatch.setattr(succession_tool.urllib.request, "urlopen",
+                        fake_urlopen)
+    assert succession_tool._mint_token("http://x:1", "run-demo-s1") == \
+        "glv_at_loop1"
+    assert reqs[0].method == "POST"
+    assert reqs[0].full_url.endswith("/api/tokens")
+
+
+def test_chain_re_mints_on_401_without_ending_the_chain(
+        monkeypatch, capsys, tmp_path):
+    """A sudden 401 run (the 30-day expiry) re-mints and continues —
+    re-auth is never a stop and never a human ask (issue #47)."""
+
+    class AuthOnceGlv(FakeGlv):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.fortied_once = False
+
+        def start_session(self, **kw):
+            # the successor spawn 401s exactly once, then the re-minted
+            # retry goes through
+            if len(self.started) == 1 and not self.fortied_once:
+                self.fortied_once = True
+                raise succession_tool.GlvAuthError(
+                    "GLV POST /api/sessions: HTTP 401: expired")
+            return super().start_session(**kw)
+
+    p = _midrun_state(tmp_path)
+    fake = AuthOnceGlv(p, [
+        _session_exhausts(stage=4, unit_status={"u1": "ported"}),
+        _session_completes(unit_status={"u2": "ported", "u3": "ported"}),
+    ])
+    minted = _wire_selfbootstrap(monkeypatch, fake)
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["chain", str(p), "--prompt-file", "/dev/null"])
+    assert code == 0, out
+    assert out["run_status"] == "complete"    # the chain never ended
+    assert minted.count("run-demo-s2") == 2   # bootstrap mint + re-mint
+    assert any(e["event"] == "glv-reauth" and
+               e["token_name"] == "run-demo-s2" for e in out["events"])
+
+
+def test_chain_revives_a_dead_server_mid_chain(monkeypatch, capsys,
+                                               tmp_path):
+    """Connection loss mid-chain: the harness owns the server lifecycle —
+    it revives the server and retries the call; the chain continues."""
+
+    class DeadOnceGlv(FakeGlv):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.died_once = False
+
+        def wait_settled(self, session_id, **kw):
+            # the first wait loses the connection exactly once; after the
+            # revive the retry goes through
+            if not self.died_once:
+                self.died_once = True
+                raise succession_tool.GlvUnreachableError(
+                    "GLV GET /api/sessions/x/wait: no answer")
+            return super().wait_settled(session_id, **kw)
+
+    p = _midrun_state(tmp_path)
+    fake = DeadOnceGlv(p, [_session_completes()])
+    revives = []
+    _wire_selfbootstrap(monkeypatch, fake,
+                        ensure=lambda url, **kw:
+                        revives.append(url) or "up")
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["chain", str(p), "--prompt-file", "/dev/null"])
+    assert code == 0, out
+    assert out["run_status"] == "complete"
+    # two ensure calls: the bootstrap at session 1 + the mid-chain revive
+    assert revives == ["http://localhost:3000",
+                       "http://localhost:3000"]
+    assert any(e["event"] == "glv-server-revived" for e in out["events"])
+
+
+def test_chain_ends_failed_safely_when_the_transport_cannot_be_revived(
+        monkeypatch, capsys, tmp_path):
+    """An unrevivable transport (server dead, nothing can start it) ends
+    the chain failed_safely with a journaled stop-notice — a genuine
+    terminal with the dossier, never a park in budget_exhausted."""
+
+    class AlwaysDeadGlv(FakeGlv):
+        def start_session(self, **kw):
+            raise succession_tool.GlvUnreachableError(
+                "GLV POST /api/sessions: no answer")
+
+    p = _midrun_state(tmp_path)
+    fake = AlwaysDeadGlv(p, [])
+
+    def dead_ensure(url, **kw):
+        raise state_tool.ToolError(
+            "nothing is serving and the glv CLI is not on PATH (fake)",
+            kind="io")
+
+    _wire_selfbootstrap(monkeypatch, fake, ensure=dead_ensure)
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["chain", str(p), "--prompt-file", "/dev/null"])
+    assert code == 2
+    assert out["run_status"] == "failed_safely"
     st = _load(p)
-    assert any("succession FAILED" in n
+    assert any("could not be revived" in n
                for n in st["session_chain"]["notices"])
+    assert (tmp_path / "state.run-report.md").exists()
+    assert "degraded" not in json.dumps(out)
+
+
+def test_chain_without_cli_or_server_reports_the_environment_gap(
+        monkeypatch, capsys, tmp_path):
+    """Cold start with nothing installed: an environment failure (exit 2,
+    install glv) — the state still gets the honest terminal + notice."""
+    p = _midrun_state(tmp_path)
+    fake = FakeGlv(p, [])
+
+    def dead_ensure(url, **kw):
+        raise state_tool.ToolError(
+            "nothing is serving at http://localhost:3000 and the glv CLI "
+            "is not on PATH, so the server cannot be started — install "
+            "glv; GLV is the only transport (issue #47)", kind="io")
+
+    _wire_selfbootstrap(monkeypatch, fake, ensure=dead_ensure)
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["chain", str(p), "--prompt-file", "/dev/null"])
+    assert code == 2 and out["run_status"] == "failed_safely"
+    assert "install glv" in out["summary"]["human"]
+    assert "degraded" not in json.dumps(out)
+    assert "fallback" not in json.dumps(out)
 
 
 def test_chain_adopts_a_live_session_after_a_harness_restart(
@@ -677,7 +920,8 @@ def test_chained_resume_does_not_warn_but_plain_resume_still_does(
 def test_pipeline_budget_exhausted_points_at_the_chain(monkeypatch, capsys,
                                                        tmp_path):
     """pipeline.py's own budget_exhausted exit is the RUN-level bound; its
-    summary now says the session-level case chains automatically."""
+    summary says the session-level case chains automatically and never
+    presents a human resume path as the expected outcome (issue #47)."""
     p = _midrun_state(tmp_path, run_status="pending",
                       budget={"max_tokens": 5000,
                               "max_wall_clock_minutes": 720,
@@ -690,6 +934,7 @@ def test_pipeline_budget_exhausted_points_at_the_chain(monkeypatch, capsys,
     assert code == 0 and out["run_status"] == "budget_exhausted"
     assert "succession.py" in out["summary"]["human"]
     assert "session-level" in out["summary"]["human"]
+    assert "manual" not in out["summary"]["human"]
 
 
 def test_run_report_includes_the_session_chain_section(tmp_path, monkeypatch,
@@ -711,3 +956,25 @@ def test_run_report_includes_the_session_chain_section(tmp_path, monkeypatch,
     assert "Session chain" in text
     assert "run-demo-s2" in text and "stop-notice" in text
     assert "104" in text  # wall clock summed across the chain
+
+
+# ------------------------------------------- issue #47: no conditionals ----
+
+def test_no_degraded_mode_or_fallback_wording_remains():
+    """Issue #47 acceptance: grep-clean across framework/ — no degraded
+    mode, no pre-#25 fallback, no 'GLV reachable/unreachable'
+    conditional, no manual-resume framing may survive anywhere in the
+    runbook, the tools, the policy, or the state schema."""
+    banned = ["degraded", "pre-#25", "glv unreachable",
+              "glv is reachable", "glv reachable", "manual resume"]
+    files = [
+        TOOLS / "succession.py", TOOLS / "pipeline.py", TOOLS / "README.md",
+        TOOLS / "glv-subagents.md", TOOLS / "tests" / "conftest.py",
+        TOOLS.parent / "MIGRATION_PROMPT.md",
+        TOOLS.parent / "autonomy" / "policy.json",
+        TOOLS.parent / "state" / "migration-state.schema.json",
+    ]
+    for path in files:
+        text = path.read_text(encoding="utf-8").lower()
+        for phrase in banned:
+            assert phrase not in text, f"{phrase!r} still in {path}"
