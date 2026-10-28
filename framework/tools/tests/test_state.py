@@ -310,6 +310,23 @@ def test_init_creates_valid_journaled_state(monkeypatch, capsys, tmp_path):
 
 # -- internal validator vs the jsonschema reference implementation ----------
 
+def test_validator_implements_additional_properties():
+    """additionalProperties (schema-per-value form, used by the preflight
+    block's checks map — issue #31) constrains exactly the keys properties
+    does not cover; false forbids them outright."""
+    schema = {"type": "object",
+              "properties": {"known": {"type": "integer"}},
+              "additionalProperties": {"type": "string"}}
+    assert state_tool.validate_schema({"known": 1, "extra": "ok"}, schema) == []
+    errs = state_tool.validate_schema({"known": 1, "extra": 2}, schema)
+    assert errs and "extra" in errs[0] and "string" in errs[0]
+    closed = {"type": "object", "additionalProperties": False}
+    errs = state_tool.validate_schema({"sneaky": 1}, closed)
+    assert errs and "sneaky" in errs[0]
+    # declared properties stay governed by their own schema, not addl
+    assert state_tool.validate_schema({"known": 1}, schema) == []
+
+
 def test_validator_agrees_with_jsonschema_package():
     pytest = __import__("pytest")
     pytest.importorskip("jsonschema")
@@ -368,7 +385,8 @@ def test_validator_schema_subset_covers_the_schema():
     schema = json.loads((REPO_ROOT / "framework" / "state" /
                          "migration-state.schema.json").read_text())
     supported = {"$schema", "$comment", "title", "type", "required",
-                 "properties", "items", "enum", "minimum", "maximum", "format",
+                 "properties", "additionalProperties", "items", "enum",
+                 "minimum", "maximum", "format",
                  "default"}  # 'default' is informational — ignored, not validated
 
     def walk(node, path):
@@ -386,6 +404,8 @@ def test_validator_schema_subset_covers_the_schema():
                         walk(v2, f"{path}.{k2}")
                 elif key == "items":
                     walk(value, f"{path}[]")
+                elif key == "additionalProperties" and isinstance(value, dict):
+                    walk(value, f"{path}[+]")
         return
 
     walk(schema, "$")

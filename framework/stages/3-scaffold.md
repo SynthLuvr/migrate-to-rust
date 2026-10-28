@@ -14,6 +14,11 @@ is instant and trustworthy.
        cp -a <tmp>/. rust/ && rm -rf rust/.git
        git -C <tmp> rev-parse HEAD   # record the SHA for provenance
 
+   `pipeline.py preflight` (issue #31) already captured the template's HEAD
+   SHA in the state file (`preflight.checks.template.head_sha`) — reuse it
+   for the provenance header so the scaffold cites the same run that proved
+   the template reachable.
+
    The template pre-wires the gate stack Stage 4 depends on: `rustfmt`,
    `clippy` (`-D warnings`; `unwrap_used`/`expect_used`/`unsafe_code`
    denied), the docs gate, `cargo-deny`, `cargo-shear`, `cargo-llvm-cov`

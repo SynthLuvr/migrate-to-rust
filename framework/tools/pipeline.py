@@ -34,6 +34,16 @@ gates policy-resolved, publish disabled · L3 full autopilot incl. cutover.
 
 Subcommands
 -----------
+  preflight      run and record, in one command, everything stages 0/3
+                 silently assumed (issue #31): target suite green + wall
+                 time, pytest collection capture, oracle self-test 5/5,
+                 rust-template reachability + HEAD SHA, toolchain versions,
+                 target venv/interpreter/wheel flavor/derived PYO3_PYTHON,
+                 substitutions freshness, framework-vs-target interpreter
+                 match — journaled as a `preflight` block + a human report;
+                 exit 2 on the hard prerequisites (suite not green,
+                 self-test not 5/5, template unreachable) so a run starts
+                 only when Stage 0's exit criteria are actually checkable
   run            drive stages 0 -> 7 to a terminal state (requires L2+)
   resolve-gates  evaluate open gates against the policy in code and record
                  the decisions through state.py's journaled writer (pure
@@ -48,15 +58,17 @@ This tool writes the state file ONLY through state.py's save_validated (the
 it, the way bench.py composes oracle.py's comparator).
 
 Exit codes follow tools/README.md: 0 clean (any terminal state except
-failed_safely is a *result*, not a failure) · 2 findings (failed_safely, or
-a refusal such as "driver requires L2+") · 1 usage/IO via the shared
-envelope.
+failed_safely is a *result*, not a failure) · 2 findings (failed_safely, a
+refusal such as "driver requires L2+", or a preflight hard prerequisite —
+suite not green / self-test not 5/5 / template unreachable) · 1 usage/IO
+via the shared envelope.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -69,7 +81,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import state as state_tool  # noqa: E402  — the ONLY writer, composed not duplicated
 from _common import (  # noqa: E402
-    EXIT_FINDINGS, EXIT_OK, ToolError, emit, run_cli,
+    EXIT_FINDINGS, EXIT_OK, ToolError, emit, now_iso, python_version_string,
+    run_child, run_cli,
 )
 
 TOOL = "pipeline.py"
@@ -88,6 +101,35 @@ STAGE_GATES = {0: ["go_no_go"], 6: ["cutover"]}
 # evaluation order: descoping (DEP-1) must clear the scope before GO-1 reads it
 GATE_ORDER = {"no_equivalent_dependency": 0, "go_no_go": 1}
 UNDECIDABLE = "undecidable"
+
+# Preflight constants (issue #31): the environment checks stages 0-3 each
+# re-implemented ad hoc. Three are hard prerequisites: without them Stage
+# 0's exit criteria are not even checkable, so preflight fails loudly
+# (exit 2) instead of letting a run start on assumptions.
+TEMPLATE_URL = "https://github.com/SynthLuvr/rust-template"
+HARD_CHECKS = ("suite", "oracle_selftest", "template")
+# --skip accepts the friendly spellings; SKIP_TO_CHECK maps them to check ids
+SKIP_TO_CHECK = {"suite": "suite", "pytest-collect": "pytest_collect",
+                 "selftest": "oracle_selftest", "template": "template",
+                 "toolchain": "toolchain"}
+PYTEST_NODEID_RE = re.compile(r"^\S+\.py::\S+$")
+PYTEST_SUMMARY_RE = re.compile(
+    r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|deselected)")
+PYTEST_SUMMARY_KEYS = {"error": "error", "errors": "error"}  # plural fold
+# cargo/rustc/maturin/uv feed Stage 3 directly; the extras are the template's
+# gate stack (just doctor covers the crate, nothing checks it *before*
+# scaffolding — that is this check's job)
+TOOLCHAIN_VERSION_CMDS = {"cargo": ["cargo", "--version"],
+                          "rustc": ["rustc", "--version"],
+                          "maturin": ["maturin", "--version"],
+                          "uv": ["uv", "--version"]}
+TOOLCHAIN_EXTRA_CMDS = {"cargo-deny": ["cargo", "deny", "--version"],
+                        "cargo-llvm-cov": ["cargo", "llvm-cov", "--version"],
+                        "cargo-shear": ["cargo", "shear", "--version"],
+                        "pandoc": ["pandoc", "--version"]}
+SUBSTITUTIONS_MAX_AGE_DAYS = 30  # the table's own rule: RE-VERIFY before each migration
+SUITE_TIMEOUT = 3600.0           # matches the driver's per-stage agent timeout
+COLLECT_TIMEOUT = 300.0          # matches contract_extract.py's collection timeout
 
 
 # --------------------------------------------------------------- policy ----
@@ -615,6 +657,496 @@ def verify_stage_exit(state: dict, stage: int, *, run_selftest: bool = True) -> 
     return failures
 
 
+# ------------------------------------------------------------- preflight --
+# Each check is a pure-ish function returning one record; cmd_preflight
+# assembles them into the journaled `preflight` block. Hard checks
+# (HARD_CHECKS) failing — or being *unprovable* (no target recorded) —
+# exits 2; an explicit --skip downgrades a hard check to a warning (the
+# operator's choice, never silent).
+
+def _probe(cmd: list[str], *, cwd: str | None = None,
+           timeout: float = 120.0) -> tuple[int, str, str]:
+    """run_child with the not-found/timeout corner normalized to a failed
+    probe (code 127/124) so one code path reports every outcome."""
+    try:
+        return run_child(cmd, cwd=cwd, timeout=timeout)
+    except OSError:
+        return 127, "", f"command not found: {cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout:g}s"
+
+
+def _resolve_target_root(flag_value: str | None, state: dict) -> tuple[Path | None, str]:
+    """--target-root wins; else the root a previous preflight recorded
+    (preflight.target.root) — re-runs need no re-typing. Returns
+    (resolved absolute path or None, note for the report)."""
+    recorded = ((state.get("preflight") or {}).get("target") or {}).get("root")
+    raw = flag_value or recorded
+    if not raw:
+        return None, ("no target root recorded — pass --target-root once; it "
+                      "is journaled into the preflight block for re-runs")
+    root = Path(raw).resolve()
+    if not root.is_dir():
+        return None, f"target root {raw} is not a directory"
+    source = "--target-root" if flag_value else "recorded by a previous preflight"
+    return root, f"{root} (from {source})"
+
+
+def _resolve_target_python(root: Path | None) -> tuple[Path | None, str]:
+    """The target's venv interpreter (`.venv` then `venv`, POSIX and Windows
+    layouts). None means: fall back to this interpreter for the suite /
+    self-test runs, recorded as such — an honest failure with the output
+    tail beats a silent wrong-interpreter run."""
+    if root is None:
+        return None, "no target root recorded"
+    exe = "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    for name in (".venv", "venv"):
+        py = root / name / exe
+        if py.exists():
+            return py, f"target venv {root / name}"
+    return None, f"no .venv/ or venv/ under {root}"
+
+
+_PY_PROBE_SRC = (
+    "import json, sys, sysconfig; print(json.dumps({"
+    "'version': '%d.%d.%d' % sys.version_info[:3],"
+    " 'implementation': sys.implementation.name,"
+    " 'gil_disabled': bool(sysconfig.get_config_var('Py_GIL_DISABLED'))}))"
+)
+
+
+def _probe_python(python: Path | str) -> dict:
+    """Version + implementation + free-threaded flag of one interpreter."""
+    code, out, err = _probe([str(python), "-c", _PY_PROBE_SRC], timeout=60.0)
+    if code != 0:
+        return {"ok": False, "detail": (err.strip() or f"exit {code}")[:300]}
+    try:
+        info = json.loads(out.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return {"ok": False, "detail": "probe output was not the expected JSON"}
+    info["ok"] = True
+    return info
+
+
+def _wheel_flavor(gil_disabled: bool) -> str:
+    """The Stage 3 wheel decision the flavor forces (stages/3-scaffold.md):
+    free-threaded targets need cp3XXt wheels; abi3t arrives with 3.15."""
+    if gil_disabled:
+        return "free-threaded — cp3XXt wheels required (abi3t arrives with 3.15)"
+    return "standard — abi3 or version-specific wheels"
+
+
+def _parse_pytest_summary(text: str) -> dict[str, int]:
+    """Best-effort counts from pytest -q's summary line
+    ('12 passed, 1 skipped in 3.42s'); plural keys fold to singular."""
+    counts: dict[str, int] = {}
+    for m in PYTEST_SUMMARY_RE.finditer(text or ""):
+        key = PYTEST_SUMMARY_KEYS.get(m.group(2), m.group(2))
+        counts[key] = counts.get(key, 0) + int(m.group(1))
+    return counts
+
+
+def _minor_version(version: str) -> tuple[int, int] | None:
+    parts = (version or "").split(".")
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except (ValueError, IndexError):
+        return None
+
+
+def _interpreter_mismatch(framework: str, target: str) -> str | None:
+    """Warning when the framework interpreter is older than the target's:
+    tools that parse target source (port_plan.py, contract_extract.py) and
+    the oracle's reference side must run under the target interpreter — a
+    3.10 framework python SyntaxErrors on 3.12+ syntax (hit for real)."""
+    f, t = _minor_version(framework), _minor_version(target)
+    if f and t and t > f:
+        return (f"framework python {framework} is older than target python "
+                f"{target}: run the source-parsing tools (port_plan.py, "
+                f"contract_extract.py) and the oracle's reference side under "
+                f"the target interpreter, or they SyntaxError on newer syntax")
+    return None
+
+
+def _substitutions_record(subs: dict, today: date) -> dict:
+    """knowledge/substitutions.json freshness — the table's own rule is
+    'RE-VERIFY before each migration'; an unparsable version counts as
+    stale (never silently trusted)."""
+    version = subs.get("version")
+    record = {"version": version, "max_age_days": SUBSTITUTIONS_MAX_AGE_DAYS}
+    try:
+        record["age_days"] = (today - date.fromisoformat(str(version))).days
+    except (TypeError, ValueError):
+        record["age_days"] = None
+    record["stale"] = (record["age_days"] is None
+                       or record["age_days"] > SUBSTITUTIONS_MAX_AGE_DAYS)
+    record["id"] = "substitutions_freshness"
+    record["ok"] = not record["stale"]
+    if record["stale"]:
+        record["detail"] = (
+            f"substitutions.json version {version!r} is "
+            + ("unparsable (expected YYYY-MM-DD)" if record["age_days"] is None
+               else f"{record['age_days']} days old (> {SUBSTITUTIONS_MAX_AGE_DAYS})")
+            + " — RE-VERIFY before Stage 1 maps dependencies (ecosystems move)")
+    else:
+        record["detail"] = (f"substitutions.json verified {version} "
+                            f"({record['age_days']} days old)")
+    return record
+
+
+def _check_template(url: str) -> dict:
+    """rust-template reachable + HEAD SHA — Stage 3's provenance header and
+    dossier, captured here so the scaffold cites the same run (issue #31).
+    `git ls-remote <url> HEAD` needs no clone (a local checkout path works
+    offline, which the tests rely on)."""
+    code, out, err = _probe(["git", "ls-remote", url, "HEAD"], timeout=60.0)
+    sha = next((ln.split()[0] for ln in out.splitlines() if ln.strip()), None)
+    ok = code == 0 and bool(sha) and bool(re.fullmatch(r"[0-9a-f]{7,40}", sha or ""))
+    record = {"id": "template", "hard": True, "ok": ok, "url": url,
+              "head_sha": sha if ok else None}
+    record["detail"] = (f"rust-template reachable, HEAD {sha[:12]}"
+                        if ok else
+                        f"git ls-remote {url} failed (exit {code}): "
+                        f"{((err or out).strip() or 'no output')[:200]}")
+    return record
+
+
+def _check_selftest(python: str) -> dict:
+    """oracle.py self-test re-proven this run, under the interpreter the run
+    will actually judge with — the Stage 2 hard gate is per-run, never
+    inherited from an old session."""
+    code, out, err = _probe([python, str(ORACLE), "self-test"],
+                            timeout=COLLECT_TIMEOUT)
+    caught = injected = None
+    try:
+        payload = json.loads(out)
+        caught, injected = payload.get("caught"), payload.get("injected_bugs")
+    except json.JSONDecodeError:
+        pass
+    ok = code == EXIT_OK and caught is not None and caught == injected
+    record = {"id": "oracle_selftest", "hard": True, "ok": ok,
+              "interpreter": python, "caught": caught, "injected": injected}
+    if ok:
+        record["detail"] = f"oracle.py self-test {caught}/{injected} under {python}"
+    else:
+        record["detail"] = (f"oracle.py self-test not {caught}/{injected} "
+                            f"(exit {code}) — the Stage 2 judge-first gate "
+                            f"cannot be proven this run: "
+                            f"{((err or out).strip() or 'no output')[:200]}")
+    return record
+
+
+def _check_pytest_collect(python: str, root: Path, capture_path: Path) -> dict:
+    """`pytest --collect-only -q` capture for contract_extract
+    (--pytest-collect); written next to the state file so Stage 2 replays
+    the same collection instead of re-running it."""
+    code, out, err = _probe([python, "-m", "pytest", "--collect-only", "-q"],
+                            cwd=str(root), timeout=COLLECT_TIMEOUT)
+    nodeids = [ln.strip() for ln in out.splitlines()
+               if PYTEST_NODEID_RE.match(ln.strip())]
+    capture_path.write_text(out, encoding="utf-8")
+    counts = _parse_pytest_summary(out[-500:])
+    record = {"id": "pytest_collect", "ok": code in (0, 5) and bool(nodeids),
+              "exit_code": code, "collected": len(nodeids),
+              "errors": counts.get("error", 0), "capture": str(capture_path)}
+    if code not in (0, 5):
+        record["detail"] = (f"pytest --collect-only exited {code}: "
+                            f"{((err or out).strip() or 'no output')[:200]} "
+                            f"— contract_extract cannot extract contracts")
+    elif not nodeids:
+        record["detail"] = ("collection found no tests — the suite is not "
+                            "substantive enough to act as the spec (hard rule 2)")
+    else:
+        record["detail"] = (f"{len(nodeids)} tests collected; capture written to "
+                            f"{capture_path} (contract_extract --pytest-collect)")
+    return record
+
+
+def _check_suite(python: str, root: Path) -> dict:
+    """The target suite green + wall time — the spec baseline Stage 2
+    records and every later parity claim is measured against."""
+    started = time.monotonic()
+    code, out, err = _probe([python, "-m", "pytest", "-q"], cwd=str(root),
+                            timeout=SUITE_TIMEOUT)
+    wall = round(time.monotonic() - started, 3)
+    counts = _parse_pytest_summary((out or "")[-500:] + "\n" + (err or "")[-500:])
+    green = code == 0 and counts.get("passed", 0) > 0
+    record = {"id": "suite", "hard": True, "ok": green, "exit_code": code,
+              "counts": counts, "wall_seconds": wall,
+              "tail": ((out or "") + (err or ""))[-600:].strip()}
+    if green:
+        record["detail"] = (f"target suite green: {counts.get('passed', 0)} "
+                            f"passed in {wall:g}s (the Stage 2 baseline)")
+    elif code == 5:
+        record["detail"] = ("pytest collected no tests (exit 5) — the suite "
+                            "is not substantive enough to act as the spec")
+    else:
+        record["detail"] = (f"target suite NOT green (exit {code}, "
+                            f"{counts.get('failed', 0)} failed, "
+                            f"{counts.get('error', 0)} errors) — the spec "
+                            f"itself is broken; fix it before any migration "
+                            f"work (the full test suite is the spec, hard rule 2)")
+    return record
+
+
+def _check_toolchain() -> dict:
+    """cargo/rustc/maturin/uv versions + the template gate stack
+    (cargo-deny/llvm-cov/shear, pandoc): `just doctor` covers the *crate*,
+    nothing checked it before scaffolding — this does (soft: missing pieces
+    block Stage 3, which is exactly when they are first needed)."""
+    versions, missing = {}, []
+    for name, cmd in {**TOOLCHAIN_VERSION_CMDS, **TOOLCHAIN_EXTRA_CMDS}.items():
+        code, out, err = _probe(cmd, timeout=60.0)
+        first = next((ln for ln in (out or err).splitlines() if ln.strip()), "")
+        if code == 0 and first:
+            versions[name] = first.strip()
+        else:
+            versions[name] = None
+            missing.append(name)
+    core_missing = [n for n in TOOLCHAIN_VERSION_CMDS if n in missing]
+    record = {"id": "toolchain", "ok": True, "versions": versions,
+              "missing": missing, "core_missing": core_missing}
+    present = "; ".join(f"{k}: {versions[k]}" for k in versions if versions[k])
+    record["detail"] = (
+        (present or "no toolchain found")
+        + (f" — MISSING: {', '.join(missing)} (Stage 3 gates need them)"
+           if missing else " — full toolchain present"))
+    return record
+
+
+def _check_target_interpreter(root: Path | None, venv_python: Path | None,
+                              venv_note: str) -> tuple[dict, str | None]:
+    """Target venv + interpreter version + Py_GIL_DISABLED (wheel flavor) +
+    the derived PYO3_PYTHON the justfile pins for dev builds."""
+    if venv_python is None:
+        record = {"id": "target_interpreter", "ok": False,
+                  "root": str(root) if root else None,
+                  "detail": f"not resolved: {venv_note} — PYO3_PYTHON and the "
+                            f"wheel flavor are unknown; Stage 3/4 dev builds "
+                            f"cannot be pinned"}
+        return record, f"target interpreter unresolved: {venv_note}"
+    info = _probe_python(venv_python)
+    if not info.get("ok"):
+        info.update({"id": "target_interpreter", "ok": False,
+                     "python": str(venv_python),
+                     "detail": f"probe failed: {info.get('detail')}"})
+        return info, None
+    flavor = _wheel_flavor(bool(info.get("gil_disabled")))
+    record = {"id": "target_interpreter", "ok": True, "root": str(root),
+              "python": str(venv_python), "version": info["version"],
+              "implementation": info.get("implementation"),
+              "gil_disabled": bool(info.get("gil_disabled")),
+              "wheel_flavor": flavor, "pyo3_python": str(venv_python),
+              "detail": f"{info['version']} at {venv_python} — {flavor}; "
+                        f"PYO3_PYTHON={venv_python}"}
+    return record, None
+
+
+def build_preflight_report(project: str, block: dict) -> str:
+    """Human report for <state>.preflight.md — the one artifact an operator
+    reads before starting the run."""
+    checks = block.get("checks") or {}
+    lines = [
+        f"# Preflight — {project} ({block.get('timestamp')})",
+        "",
+        f"- result: **{'ok' if block.get('ok') else 'FAILED — hard prerequisite(s) unproven'}**",
+        f"- policy: v{block.get('policy_version', '?')}",
+        f"- framework interpreter: {block.get('framework_python', '?')}",
+    ]
+    target = checks.get("target_interpreter") or {}
+    if target.get("python"):
+        lines.append(f"- target interpreter: {target.get('version')} at "
+                     f"{target.get('python')} — {target.get('wheel_flavor')}; "
+                     f"PYO3_PYTHON={target.get('pyo3_python')}")
+    else:
+        lines.append(f"- target interpreter: unresolved ({target.get('detail')})")
+    lines += ["", "| check | status | detail |", "|---|---|---|"]
+    for cid in ("template", "oracle_selftest", "pytest_collect", "suite",
+                "toolchain", "target_interpreter", "substitutions_freshness",
+                "interpreter_match"):
+        rec = checks.get(cid)
+        if not rec:
+            continue
+        status = ("skipped" if rec.get("skipped")
+                  else ("ok" if rec.get("ok") else "FAILED")
+                  + (" · hard" if rec.get("hard") else ""))
+        lines.append(f"| {cid} | {status} | {rec.get('detail', '')} |")
+    if block.get("warnings"):
+        lines += ["", "## Warnings", ""]
+        lines += [f"- {w}" for w in block["warnings"]]
+    if block.get("hard_failures"):
+        lines += ["", "## Hard failures (a run must not start)", ""]
+        lines += [f"- **{cid}**: {(checks.get(cid) or {}).get('detail', '')}"
+                  for cid in block["hard_failures"]]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def preflight_report_path_for(state_path: Path) -> Path:
+    """<state>.json -> <state>.preflight.md (same directory, like the run
+    report)."""
+    return state_path.parent / (state_path.stem + ".preflight.md")
+
+
+def collect_capture_path_for(state_path: Path) -> Path:
+    """<state>.json -> <state>.pytest-collect.txt — the capture file
+    contract_extract.py --pytest-collect replays."""
+    return state_path.parent / (state_path.stem + ".pytest-collect.txt")
+
+
+def _skipped_record(cid: str, hard: bool) -> dict:
+    return {"id": cid, "hard": hard, "ok": None, "skipped": True,
+            "detail": f"skipped via --skip {cid.replace('_', '-')}: "
+                      + ("hard prerequisite NOT proven (operator choice)"
+                         if hard else "not checked")}
+
+
+def _unprovable_record(cid: str, hard: bool, why: str) -> dict:
+    """A check that could not run at all (e.g. no target root). For a hard
+    check that is a failure, never a pass — 'unproven' is not 'green'; a
+    soft check just records why it did not run."""
+    return {"id": cid, "hard": hard, "ok": False,
+            "detail": f"not run: {why}"}
+
+
+def cmd_preflight(args) -> int:
+    policy = load_policy(args.policy)
+    path = Path(args.state)
+    state = _load_state(path)
+    subs = load_substitutions(args.substitutions)
+    today = date.today()
+    skipped = {SKIP_TO_CHECK[s] for s in (args.skip or [])}
+    checks: dict[str, dict] = {}
+    warnings: list[str] = []
+
+    # target root + interpreter (everything below depends on these)
+    root, root_note = _resolve_target_root(args.target_root, state)
+    if root is None:
+        warnings.append(f"target root unresolved — {root_note}")
+    venv_python, venv_note = _resolve_target_python(root)
+    python = str(venv_python) if venv_python else sys.executable
+    if root is not None and venv_python is None:
+        warnings.append(f"{venv_note} — suite/self-test fall back to "
+                        f"{sys.executable}; if the suite needs the venv's "
+                        f"dependencies this fails loudly with the output tail")
+    checks["target_interpreter"], warn = _check_target_interpreter(
+        root, venv_python, venv_note)
+    if warn:
+        warnings.append(warn)
+
+    # template reachability + provenance SHA (Stage 3)
+    checks["template"] = (_skipped_record("template", True)
+                          if "template" in skipped
+                          else _check_template(args.template_url))
+
+    # oracle self-test, re-proven per run under the judging interpreter
+    checks["oracle_selftest"] = (
+        _skipped_record("oracle_selftest", True) if "oracle_selftest" in skipped
+        else _check_selftest(python))
+
+    # pytest collection capture (Stage 2 / contract_extract)
+    if "pytest_collect" in skipped:
+        checks["pytest_collect"] = _skipped_record("pytest_collect", False)
+    elif root is None:
+        checks["pytest_collect"] = _unprovable_record(
+            "pytest_collect", False, f"target root unresolved — {root_note}")
+    else:
+        checks["pytest_collect"] = _check_pytest_collect(
+            python, root, collect_capture_path_for(path))
+
+    # the spec itself: target suite green + wall time (Stage 2 baseline)
+    if "suite" in skipped:
+        checks["suite"] = _skipped_record("suite", True)
+    elif root is None:
+        checks["suite"] = _unprovable_record(
+            "suite", True, f"target root unresolved — {root_note}")
+    else:
+        checks["suite"] = _check_suite(python, root)
+
+    # toolchain (soft) + substitutions freshness + interpreter match
+    checks["toolchain"] = (_skipped_record("toolchain", False)
+                           if "toolchain" in skipped else _check_toolchain())
+    if checks["toolchain"].get("missing"):
+        warnings.append("toolchain missing: "
+                        + ", ".join(checks["toolchain"]["missing"])
+                        + " — Stage 3 gates (just check / deny / llvm-cov / "
+                          "shear / the pandoc Markdown gate) need them")
+    checks["substitutions_freshness"] = _substitutions_record(subs, today)
+    if not checks["substitutions_freshness"]["ok"]:
+        warnings.append(checks["substitutions_freshness"]["detail"])
+
+    framework_python = python_version_string()
+    target_version = checks["target_interpreter"].get("version")
+    mismatch = (_interpreter_mismatch(framework_python, target_version)
+                if target_version else None)
+    checks["interpreter_match"] = {
+        "id": "interpreter_match",
+        "ok": mismatch is None,
+        "framework_python": framework_python,
+        "target_python": target_version,
+        "parse_tools_must_use_target": mismatch is not None,
+        "detail": mismatch or (f"framework {framework_python} >= target "
+                               f"{target_version or 'n/a'} — the framework "
+                               f"interpreter may parse the target source"),
+    }
+    if mismatch:
+        warnings.append(mismatch)
+
+    # hard prerequisites: failed OR unproven -> exit 2; skipped -> warning
+    hard_failures = [cid for cid in HARD_CHECKS
+                     if not checks[cid].get("skipped")
+                     and checks[cid].get("ok") is not True]
+    for cid in HARD_CHECKS:
+        if checks[cid].get("skipped"):
+            warnings.append(f"hard prerequisite '{cid}' skipped by --skip — "
+                            f"NOT proven this run")
+
+    # target: the machine-facing summary Stage 3/4 pin from (the venv
+    # interpreter IS the derived PYO3_PYTHON); root recorded for re-runs
+    ti = checks["target_interpreter"]
+    target_summary = {"root": ti.get("root")}
+    for key in ("python", "version", "gil_disabled", "wheel_flavor",
+                "pyo3_python"):
+        target_summary[key] = ti.get(key)
+
+    block = {
+        "timestamp": now_iso(),
+        "ok": not hard_failures,
+        "policy_version": policy.get("version"),
+        "hard_failures": hard_failures,
+        "warnings": warnings,
+        "framework_python": framework_python,
+        "target": target_summary,
+        "checks": checks,
+        "report_path": str(preflight_report_path_for(path)),
+    }
+    old = state.get("preflight")
+    state["preflight"] = block
+    try:
+        state_tool.save_validated(state, path, actor=TOOL,
+                                  changes=[(None, "preflight", old, block)])
+    except ValueError as e:
+        return _emit_refusal(f"preflight block rejected — resulting state "
+                             f"would be invalid: {e}", args.human,
+                             file=str(path), rolled_back=True)
+    report = build_preflight_report(
+        state.get("project", {}).get("name", "?"), block)
+    rp = preflight_report_path_for(path)
+    rp.write_text(report, encoding="utf-8")
+
+    code = EXIT_FINDINGS if hard_failures else EXIT_OK
+    human = (f"preflight {'OK' if not hard_failures else 'FAILED'}: "
+             f"{len(checks)} check(s), {len(hard_failures)} hard failure(s), "
+             f"{len(warnings)} warning(s) -> {path} + {rp}")
+    emit({"tool": TOOL, "version": VERSION, "file": str(path),
+          "ok": not hard_failures, "hard_failures": hard_failures,
+          "warnings": warnings, "checks": checks,
+          "report_path": str(rp),
+          "summary": {"exit_code": code, "human": human}},
+         human_flag=args.human)
+    return code
+
+
 # ----------------------------------------------------------------- report --
 
 def _tokens_spent(state: dict) -> int:
@@ -1021,6 +1553,29 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog=TOOL, description=__doc__.splitlines()[0])
     ap.add_argument("--human", action="store_true", help="echo human summary to stderr")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("preflight",
+                       help="run + record everything stages 0/3 assumed "
+                            "(issue #31): suite green, template SHA, "
+                            "toolchains, target interpreter, oracle self-test")
+    p.add_argument("state")
+    p.add_argument("--target-root",
+                   help="the repo being migrated (absolute or relative); "
+                        "recorded into the preflight block, so later re-runs "
+                        "omit the flag")
+    p.add_argument("--template-url", default=TEMPLATE_URL,
+                   help="rust-template provenance source (a local checkout "
+                        "path works offline; default: the GitHub URL from "
+                        "stages/3-scaffold.md)")
+    p.add_argument("--policy", help="override autonomy/policy.json")
+    p.add_argument("--substitutions",
+                   help="override knowledge/substitutions.json")
+    p.add_argument("--skip", action="append", default=[],
+                   choices=sorted(SKIP_TO_CHECK),
+                   help="skip a check (repeatable); skipping a hard "
+                        "prerequisite downgrades it to an explicit warning — "
+                        "the offline corner, never silent")
+    p.set_defaults(func=cmd_preflight)
 
     p = sub.add_parser("run", help="drive stages 0->7 to a terminal state (L2+)")
     p.add_argument("state")
