@@ -4,7 +4,11 @@ Purpose: turn the signed scope into a dependency-ordered, portability-scored
 unit backlog.
 
 ## Steps
-1. Parse scoped modules with `tree-sitter-python`; build import/call graph.
+1. Parse scoped modules with `port_plan.py plan` (stdlib `ast` — no
+   tree-sitter grammar needed); build import/dep graph. Files the tool's
+   interpreter cannot parse (e.g. newer-than-tool syntax) get a
+   regex-fallback scan and a tooling note, not a phantom `parse-error`
+   risk flag.
 2. Segment into units — module > class > function — each **independently
    verifiable** (its contract tests run in isolation).
 3. Order **leaf-first** (no forward deps). AlphaTrans: naive repo-level

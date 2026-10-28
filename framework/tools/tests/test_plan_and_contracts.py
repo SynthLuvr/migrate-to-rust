@@ -77,6 +77,122 @@ def test_plan_risk_flags_attached(monkeypatch, capsys, tmp_path):
     assert "threads" not in by_id["u-pkg-leaf"]["risk_flags"]
 
 
+# ------------------------------------- issue #28: subcommands must compose --
+
+def _quiet_project(tmp_path):
+    """Cycle-free two-module project (leaf + importer)."""
+    proj = tmp_path / "qproj"
+    (proj / "src" / "pkg").mkdir(parents=True)
+    (proj / "src" / "pkg" / "leaf.py").write_text("def g(x):\n    return x + 1\n")
+    (proj / "src" / "pkg" / "hot.py").write_text(
+        "from pkg.leaf import g\n\n\ndef f(n):\n    return g(n) * 2\n")
+    return proj
+
+
+def test_plan_accepts_from_cprofile_envelope(monkeypatch, capsys, tmp_path):
+    """`plan --hotspots` must take `from-cprofile`'s output as-is: the
+    standard tool envelope ({"tool", "version", "profile", "hotspots": [...]})
+    unwraps to the same plan as the bare canonical list (issue #28)."""
+    proj = _quiet_project(tmp_path)
+    bare = [{"path": "src/pkg/hot.py", "self_cpu_s": 5.0, "calls": 7},
+            {"path": "src/pkg/leaf.py", "self_cpu_s": 1.0, "calls": 3}]
+    bare_file = tmp_path / "bare.json"
+    bare_file.write_text(json.dumps(bare))
+    envelope = tmp_path / "envelope.json"
+    envelope.write_text(json.dumps({
+        "tool": "port_plan.py", "version": 1,
+        "profile": str(tmp_path / "run.prof"),
+        "hotspots": bare,
+        "summary": {"exit_code": 0, "human": "cProfile dump -> 2 file hotspots"},
+    }))
+    code_a, out_a = run_tool(monkeypatch, capsys, "port_plan.py", [
+        "plan", "--hotspots", str(envelope), "--project-root", str(proj)])
+    code_b, out_b = run_tool(monkeypatch, capsys, "port_plan.py", [
+        "plan", "--hotspots", str(bare_file), "--project-root", str(proj)])
+    assert code_a == code_b == 0
+    assert out_a["units"] == out_b["units"]
+
+
+def test_plan_rejects_bad_hotspot_shapes(monkeypatch, capsys, tmp_path):
+    proj = _quiet_project(tmp_path)
+    for bad in ('{"tool": "port_plan.py", "version": 1, "hotspots": []}',
+                '{"tool": "port_plan.py", "version": 1}',
+                '{"hotspots": {"path": "src/pkg/leaf.py"}}',
+                '[]'):
+        f = tmp_path / "bad.json"
+        f.write_text(bad)
+        code, out = run_tool(monkeypatch, capsys, "port_plan.py", [
+            "plan", "--hotspots", str(f), "--project-root", str(proj)])
+        assert code == 1 and out["error"]["kind"] == "usage", bad
+        assert "hotspots JSON" in out["error"]["detail"]
+
+
+def test_plan_skips_profiler_noise_paths(monkeypatch, capsys, tmp_path):
+    """Non-existent hotspot paths (console-script launchers recorded as "~",
+    stale entries) are measurement noise, not port units: skip with one
+    warning instead of refusing the whole plan (issue #28)."""
+    proj = _quiet_project(tmp_path)
+    hotspots = tmp_path / "noisy.json"
+    hotspots.write_text(json.dumps([
+        {"path": "~", "self_cpu_s": 9.9, "calls": 999},
+        {"path": "src/pkg/hot.py", "self_cpu_s": 5.0, "calls": 7},
+        {"path": "stale/gone.py", "self_cpu_s": 4.0, "calls": 2},
+        {"path": "src/pkg/leaf.py", "self_cpu_s": 1.0, "calls": 3},
+    ]))
+    code, out = run_tool(monkeypatch, capsys, "port_plan.py", [
+        "plan", "--hotspots", str(hotspots), "--project-root", str(proj)])
+    assert code == 0, "noise must not fail the plan"
+    assert sorted(u["id"] for u in out["units"]) == ["u-pkg-hot", "u-pkg-leaf"]
+    skip_warnings = [w for w in out["warnings"] if "skipped 2 hotspot path(s)" in w]
+    assert len(skip_warnings) == 1, "one summarized warning, not one per path"
+    assert "~" in skip_warnings[0] and "stale/gone.py" in skip_warnings[0]
+    assert "skipped 2 unresolvable hotspot path(s)" in out["summary"]["human"]
+
+
+def test_plan_refuses_when_nothing_resolves(monkeypatch, capsys, tmp_path):
+    proj = _quiet_project(tmp_path)
+    hotspots = tmp_path / "allnoise.json"
+    hotspots.write_text(json.dumps([{"path": "~", "self_cpu_s": 9.9},
+                                    {"path": "nope.py", "self_cpu_s": 1.0}]))
+    code, out = run_tool(monkeypatch, capsys, "port_plan.py", [
+        "plan", "--hotspots", str(hotspots), "--project-root", str(proj)])
+    assert code == 1 and out["error"]["kind"] == "usage"
+    assert "no hotspot path resolved" in out["error"]["detail"]
+    assert "~" in out["error"]["detail"] and "nope.py" in out["error"]["detail"]
+
+
+def test_parse_error_is_tooling_note_not_risk_flag(monkeypatch, capsys, tmp_path):
+    """A file the *tool's* interpreter can't parse (e.g. newer-than-tool
+    syntax) still ran under the target interpreter — the profile proves it —
+    so the old `parse-error` risk flag was a phantom portability penalty.
+    It must become an unscored note plus a regex-fallback scan that still
+    recovers import edges (issue #28)."""
+    proj = tmp_path / "pproj"
+    (proj / "src" / "pkg").mkdir(parents=True)
+    (proj / "src" / "pkg" / "leaf.py").write_text("def g(x):\n    return x + 1\n")
+    # syntax invalid under every Python — the suppression must not depend
+    # on which interpreter runs the tool
+    (proj / "src" / "pkg" / "newer.py").write_text(
+        "from pkg.leaf import g\n\n\ndef broken(:\n    return g(1)\n")
+    hotspots = tmp_path / "h.json"
+    hotspots.write_text(json.dumps([
+        {"path": "src/pkg/newer.py", "self_cpu_s": 5.0, "calls": 7},
+        {"path": "src/pkg/leaf.py", "self_cpu_s": 1.0, "calls": 3},
+    ]))
+    code, out = run_tool(monkeypatch, capsys, "port_plan.py", [
+        "plan", "--hotspots", str(hotspots), "--project-root", str(proj)])
+    assert code == 0
+    by_id = {u["id"]: u for u in out["units"]}
+    newer = by_id["u-pkg-newer"]
+    assert "parse-error" not in newer["risk_flags"]
+    assert newer["risk_flags"] == []
+    assert newer["portability_score"] == 100  # no phantom -10 penalty
+    assert "not counted as a portability risk" in newer["parse_note"]
+    assert newer["deps"] == ["u-pkg-leaf"]  # regex fallback keeps dep edges
+    assert any("regex-fallback" in w and "u-pkg-newer" in w for w in out["warnings"])
+    assert "1 regex-fallback scan(s)" in out["summary"]["human"]
+
+
 # ------------------------------------------------------ contract_extract ---
 
 def _cproj(tmp_path):

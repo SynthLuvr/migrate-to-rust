@@ -108,14 +108,18 @@ def test_issue20_subprocess_port_plan(tmp_path):
 # ------------------------- one representative refusal per tool (8/8)
 
 def test_port_plan_hotspot_path_not_found(monkeypatch, capsys, tmp_path):
+    """Issue #28: an unresolvable hotspot path is no longer fatal (skip with
+    a warning); the envelope contract now bites when NOTHING resolves —
+    still a uniform JSON envelope, kind=usage."""
     hotspots = tmp_path / "hotspots.json"
     hotspots.write_text(json.dumps(
         [{"path": "src/ghost.py", "self_cpu_s": 1.0, "calls": 1}]))
     code, out = run_tool(monkeypatch, capsys, "port_plan.py",
                          ["plan", "--hotspots", str(hotspots),
                           "--project-root", str(tmp_path)])
-    detail = _assert_envelope(code, out, kind="io")
-    assert detail == "hotspot path not found: src/ghost.py"
+    detail = _assert_envelope(code, out, kind="usage")
+    assert "no hotspot path resolved" in detail
+    assert "src/ghost.py" in detail
 
 
 def test_port_plan_hotspots_not_a_list(monkeypatch, capsys, tmp_path):
