@@ -73,6 +73,46 @@ def test_bench_divergent_outputs_abort_without_timing(monkeypatch, capsys, tmp_p
     assert "ABORTED" in out["summary"]["human"]
 
 
+def test_bench_degenerate_corpus_aborts_without_timing(monkeypatch, capsys, tmp_path):
+    # issue #30: the reference side rejects every row and the candidate
+    # errors identically — per-run error==error pairs are not ground truth
+    # to hang a timing claim on
+    manifest = _bench_scaffold(tmp_path)
+    for name in ("py_impl.py", "rs_impl.py"):
+        (tmp_path / "bench" / "impl" / name).write_text(
+            "def run(v):\n    raise TypeError('corpus is not what the reference expects')\n")
+    code, out = run_tool(monkeypatch, capsys, "bench.py",
+                         ["run", "--manifest", str(manifest)])
+    assert code == 2
+    assert out["parity"]["verdict"] == "incomparable"
+    assert out["parity"]["counts"]["equivalent"] == 20  # per-run error==error
+    assert out["ground_truth"]["degenerate"] is True
+    assert "speedup" not in out, "no number without ground truth"
+    assert "no ground truth" in out["summary"]["human"]
+    assert "ABORTED" in out["summary"]["human"]
+
+
+def test_bench_thin_ground_truth_warns_but_times(monkeypatch, capsys, tmp_path):
+    # reference ok on only 5 of 20 rows (25% < 50%): parity still
+    # equivalent per run, timings proceed, but the warning surfaces
+    manifest = _bench_scaffold(tmp_path)
+    src = ("def run(v):\n"
+           "    if v['nums'][3] % 4:\n"
+           "        raise ValueError('three quarters rejected')\n"
+           "    return {'total': sum(v['nums'])}\n")
+    (tmp_path / "bench" / "impl" / "py_impl.py").write_text(src)
+    (tmp_path / "bench" / "impl" / "rs_impl.py").write_text(src)
+    code, out = run_tool(monkeypatch, capsys, "bench.py",
+                         ["run", "--manifest", str(manifest)])
+    assert code == 0
+    assert out["parity"]["verdict"] == "equivalent"
+    assert out["ground_truth"]["reference_ok"] == 5
+    assert out["ground_truth"]["reference_ok_fraction"] == 0.25
+    assert any("thin ground truth" in w for w in out["warnings"])
+    assert "WARNING" in out["summary"]["human"]
+    assert "speedup" in out
+
+
 # ------------------------------------------------------------ pyo3_review --
 
 BAD_RS = """use pyo3::prelude::*;

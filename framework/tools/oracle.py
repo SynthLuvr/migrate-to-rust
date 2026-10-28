@@ -24,8 +24,10 @@ that is *internal stdin framing* the oracle adds itself (below). A
 pre-wrapped line reaches the entry double-wrapped, both sides raise the
 same TypeError on every run, and the judge reports a hollow all-EQUIVALENT
 verdict — so ``_load_corpus`` refuses a corpus in which every line carries
-exactly the framing keys, and ``corpus --validate`` dry-runs an entry
-per-row before judging.
+exactly the framing keys, ``corpus --validate`` dry-runs an entry
+per-row before judging, and the judge's ground-truth guard (below)
+classifies an all-error reference corpus INCOMPARABLE so no hollow
+verdict can survive to the summary (issues #29, #30).
 
 **Child-process protocol (what the oracle writes)** — one child process
 per side; the oracle frames each corpus value on the child's stdin as::
@@ -53,6 +55,21 @@ Verdicts
                  errored/unserializable/missing, or a side failed to run).
                  Never a synonym for "close enough".
 
+Ground-truth guard (issue #30)
+------------------------------
+The summary verdict additionally checks that the reference side produced
+ground truth at all. A corpus on which the reference has zero ``ok:true``
+runs is degenerate: every per-run pair is error-vs-error, which
+``compare_error`` rightly calls equivalent *per run*, but a run set with no
+successful reference output carries no parity evidence (the
+oracle-equivalent of a test suite where every test raises before
+asserting). Such a corpus judges **INCOMPARABLE**, never EQUIVALENT — and
+per-run error-path mismatches on it are corpus artifacts, not candidate
+defects, so they do not make the summary divergent either. The
+``normalization.min_reference_ok_fraction`` rule (default 0.5) additionally
+warns when fewer reference runs succeeded; 0 disables that warning — the
+zero-ok INCOMPARABLE guard itself cannot be turned off.
+
 Subcommands
 -----------
   judge       run both entries over a corpus manifest and classify every run
@@ -61,7 +78,9 @@ Subcommands
               unserializable reference status before judging — surfaces
               corpus-format mistakes (e.g. pre-wrapped lines) in seconds
   self-test   Stage 2 judge-first validation: inject the 5 canonical bug
-              classes and prove 5/5 are caught — the hard gate
+              classes and prove 5/5 are caught, benign differences stay
+              equivalent, and an all-error reference corpus classifies
+              INCOMPARABLE — the hard gate
   rules       print the normalization rules (machine-readable documentation)
 
 judge manifest shape (relative paths resolve against the manifest's
@@ -74,7 +93,8 @@ directory)::
      "normalization": {...}}          # optional rule overrides
 
 Exit codes: 0 all equivalent · 2 any divergent · 3 incomparable (no
-divergence) · 1 usage/IO · 4 side failed to run at all. ``corpus`` reuses
+divergence, or a degenerate all-error reference corpus — issue #30) ·
+1 usage/IO · 4 side failed to run at all. ``corpus`` reuses
 them as: 0 every row ok · 2 some row error/unserializable/missing · 4 the
 entry failed to run at all.
 """
@@ -127,6 +147,8 @@ DEFAULT_RULES: dict = {
     "error_compare": "type-and-message",
     # regex patterns; matching substrings are blanked from error messages
     "error_message_ignore_patterns": [],
+    # ground-truth guard (issue #30) — see RULE_DOCS and the module docstring
+    "min_reference_ok_fraction": 0.5,
 }
 
 RULE_DOCS = {
@@ -140,6 +162,12 @@ RULE_DOCS = {
     "strip_fields": "object keys removed from both outputs before comparing",
     "error_compare": "how raised exceptions compare: type-and-message | type-only",
     "error_message_ignore_patterns": "regexes blanked from exception messages (addresses, tmp paths)",
+    "min_reference_ok_fraction": (
+        "minimum fraction of corpus rows the reference must complete (ok) — "
+        "below it the judge warns (thin ground truth); at zero ok reference "
+        "runs the summary verdict is INCOMPARABLE, never EQUIVALENT "
+        "(issue #30: an all-error reference corpus carries no parity evidence)"
+    ),
 }
 
 
@@ -151,6 +179,12 @@ def merge_rules(manifest: dict) -> dict:
     rules["error_message_ignore_patterns"] = [
         re.compile(p) for p in rules["error_message_ignore_patterns"]
     ]
+    frac = rules["min_reference_ok_fraction"]
+    if (isinstance(frac, bool) or not isinstance(frac, (int, float))
+            or not 0.0 <= frac <= 1.0):
+        raise ValueError(
+            f"min_reference_ok_fraction must be a number in [0, 1], got {frac!r}"
+        )
     return rules
 
 
@@ -349,6 +383,98 @@ def classify_pair(run_id, ref_rec: dict | None, cand_rec: dict | None, rules: di
     return out
 
 
+def classify_runs(ref_recs: list, cand_recs: list, rules: dict) -> list[dict]:
+    """classify_pair over index-aligned record lists, one verdict per run
+    (a record missing on either side judges incomparable)."""
+    def rec(records: list, i: int):
+        return records[i] if i < len(records) else None
+    return [classify_pair(i, rec(ref_recs, i), rec(cand_recs, i), rules)
+            for i in range(max(len(ref_recs), len(cand_recs)))]
+
+
+def count_verdicts(runs: list[dict]) -> dict:
+    """Tally per-run verdicts; fixed key order keeps the JSON output stable."""
+    counts = {"equivalent": 0, "divergent": 0, "incomparable": 0}
+    for run in runs:
+        counts[run["verdict"]] += 1
+    return counts
+
+
+# ------------------------------------------------------- ground truth -----
+# issue #30: a corpus whose reference side never succeeds must not judge
+# EQUIVALENT — the repair loop would select candidates on noise.
+
+def _first_setup_error(recs: list) -> str | None:
+    return next((r["setup_error"] for r in recs if r and r.get("setup_error")), None)
+
+
+def reference_ground_truth(ref_recs: list, total: int, rules: dict) -> dict:
+    """How much of a corpus the reference side actually ran to completion.
+
+    ``ref_recs`` are the reference runner records (judge/compare shapes
+    both work: per-run dicts, possibly None, or a single setup_error
+    record); ``total`` is the number of runs being judged. Returns the
+    ``ground_truth`` block emitted with every summary verdict:
+    ``degenerate`` (zero ok reference runs — no parity evidence at all),
+    a human ``detail`` for the degenerate case, and a ``warning`` when the
+    ok fraction falls below ``min_reference_ok_fraction`` (thin ground
+    truth)."""
+    ref_ok = sum(1 for r in ref_recs if r is not None and r.get("ok") is True)
+    fraction = (ref_ok / total) if total else None
+    min_frac = rules["min_reference_ok_fraction"]
+    setup_error = _first_setup_error(ref_recs)
+    gt = {
+        "reference_ok": ref_ok,
+        "runs": total,
+        "reference_ok_fraction": round(fraction, 6) if fraction is not None else None,
+        "min_reference_ok_fraction": min_frac,
+        "degenerate": bool(total > 0 and ref_ok == 0),
+        "detail": None,
+        "warning": None,
+    }
+    if gt["degenerate"]:
+        if setup_error:
+            gt["detail"] = (f"reference side failed to run — no ground "
+                            f"truth on any row ({setup_error})")
+        else:
+            gt["detail"] = ("reference errored on every corpus row — "
+                            "corpus is degenerate for this entry")
+    elif fraction is not None and fraction < min_frac:
+        gt["warning"] = (
+            f"reference ok on only {ref_ok}/{total} runs "
+            f"({fraction:.1%} < min_reference_ok_fraction {min_frac}) — "
+            "verdict rests on thin ground truth"
+        )
+    return gt
+
+
+def summary_verdict(counts: dict, ground_truth: dict) -> str:
+    """Per-run counts + the ground-truth guard -> the summary verdict.
+
+    A degenerate corpus (reference ok on zero rows) is INCOMPARABLE —
+    never EQUIVALENT, and never DIVERGENT either: error-path mismatches
+    between two all-erroring sides are corpus artifacts, not candidate
+    defects (the per-run verdicts and diffs stay in the payload for the
+    operator to read)."""
+    if ground_truth["degenerate"]:
+        return "incomparable"
+    if counts["divergent"]:
+        return "divergent"
+    if counts["incomparable"]:
+        return "incomparable"
+    return "equivalent"
+
+
+def _degenerate_note(counts: dict) -> str:
+    """What per-run verdicts on a degenerate corpus are worth: matches
+    carry no parity evidence, mismatches blame the corpus, not the
+    candidate."""
+    if counts["equivalent"]:
+        return "error==error matches are not parity evidence"
+    return ("error-path mismatches on a degenerate corpus are corpus "
+            "artifacts, not candidate defects")
+
+
 # --------------------------------------------------------------- runner ----
 
 RUNNER_SRC = r"""
@@ -533,8 +659,7 @@ def cmd_corpus(args) -> int:
                                      corpus_path.parent, args.timeout)
     corpus_digest = sha256_bytes(corpus_path.read_bytes())
 
-    setup_error = next((r["setup_error"] for r in recs
-                        if r and r.get("setup_error")), None)
+    setup_error = _first_setup_error(recs)
     if setup_error is not None:
         human = f"corpus dry-run: entry failed to run: {setup_error}"
         emit({
@@ -549,9 +674,12 @@ def cmd_corpus(args) -> int:
     counts = Counter(row["status"] for row in rows)
     ok = counts["ok"]
     # hollow-verdict signature (issue #29): no row produced a value, so a
-    # judge run over this corpus would compare only error-vs-error pairs
-    hollow = bool(rows) and ok == 0
-    warning = None
+    # judge run over this corpus would compare only error-vs-error pairs —
+    # the judge's ground-truth guard (issue #30) calls that INCOMPARABLE
+    # and already warns here below the ok-fraction threshold (rule
+    # defaults; the dry-run takes no manifest to override them)
+    gt = reference_ground_truth(recs, len(rows), merge_rules({}))
+    hollow = gt["degenerate"]
     if hollow:
         warning = (
             "every reference run errored/was unserializable — a judge "
@@ -560,6 +688,8 @@ def cmd_corpus(args) -> int:
             "value per line — no {\"i\",\"input\"} pre-wrapping) and the "
             "entry's expected input shape."
         )
+    else:
+        warning = gt["warning"]
 
     code = EXIT_OK if ok == len(rows) else EXIT_FINDINGS
     human = f"corpus {corpus_path.name} vs {args.entry}: {ok}/{len(rows)} rows ok"
@@ -567,6 +697,8 @@ def cmd_corpus(args) -> int:
         human += f", {len(rows) - ok} error/unserializable"
     if hollow:
         human += " — HOLLOW: no row produced a value"
+    elif gt["warning"]:
+        human += f" — THIN: {gt['warning']}"
     emit({
         "tool": TOOL, "version": VERSION, "entry": args.entry,
         "corpus": {"path": str(corpus_path), "lines": len(inputs),
@@ -574,6 +706,7 @@ def cmd_corpus(args) -> int:
         "rows": rows, "counts": dict(sorted(counts.items())),
         "ok": ok, "total": len(rows),
         "hollow_equivalent_risk": hollow, "warning": warning,
+        "reference_ok_fraction": gt["reference_ok_fraction"],
         "summary": {"exit_code": code, "human": human},
     }, human_flag=args.human)
     return code
@@ -601,22 +734,13 @@ def _records_by_index(recs: list) -> list:
 
 def _emit_runs_verdicts(*, unit, inputs, corpus_path, ref_recs, cand_recs,
                         rules, extra: dict, human_flag: bool = False) -> int:
-    runs, counts = [], {"equivalent": 0, "divergent": 0, "incomparable": 0}
-    for i in range(max(len(ref_recs), len(cand_recs))):
-        verdict = classify_pair(i, ref_recs[i] if i < len(ref_recs) else None,
-                                cand_recs[i] if i < len(cand_recs) else None, rules)
-        runs.append(verdict)
-        counts[verdict["verdict"]] += 1
+    runs = classify_runs(ref_recs, cand_recs, rules)
+    counts = count_verdicts(runs)
     total = len(runs)
-    if counts["divergent"]:
-        verdict = "divergent"
-        code = EXIT_FINDINGS
-    elif counts["incomparable"]:
-        verdict = "incomparable"
-        code = EXIT_INCOMPARABLE
-    else:
-        verdict = "equivalent"
-        code = EXIT_OK
+    gt = reference_ground_truth(ref_recs, total, rules)
+    verdict = summary_verdict(counts, gt)
+    code = {"equivalent": EXIT_OK, "divergent": EXIT_FINDINGS,
+            "incomparable": EXIT_INCOMPARABLE}[verdict]
 
     diff_kinds: dict[str, int] = {}
     for run in runs:
@@ -631,14 +755,20 @@ def _emit_runs_verdicts(*, unit, inputs, corpus_path, ref_recs, cand_recs,
         f"unit={unit or '-'}: {counts['equivalent']}/{total} equivalent, "
         f"{counts['divergent']} divergent, {counts['incomparable']} incomparable "
         f"-> {verdict.upper()}"
-        + (f"; top diff kinds: {sorted(diff_kinds, key=diff_kinds.get, reverse=True)[:3]}"
-           if diff_kinds else "")
     )
+    if gt["degenerate"]:
+        human += f"; {gt['detail']} — no ground truth: {_degenerate_note(counts)}"
+    elif gt["warning"]:
+        human += f"; WARNING: {gt['warning']}"
+    if diff_kinds:
+        human += (f"; top diff kinds: "
+                  f"{sorted(diff_kinds, key=diff_kinds.get, reverse=True)[:3]}")
     payload = {
         "tool": TOOL, "version": VERSION, "unit": unit, "verdict": verdict,
         "counts": counts, "total": total, "runs": runs,
         "diff_kind_histogram": dict(sorted(diff_kinds.items())),
         "verdicts_digest": verdicts_digest,
+        "ground_truth": gt,
         "normalization": _rules_public(rules),
         "summary": {"exit_code": code, "human": human},
     }
@@ -750,6 +880,35 @@ SELF_TEST_INPUTS = [
 ]
 
 
+def _degenerate_corpus_guard(entry: str) -> dict:
+    """Issue #30 probe through the production judging path: a corpus the
+    reference fully rejects (every row's separator is longer than its text,
+    so the reference raises) must classify INCOMPARABLE at the summary even
+    though every per-run pair is error==error equivalent — the
+    hollow-verdict scenario the guard exists for. ``entry`` is the
+    self-test reference (already registered in sys.modules). Returns the
+    ``degenerate_corpus_guard`` block of the self-test payload."""
+    inputs = [
+        {"text": "a", "sep": "!!longer-than-a"},
+        {"text": "ab", "sep": "!!!!longer-than-ab"},
+    ]
+    ref = _execute_entry_local(entry, inputs)
+    cand = _execute_entry_local(entry, inputs)
+    rules = merge_rules({})
+    runs = classify_runs(ref, cand, rules)
+    counts = count_verdicts(runs)
+    gt = reference_ground_truth(ref, len(inputs), rules)
+    verdict = summary_verdict(counts, gt)
+    return {
+        "per_run_equivalent": counts["equivalent"],
+        "reference_ok": gt["reference_ok"],
+        "summary_verdict": verdict,
+        "held": (counts["equivalent"] == len(inputs)
+                 and gt["degenerate"] and gt["reference_ok"] == 0
+                 and verdict == "incomparable"),
+    }
+
+
 def cmd_self_test(args) -> int:
     mod = types.ModuleType("_oracle_selftest_reference")
     mod.run = _reference_word_count
@@ -788,18 +947,24 @@ def cmd_self_test(args) -> int:
         benign_results.append({"case": name, "verdict": verdict["verdict"]})
     benign_ok = all(b["verdict"] == "equivalent" for b in benign_results)
 
+    guard = _degenerate_corpus_guard("_oracle_selftest_reference:run")
+
     caught = sum(1 for r in results if r["caught"])
-    passed = caught == len(SELF_TEST_BUGS) and benign_ok
+    passed = caught == len(SELF_TEST_BUGS) and benign_ok and guard["held"]
     code = EXIT_OK if passed else EXIT_FINDINGS
     human = (
         f"judge-first validation: {caught}/{len(SELF_TEST_BUGS)} injected bugs caught"
         + ("" if benign_ok else "; WARNING: benign differences flagged as divergent")
+        + ("; all-error reference corpus -> INCOMPARABLE (guard held)"
+           if guard["held"] else
+           "; WARNING: all-error reference corpus did not classify INCOMPARABLE")
     )
     emit({
         "tool": TOOL, "version": VERSION,
         "injected_bugs": len(SELF_TEST_BUGS), "caught": caught,
         "results": results,
         "benign_normalization_cases": benign_results,
+        "degenerate_corpus_guard": guard,
         "llm_in_judging_path": False,
         "summary": {"exit_code": code, "human": human},
     }, human_flag=args.human)
@@ -836,7 +1001,9 @@ def main(argv=None) -> int:
     p.add_argument("--runs", required=True, help="JSON {reference: [...], candidate: [...]}")
     p.set_defaults(func=cmd_compare)
 
-    p = sub.add_parser("self-test", help="Stage 2 judge-first validation: 5/5 injected bugs")
+    p = sub.add_parser("self-test",
+                       help="Stage 2 judge-first validation: 5/5 injected bugs "
+                            "+ degenerate-corpus guard (issue #30)")
     p.set_defaults(func=cmd_self_test)
 
     p = sub.add_parser("rules", help="print documented normalization rules")

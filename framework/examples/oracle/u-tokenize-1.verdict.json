@@ -46,6 +46,15 @@
     "swallowed-error": 1
   },
   "verdicts_digest": "c17b3f2f4feb6613",
+  "ground_truth": {
+    "reference_ok": 1,
+    "runs": 3,
+    "reference_ok_fraction": 0.333333,
+    "min_reference_ok_fraction": 0.5,
+    "degenerate": false,
+    "detail": null,
+    "warning": "reference ok on only 1/3 runs (33.3% < min_reference_ok_fraction 0.5) — verdict rests on thin ground truth"
+  },
   "normalization": {
     "float_abs_tol": 1e-09,
     "float_rel_tol": 1e-09,
@@ -56,11 +65,12 @@
     "unicode_nfc": true,
     "strip_fields": [],
     "error_compare": "type-and-message",
-    "error_message_ignore_patterns": []
+    "error_message_ignore_patterns": [],
+    "min_reference_ok_fraction": 0.5
   },
   "summary": {
     "exit_code": 2,
-    "human": "unit=u-tokenize-1: 1/3 equivalent, 1 divergent, 1 incomparable -> DIVERGENT; top diff kinds: ['swallowed-error']"
+    "human": "unit=u-tokenize-1: 1/3 equivalent, 1 divergent, 1 incomparable -> DIVERGENT; WARNING: reference ok on only 1/3 runs (33.3% < min_reference_ok_fraction 0.5) — verdict rests on thin ground truth; top diff kinds: ['swallowed-error']"
   },
   "runs_requested": 3,
   "corpus": {
