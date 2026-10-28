@@ -55,7 +55,6 @@ from _common import (  # noqa: E402
 
 TOOL = "state.py"
 VERSION = 1
-# issue #35: per-field strict-JSON marker for `set --field '@json:path={...}'`
 JSON_FIELD_PREFIX = "@json:"
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "state" / "migration-state.schema.json"
 POLICY_PATH = Path(__file__).resolve().parent.parent / "autonomy" / "policy.json"
@@ -638,10 +637,8 @@ def cmd_set(args) -> int:
     state = _load(path)
     changes = []
     for pair in args.field:
-        # issue #35: '@json:path=value' types that ONE field as strict JSON
-        # so plain and JSON fields can share a single invocation
         strict_json = pair.startswith(JSON_FIELD_PREFIX)
-        spec = pair[len(JSON_FIELD_PREFIX):] if strict_json else pair
+        spec = pair.removeprefix(JSON_FIELD_PREFIX)
         if "=" not in spec:
             return _refusal(f"--field expects path=value, got {pair!r}", args.human)
         field, raw = spec.split("=", 1)
@@ -1070,12 +1067,13 @@ def main(argv=None) -> int:
     p.add_argument("file")
     p.add_argument("--field", action="append", required=True,
                    help="dotted path=value, e.g. units[u-1].status=ported "
-                        "(repeatable); prefix with '@json:' to type that one "
-                        "value as strict JSON (issue #35)")
+                        "(repeatable); a leading '@json:' types that one "
+                        "value as strict JSON")
     p.add_argument("--actor", default="orchestrator")
     p.add_argument("--json-value", action="store_true",
-                   help="treat ALL values as strict JSON (error on non-JSON); "
-                        "for mixing, see the per-field '@json:' prefix")
+                   help="treat every value as strict JSON (error on "
+                        "non-JSON); to mix, use the per-field '@json:' "
+                        "prefix")
     p.set_defaults(func=cmd_set)
 
     p = sub.add_parser("mark", help="guarded unit status transition")

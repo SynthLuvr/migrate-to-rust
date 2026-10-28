@@ -44,8 +44,6 @@ def test_every_transition_journaled(monkeypatch, capsys, mini_state):
 
 def test_set_mixes_plain_and_json_fields_in_one_invocation(
         monkeypatch, capsys, mini_state):
-    # issue #35: '@json:' types one field strict JSON so a plain string and a
-    # JSON object share one call — no journal noise from split invocations
     code, out = run_tool(monkeypatch, capsys, "state.py", [
         "set", str(mini_state),
         "--field", "project.workload=some plain string",
@@ -54,11 +52,10 @@ def test_set_mixes_plain_and_json_fields_in_one_invocation(
     st = _load(mini_state)
     assert st["project"]["workload"] == "some plain string"
     assert st["go_no_go"] == {"decision": "pending", "scope": ["u1"]}
-    assert len(st["journal"]) == 2  # one entry per field, one invocation
+    assert len(st["journal"]) == 2
 
 
 def test_set_json_prefix_is_exact_typing(monkeypatch, capsys, mini_state):
-    # '@json:project.workload="4"' keeps the quoted string a string
     code, _ = run_tool(monkeypatch, capsys, "state.py", [
         "set", str(mini_state), "--field", '@json:project.workload="4"'])
     assert code == 0
@@ -71,12 +68,11 @@ def test_set_json_prefix_rejects_non_json_without_landing(
     code, out = run_tool(monkeypatch, capsys, "state.py", [
         "set", str(mini_state), "--field", "@json:project.workload=oops"])
     assert code == 2 and "not valid JSON" in out["error"]
-    assert _load(mini_state) == before  # nothing landed
+    assert _load(mini_state) == before
 
 
 def test_set_json_value_flag_keeps_whole_invocation_strictness(
         monkeypatch, capsys, mini_state):
-    # --json-value unchanged (back-compat): every field must be valid JSON
     code, out = run_tool(monkeypatch, capsys, "state.py", [
         "set", str(mini_state), "--field", "project.workload=oops",
         "--json-value"])
