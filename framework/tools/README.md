@@ -61,6 +61,27 @@ loop:
   stops safely and resumably in `budget_exhausted`.
 - Agent retries per stage are bounded (`budget.max_agent_retries_per_stage`);
   exhaustion ends the run in `failed_safely` — never a silent skip.
+- **Preflight** (issue #31): `pipeline.py preflight state.json
+  --target-root <repo>` runs, in one command and one auditable artifact,
+  everything stages 0/3 silently depended on — target suite green + wall
+  time (the Stage 2 spec baseline), a `pytest --collect-only -q` capture
+  written next to the state file (replayed by
+  `contract_extract.py --pytest-collect`), the `oracle.py` self-test
+  re-proven under the target interpreter, rust-template reachability +
+  HEAD SHA (Stage 3's provenance, captured from the same run),
+  cargo/rustc/maturin/uv versions + cargo-deny/llvm-cov/shear/pandoc
+  presence (`just doctor` covers the crate; nothing checked the gate stack
+  *before* scaffolding), the target venv interpreter + `Py_GIL_DISABLED`
+  wheel flavor + the derived `PYO3_PYTHON`, substitutions.json freshness,
+  and the framework-vs-target interpreter match (a 3.10 framework python
+  SyntaxErrors on 3.12+ target source). Everything lands in a journaled
+  `preflight` block (`state.py` stays the only writer) plus
+  `<state>.preflight.md`; exit **2** on the hard prerequisites (suite not
+  green, self-test not 5/5, template unreachable — or unprovable, e.g. no
+  target root recorded), so a run starts only when Stage 0's exit criteria
+  are actually checkable. `--skip <check>` downgrades a hard check to an
+  explicit warning (the offline corner); the target root is recorded, so
+  re-runs need no flag.
 
 ## Minimal viable subset
 If you only build three things before starting: **#1 oracle**, **#4 state**,
@@ -116,6 +137,10 @@ python framework/tools/state.py shim state.json --unit u1 --write shims/u1.py
 python framework/tools/state.py validate|journal|show|migrate state.json
 
 # the deterministic driver (issue #22): L2+ unattended runs
+# preflight first (issue #31): suite green + wall time, pytest capture,
+# oracle self-test 5/5, rust-template HEAD SHA, toolchain, target
+# venv/PYO3_PYTHON, substitutions freshness -> one journaled block + report
+python framework/tools/pipeline.py preflight state.json --target-root /abs/target
 python framework/tools/pipeline.py run state.json \
   --agent-cmd 'goose run --recipe {framework}/recipe.yaml' --autonomy L2
 python framework/tools/pipeline.py resolve-gates state.json   # policy only, no agent

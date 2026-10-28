@@ -4,6 +4,13 @@ Purpose: decide **whether** and **what** to port, from measurement. Nothing
 else happens until this is signed.
 
 ## Steps
+
+`pipeline.py preflight <state.json> --target-root <repo>` (issue #31) should
+have run before this stage: it proves the target suite green (recording wall
+time as the spec baseline), re-proves the `oracle.py` self-test, records the
+rust-template SHA Stage 3 cites, and pins the target interpreter — one
+journaled block instead of ~10 ad-hoc commands.
+
 1. Deterministic baseline of a representative workload (cProfile/pyperf).
 2. `py-spy` flamegraphs on the live process → CPU hot paths.
 3. `Scalene` per-line CPU/GPU/memory attribution → allocation-dense lines

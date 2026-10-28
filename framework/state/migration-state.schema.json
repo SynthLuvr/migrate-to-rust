@@ -162,6 +162,45 @@
         "publish_allowed": { "type": "boolean", "$comment": "must be true (L3 only) for a policy-approved cutover; state.py rejects the combination otherwise" }
       }
     },
+    "preflight": {
+      "type": "object",
+      "$comment": "Issue #31 — one command (tools/pipeline.py preflight) runs and records everything stages 0/3 silently assumed: target suite green + wall time (the Stage 2 spec baseline), pytest collection capture, the oracle.py self-test re-proven per run, rust-template reachability + HEAD SHA (Stage 3 provenance), cargo/rustc/maturin/uv + gate-stack presence, the target venv/interpreter/Py_GIL_DISABLED wheel flavor/derived PYO3_PYTHON, substitutions.json freshness, and framework-vs-target interpreter match. Hard prerequisites failing leaves ok=false with hard_failures[] — later stages must not assume what preflight could not prove.",
+      "properties": {
+        "timestamp": { "type": "string", "format": "date-time" },
+        "ok": { "type": "boolean", "$comment": "false when any hard prerequisite (suite green, oracle self-test 5/5, rust-template reachable) failed or could not run" },
+        "policy_version": { "type": "string" },
+        "framework_python": { "type": "string", "$comment": "the interpreter running the framework tools" },
+        "hard_failures": { "type": "array", "items": { "type": "string" }, "$comment": "check ids that failed: suite / oracle_selftest / template" },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "target": {
+          "type": "object",
+          "$comment": "machine-facing summary Stage 3/4 pin from; root is recorded so preflight re-runs need no --target-root",
+          "properties": {
+            "root": { "type": ["string", "null"], "$comment": "absolute path of the repo being migrated" },
+            "python": { "type": ["string", "null"], "$comment": "the target venv interpreter" },
+            "version": { "type": ["string", "null"] },
+            "gil_disabled": { "type": ["boolean", "null"], "$comment": "Py_GIL_DISABLED: true means free-threaded (cp3XXt wheels)" },
+            "wheel_flavor": { "type": ["string", "null"] },
+            "pyo3_python": { "type": ["string", "null"], "$comment": "derived PYO3_PYTHON for maturin/justfile dev-build pins" }
+          }
+        },
+        "checks": {
+          "type": "object",
+          "$comment": "full per-check records keyed by id: template, oracle_selftest, pytest_collect, suite, toolchain, target_interpreter, substitutions_freshness, interpreter_match — each with ok/skipped/detail plus its raw evidence (head_sha, counts, wall_seconds, versions, paths, tails); deliberately free-form so a check can grow evidence without a schema change",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "ok": { "type": ["boolean", "null"] },
+              "skipped": { "type": "boolean" },
+              "hard": { "type": "boolean" },
+              "detail": { "type": "string" }
+            }
+          }
+        },
+        "report_path": { "type": "string", "$comment": "<state>.preflight.md, written every run" }
+      }
+    },
     "run_status": {
       "enum": ["pending", "running", "complete", "no_go_measured", "budget_exhausted", "failed_safely"],
       "$comment": "Terminal-state discipline (issue #22): a driver run ALWAYS ends in complete / no_go_measured / budget_exhausted / failed_safely — never 'awaiting input'. Every terminal state emits the same deliverable set (run report incl. the escalation dossier, state file, journal)."

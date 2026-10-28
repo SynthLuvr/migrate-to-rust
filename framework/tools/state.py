@@ -126,7 +126,8 @@ def record_gate_fields(gate: dict, updates: dict, changes: list) -> None:
 # --------------------------------------------------------------- schema ----
 # A stdlib-only validator for the draft-2020-12 subset the schema uses:
 # $schema/$comment/title ignored · type (incl. unions) · required ·
-# properties · items · enum · minimum/maximum · format date-time.
+# properties · additionalProperties · items · enum · minimum/maximum ·
+# format date-time.
 # tests/test_state.py cross-checks it against the jsonschema package when
 # that is installed, so the two never drift silently.
 
@@ -178,9 +179,19 @@ def validate_schema(instance, schema: dict, path: str = "$", errors: list | None
         for key in schema.get("required", []):
             if key not in instance:
                 errors.append(f"{path}: missing required property {key!r}")
-        for key, sub in schema.get("properties", {}).items():
+        properties = schema.get("properties", {})
+        for key, sub in properties.items():
             if key in instance:
                 validate_schema(instance[key], sub, f"{path}.{key}", errors)
+        addl = schema.get("additionalProperties")
+        if addl is not None:
+            for key, value in instance.items():
+                if key in properties:
+                    continue
+                if addl is False:
+                    errors.append(f"{path}: additional property {key!r} is not allowed")
+                elif isinstance(addl, dict):
+                    validate_schema(value, addl, f"{path}.{key}", errors)
     elif isinstance(instance, list):
         items = schema.get("items")
         if isinstance(items, dict):

@@ -34,6 +34,18 @@ not in the repo being migrated.
      --agent-cmd 'goose run --recipe {framework}/recipe.yaml'
    ```
 
+   Preflight first (issue #31) — one command that machine-checks the
+   "Before first use" list below against the target and records it in the
+   state file (`preflight` block + `<state>.preflight.md`); it exits 2 on
+   the hard prerequisites (suite not green, oracle self-test not 5/5,
+   rust-template unreachable), so the run starts only when Stage 0's exit
+   criteria are actually checkable:
+
+   ```console
+   python framework/tools/pipeline.py preflight \
+     framework/state/migration-state.json --target-root /abs/path/to/target
+   ```
+
    The run always ends in a terminal state (`complete`, `no_go_measured`,
    `budget_exhausted`, or `failed_safely` — never "awaiting input") with a
    run report, the state file, the journal, and an escalation dossier.
@@ -111,3 +123,13 @@ not in the repo being migrated.
 - [ ] Point `recipe.yaml` at your target project and provider/model
 - [ ] Confirm the target's test suite is green and substantive enough to act
       as the spec (Stage 2 will stop you if not)
+- [ ] Or machine-check the checklist items above in one command (issue #31):
+      `python framework/tools/pipeline.py preflight <state.json>
+      --target-root /abs/target` — runs the target suite (recording wall
+      time as the Stage 2 baseline), captures `pytest --collect-only` for
+      Stage 2, re-proves the oracle self-test under the target interpreter,
+      records the rust-template HEAD SHA for Stage 3 provenance, probes
+      cargo/rustc/maturin/uv + the gate stack, resolves the target venv /
+      interpreter / `Py_GIL_DISABLED` wheel flavor / derived `PYO3_PYTHON`,
+      and checks substitutions freshness + the framework-vs-target
+      interpreter match — all journaled into the state file

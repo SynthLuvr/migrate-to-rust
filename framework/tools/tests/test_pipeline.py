@@ -10,9 +10,15 @@ LLM self-approval; escalation defers instead of halting."""
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import shutil
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
+
+import pytest
 
 import pipeline as pipeline_tool
 import state as state_tool
@@ -510,3 +516,209 @@ def test_status_summarizes_the_run(monkeypatch, capsys, tmp_path):
     code, out = run_tool(monkeypatch, capsys, "pipeline.py", ["status", str(p)])
     assert code == 0
     assert out["run_status"] == "pending" and out["autonomy"]["level"] == "L2"
+
+
+# ------------------------------------------------- preflight (issue #31) --
+# e2e against a throwaway target repo; the template check runs offline
+# against this repo's own git checkout (--template-url REPO_ROOT).
+
+def _target_project(tmp_path, *, failing=False):
+    """A throwaway target repo: a tests/ suite (green or red) plus a fake
+    `.venv` whose python exec-wraps the running interpreter (a symlink is
+    NOT enough: venv resolution follows the resolved binary, so a venv
+    python reached through a symlink silently loses its site-packages)."""
+    root = tmp_path / "target"
+    (root / "tests").mkdir(parents=True)
+    body = ("def test_add():\n    assert 1 + 1 == 2\n\n"
+            "def test_mul():\n    assert 2 * 3 == 6\n")
+    if failing:
+        body += "\n\ndef test_broken():\n    assert 1 + 1 == 3\n"
+    (root / "tests" / "test_math.py").write_text(body)
+    if os.name == "nt":
+        pytest.skip("the exec-wrapper venv fixture is POSIX-only")
+    vbin = root / ".venv" / "bin"
+    vbin.mkdir(parents=True)
+    vpy = vbin / "python"
+    vpy.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n")
+    vpy.chmod(0o755)
+    return root
+
+
+def _init_state(monkeypatch, capsys, tmp_path):
+    p = tmp_path / "state.json"
+    run_tool(monkeypatch, capsys, "state.py", [
+        "init", str(p), "--name", "demo", "--python-path", "src/demo"])
+    return p
+
+
+def _preflight(monkeypatch, capsys, p, root=None, *extra):
+    argv = ["preflight", str(p), "--template-url", str(REPO_ROOT)]
+    if root is not None:
+        argv += ["--target-root", str(root)]
+    argv += list(extra)
+    return run_tool(monkeypatch, capsys, "pipeline.py", argv)
+
+
+def test_preflight_green_writes_block_report_and_journal(monkeypatch, capsys,
+                                                         tmp_path):
+    p = _init_state(monkeypatch, capsys, tmp_path)
+    root = _target_project(tmp_path)
+    code, out = _preflight(monkeypatch, capsys, p, root)
+    assert code == 0, out
+    assert out["ok"] is True and out["hard_failures"] == []
+    st = _load(p)
+    pf = st["preflight"]
+    assert pf["ok"] is True and pf["hard_failures"] == []
+    head = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+                          capture_output=True, text=True,
+                          check=True).stdout.strip()
+    assert pf["checks"]["template"] == {
+        "id": "template", "hard": True, "ok": True, "url": str(REPO_ROOT),
+        "head_sha": head,
+        "detail": f"rust-template reachable, HEAD {head[:12]}"}
+    selftest = pf["checks"]["oracle_selftest"]
+    assert selftest["ok"] and (selftest["caught"], selftest["injected"]) == (5, 5)
+    # the spec baseline: green + wall time, recorded for Stage 2
+    suite = pf["checks"]["suite"]
+    assert suite["ok"] and suite["counts"]["passed"] == 2
+    assert suite["wall_seconds"] >= 0
+    # collection capture feeds contract_extract --pytest-collect
+    collect = pf["checks"]["pytest_collect"]
+    assert collect["ok"] and collect["collected"] == 2
+    capture = Path(collect["capture"])
+    assert capture == tmp_path / "state.pytest-collect.txt"
+    assert capture.read_text().count("::") == 2
+    # the target interpreter summary Stage 3/4 pin from
+    ti = pf["checks"]["target_interpreter"]
+    assert ti["ok"] and ti["pyo3_python"] == ti["python"]
+    assert ti["python"].endswith("/.venv/bin/python")
+    assert ti["gil_disabled"] is False and "abi3" in ti["wheel_flavor"]
+    assert pf["target"]["root"] == str(root)
+    assert pf["target"]["pyo3_python"] == ti["python"]
+    # journaled through state.py, one preflight transition per run
+    assert [e["field"] for e in st["journal"]].count("preflight") == 1
+    # deliverables: the human report; and the state stays coherent
+    report = tmp_path / "state.preflight.md"
+    assert report.exists() and "target suite green" in report.read_text()
+    assert "PYO3_PYTHON" in report.read_text()
+    code, v = run_tool(monkeypatch, capsys, "state.py", ["validate", str(p)])
+    assert code == 0, v["invariant_errors"]
+
+
+def test_preflight_fails_loudly_on_a_red_target_suite(monkeypatch, capsys,
+                                                      tmp_path):
+    p = _init_state(monkeypatch, capsys, tmp_path)
+    root = _target_project(tmp_path, failing=True)
+    code, out = _preflight(monkeypatch, capsys, p, root)
+    assert code == 2
+    assert out["ok"] is False and out["hard_failures"] == ["suite"]
+    assert out["checks"]["suite"]["counts"]["failed"] == 1
+    # a hard failure is still journaled — auditability, never a silent skip
+    pf = _load(p)["preflight"]
+    assert pf["ok"] is False and pf["hard_failures"] == ["suite"]
+    assert "NOT green" in (tmp_path / "state.preflight.md").read_text()
+
+
+def test_preflight_fails_loudly_when_the_template_is_unreachable(
+        monkeypatch, capsys, tmp_path):
+    p = _init_state(monkeypatch, capsys, tmp_path)
+    root = _target_project(tmp_path)
+    code, out = _preflight(monkeypatch, capsys, p, root,
+                           "--template-url", str(tmp_path / "no-such-repo"))
+    assert code == 2
+    assert "template" in out["hard_failures"]
+    assert out["checks"]["template"]["head_sha"] is None
+    assert _load(p)["preflight"]["checks"]["template"]["ok"] is False
+
+
+def test_preflight_fails_loudly_when_the_selftest_cannot_run(
+        monkeypatch, capsys, tmp_path):
+    broken = tmp_path / "broken_oracle.py"
+    broken.write_text("import sys\nsys.stderr.write('judge broken')\nsys.exit(2)\n")
+    monkeypatch.setattr(pipeline_tool, "ORACLE", broken)
+    p = _init_state(monkeypatch, capsys, tmp_path)
+    root = _target_project(tmp_path)
+    code, out = _preflight(monkeypatch, capsys, p, root)
+    assert code == 2 and "oracle_selftest" in out["hard_failures"]
+    rec = out["checks"]["oracle_selftest"]
+    assert rec["caught"] is None and "judge-first" in rec["detail"]
+
+
+def test_preflight_without_a_target_root_fails_the_unprovable_hard_checks(
+        monkeypatch, capsys, tmp_path):
+    p = _init_state(monkeypatch, capsys, tmp_path)
+    code, out = _preflight(monkeypatch, capsys, p)  # no --target-root anywhere
+    assert code == 2
+    assert out["hard_failures"] == ["suite"]  # 'unproven' is not 'green'
+    assert any("--target-root" in w for w in out["warnings"])
+
+
+def test_preflight_skip_downgrades_a_hard_check_to_an_explicit_warning(
+        monkeypatch, capsys, tmp_path):
+    p = _init_state(monkeypatch, capsys, tmp_path)
+    code, out = _preflight(monkeypatch, capsys, p, None,
+                           "--skip", "suite", "--skip", "pytest-collect")
+    assert code == 0 and out["hard_failures"] == []
+    assert out["checks"]["suite"]["skipped"] is True
+    assert any("'suite' skipped" in w for w in out["warnings"])
+    assert any("NOT proven" in w for w in out["warnings"])
+
+
+def test_preflight_records_the_target_root_for_re_runs(monkeypatch, capsys,
+                                                       tmp_path):
+    p = _init_state(monkeypatch, capsys, tmp_path)
+    root = _target_project(tmp_path)
+    code, _ = _preflight(monkeypatch, capsys, p, root)
+    assert code == 0
+    # re-run with no flag: the recorded root drives the suite check again
+    code, out = _preflight(monkeypatch, capsys, p)
+    assert code == 0
+    assert out["checks"]["suite"]["ok"] is True
+    assert _load(p)["preflight"]["target"]["root"] == str(root)
+
+
+def test_preflight_warns_when_no_target_venv_is_found(monkeypatch, capsys,
+                                                      tmp_path):
+    p = _init_state(monkeypatch, capsys, tmp_path)
+    root = _target_project(tmp_path)
+    shutil.rmtree(root / ".venv")
+    code, out = _preflight(monkeypatch, capsys, p, root)
+    # soft: the suite/self-test ran under the framework interpreter instead
+    assert code == 0
+    assert out["checks"]["target_interpreter"]["ok"] is False
+    assert out["checks"]["oracle_selftest"]["interpreter"] == sys.executable
+    assert any(".venv" in w for w in out["warnings"])
+
+
+# ------------------------------------------------------- preflight pure ---
+
+def test_pytest_summary_counts_fold_plurals_and_errors():
+    counts = pipeline_tool._parse_pytest_summary(
+        "2 passed, 1 failed, 3 errors, 4 skipped in 0.10s")
+    assert counts == {"passed": 2, "failed": 1, "error": 3, "skipped": 4}
+    assert pipeline_tool._parse_pytest_summary("") == {}
+
+
+def test_interpreter_mismatch_only_flags_an_older_framework():
+    warn = pipeline_tool._interpreter_mismatch("3.10.14", "3.12.4")
+    assert warn and "3.12" in warn and "SyntaxError" in warn
+    assert pipeline_tool._interpreter_mismatch("3.12.1", "3.12.4") is None
+    assert pipeline_tool._interpreter_mismatch("3.13.0", "3.12.4") is None
+    assert pipeline_tool._interpreter_mismatch("3.12", "garbage") is None
+
+
+def test_wheel_flavor_names_the_free_threaded_pin():
+    assert "cp3XXt" in pipeline_tool._wheel_flavor(True)
+    assert "abi3" in pipeline_tool._wheel_flavor(False)
+
+
+def test_substitutions_freshness_flags_stale_and_unparsable_versions():
+    stale = pipeline_tool._substitutions_record({"version": "2020-01-01"},
+                                                date(2026, 10, 28))
+    assert stale["stale"] is True and stale["age_days"] > 30
+    fresh = pipeline_tool._substitutions_record({"version": "2026-10-27"},
+                                                date(2026, 10, 28))
+    assert fresh["ok"] is True and fresh["age_days"] == 1
+    unparsable = pipeline_tool._substitutions_record({"version": "recent"},
+                                                     date(2026, 10, 28))
+    assert unparsable["stale"] is True and unparsable["age_days"] is None
