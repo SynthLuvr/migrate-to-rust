@@ -18,7 +18,9 @@ Manifest (JSON):
      "normalization": {}}                        # oracle rules (optional)
 
 Entries are python callables (module:function, default fn name ``run``) fed
-one JSON value per corpus line — the same protocol oracle.py uses. Parity
+one JSON value per corpus line — the same protocol oracle.py uses (raw
+values; the ``{"i", "input"}`` envelope is internal stdin framing added by
+the runner, and a corpus pre-wrapped in it is refused — issue #29). Parity
 runs through the oracle comparator (imported, not duplicated), so "faster"
 can never mean "wronger": divergent outputs abort the benchmark.
 
@@ -47,7 +49,8 @@ from _common import (  # noqa: E402
     read_json, read_jsonl, run_child, run_cli, sha256_bytes, sha256_file,
 )
 from oracle import (  # noqa: E402
-    RUNNER_SRC, _execute_entry_subprocess, classify_pair, merge_rules,
+    RUNNER_SRC, _execute_entry_subprocess, _refuse_prewrapped_corpus,
+    classify_pair, merge_rules,
 )
 
 TOOL = "bench.py"
@@ -171,6 +174,7 @@ def cmd_run(args) -> int:
     inputs = [v for _, v in rows]
     if not inputs:
         raise ToolError(f"corpus {corpus_path} is empty", kind="usage")
+    _refuse_prewrapped_corpus(inputs, corpus_path)  # issue #29: no double-wrap
 
     try:
         corpus_info, warnings = corpus_commit_info(corpus_path, args.allow_dirty)

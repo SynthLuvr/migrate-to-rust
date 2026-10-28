@@ -10,10 +10,27 @@ How it runs code
 ----------------
 The unit under migration ships as a PyO3 wheel whose Python API is frozen,
 so *both* sides are Python callables: an "entry" is ``module:function``
-(runner default function name: ``run``). The oracle spawns one child process
-per side, streams the input corpus over stdin (JSONL:
+(runner default function name: ``run``).
 
-    {"i": <run id>, "input": <JSON value>})
+**Corpus file format (what you write)** — JSONL, **one raw JSON value per
+line = one input**, exactly as the entry function should receive it.
+Verbatim from the acceptance test ``test_judge_subprocess_end_to_end``::
+
+    {"xs": [1, 2], "bad": false}
+    {"xs": [], "bad": true}
+
+Do NOT pre-wrap corpus lines in a ``{"i": ..., "input": ...}`` envelope:
+that is *internal stdin framing* the oracle adds itself (below). A
+pre-wrapped line reaches the entry as ``{"i": ..., "input": {...}}`` —
+typically the same TypeError on both sides of every run, which the judge
+then reports as a hollow all-EQUIVALENT verdict. ``_load_corpus`` refuses
+a corpus in which every line carries exactly the framing keys, and
+``corpus --validate`` dry-runs an entry per-row before judging.
+
+**Child-process protocol (what the oracle writes)** — one child process
+per side; the oracle frames each corpus value on the child's stdin as::
+
+    {"i": <run id>, "input": <JSON value>}
 
 and reads per-run records from stdout:
 
@@ -40,12 +57,26 @@ Subcommands
 -----------
   judge       run both entries over a corpus manifest and classify every run
   compare     classify already-captured runs (Stage 6 shadow-mode diffing)
+  corpus      dry-run ONE entry over a corpus: per-row ok / error /
+              unserializable reference status before judging — surfaces
+              corpus-format mistakes (e.g. pre-wrapped lines) in seconds
   self-test   Stage 2 judge-first validation: inject the 5 canonical bug
               classes and prove 5/5 are caught — the hard gate
   rules       print the normalization rules (machine-readable documentation)
 
+judge manifest shape (relative paths resolve against the manifest's
+directory)::
+
+    {"unit": "u-1",
+     "reference": {"entry": "impl:run"},
+     "candidate": {"entry": "cand:run"},
+     "corpus": "corpus.jsonl",
+     "normalization": {...}}          # optional rule overrides
+
 Exit codes: 0 all equivalent · 2 any divergent · 3 incomparable (no
-divergence) · 1 usage/IO · 4 side failed to run at all.
+divergence) · 1 usage/IO · 4 side failed to run at all. ``corpus`` reuses
+them as: 0 every row ok · 2 some row error/unserializable/missing · 4 the
+entry failed to run at all.
 """
 
 from __future__ import annotations
@@ -62,7 +93,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_FINDINGS, EXIT_INCOMPARABLE, EXIT_OK, ToolError, emit,
+    EXIT_FINDINGS, EXIT_INCOMPARABLE, EXIT_OK, EXIT_SETUP, ToolError, emit,
     read_json, read_jsonl, run_child, run_cli, sha256_bytes,
 )
 
@@ -418,11 +449,33 @@ def _execute_entry_subprocess(entry: str, inputs: list, manifest_dir: Path,
 
 # ---------------------------------------------------------------- judge ----
 
+def _refuse_prewrapped_corpus(values: list, path) -> None:
+    """A corpus pre-wrapped in the child stdin framing (issue #29): every
+    line is {"i": <int>, "input": ...}. The oracle adds that envelope
+    itself when streaming to the child, so pre-wrapped lines double-wrap —
+    both sides raise the same TypeError on every run and the judge reports
+    a hollow all-EQUIVALENT verdict. Refuse loudly instead (a refusal is a
+    result, not a crash)."""
+    if all(isinstance(v, dict) and set(v) == {"i", "input"}
+           and isinstance(v["i"], int) and not isinstance(v["i"], bool)
+           for v in values):
+        raise ValueError(
+            f"corpus {path} is pre-wrapped in the child-process stdin "
+            'framing: every line is {"i": <int>, "input": ...}. Corpus '
+            "lines are raw JSON values — one input per line, exactly as "
+            "the entry receives it; oracle.py adds the {\"i\", \"input\"} "
+            "envelope itself when streaming to the child. See the corpus "
+            "file format in the module docstring / tools/README.md "
+            "(issue #29)."
+        )
+
+
 def _load_corpus(path: Path) -> list:
     rows = read_jsonl(path)
     values = [v for _, v in rows]
     if not values:
         raise ValueError(f"corpus {path} is empty — nothing to judge")
+    _refuse_prewrapped_corpus(values, path)
     return values
 
 
@@ -452,6 +505,81 @@ def cmd_judge(args) -> int:
             "reference_entry": manifest["reference"]["entry"],
             "candidate_entry": manifest["candidate"]["entry"],
         }, human_flag=args.human)
+
+
+def cmd_corpus(args) -> int:
+    """Dry-run ONE entry over a corpus and report per-row reference status
+    (ok / error / unserializable / missing) before judging — issue #29's
+    "would have surfaced this in seconds" helper: a pre-wrapped or
+    malformed corpus shows up as a wall of identical errors here, not as a
+    hollow 40/40 EQUIVALENT verdict from the judge."""
+    corpus_path = Path(args.validate).resolve()
+    inputs = _load_corpus(corpus_path)
+    if args.runs:
+        inputs = inputs[: args.runs]
+    recs = _execute_entry_subprocess(args.entry, inputs,
+                                     corpus_path.parent, args.timeout)
+
+    setup_error = next((r["setup_error"] for r in recs
+                        if r and r.get("setup_error")), None)
+    if setup_error is not None:
+        human = f"corpus dry-run: entry failed to run: {setup_error}"
+        emit({
+            "tool": TOOL, "version": VERSION, "entry": args.entry,
+            "corpus": {"path": str(corpus_path),
+                       "sha256": sha256_bytes(corpus_path.read_bytes())},
+            "setup_error": setup_error,
+            "summary": {"exit_code": EXIT_SETUP, "human": human},
+        }, human_flag=args.human)
+        return EXIT_SETUP
+
+    rows = []
+    for i, rec in enumerate(recs):
+        if rec is None:
+            rows.append({"i": i, "status": "missing",
+                         "detail": "child produced no record for this input"})
+        elif rec.get("unserializable"):
+            rows.append({"i": i, "status": "unserializable",
+                         "detail": rec.get("detail")})
+        elif rec.get("ok"):
+            rows.append({"i": i, "status": "ok", "detail": None})
+        else:
+            err = rec.get("error", {})
+            rows.append({"i": i, "status": "error",
+                         "detail": f"{err.get('type')}: {err.get('message')}"})
+
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    ok = counts.get("ok", 0)
+    # the hollow-verdict signature (issue #29): zero rows produced a value,
+    # so a judge run over this corpus compares only error-vs-error pairs
+    hollow = bool(rows) and ok == 0
+    warning = None
+    if hollow:
+        warning = (
+            "every reference run errored/was unserializable — a judge "
+            "verdict over this corpus would be hollow (identical errors "
+            "compare as equivalent). Check the corpus format (one raw JSON "
+            "value per line — no {\"i\",\"input\"} pre-wrapping) and the "
+            "entry's expected input shape."
+        )
+
+    code = EXIT_OK if ok == len(rows) else EXIT_FINDINGS
+    human = (f"corpus {corpus_path.name} vs {args.entry}: "
+             f"{ok}/{len(rows)} rows ok"
+             + (f", {len(rows) - ok} error/unserializable" if ok < len(rows) else "")
+             + (" — HOLLOW: no row produced a value" if hollow else ""))
+    emit({
+        "tool": TOOL, "version": VERSION, "entry": args.entry,
+        "corpus": {"path": str(corpus_path), "lines": len(inputs),
+                   "sha256": sha256_bytes(corpus_path.read_bytes())},
+        "rows": rows, "counts": dict(sorted(counts.items())),
+        "ok": ok, "total": len(rows),
+        "hollow_equivalent_risk": hollow, "warning": warning,
+        "summary": {"exit_code": code, "human": human},
+    }, human_flag=args.human)
+    return code
 
 
 def cmd_compare(args) -> int:
@@ -692,6 +820,20 @@ def main(argv=None) -> int:
     p.add_argument("--runs", type=int, default=0, help="cap the corpus (0 = all)")
     p.add_argument("--timeout", type=float, default=120.0, help="per-side timeout (s)")
     p.set_defaults(func=cmd_judge)
+
+    p = sub.add_parser(
+        "corpus",
+        help="dry-run one entry over a corpus: per-row ok/error/unserializable "
+             "reference status before judging (exit 0 all ok · 2 findings · 4 setup)")
+    p.add_argument("--validate", required=True, metavar="CORPUS_JSONL",
+                   help="corpus file to dry-run (one raw JSON value per line — "
+                        "see module docstring; NOT pre-wrapped in {\"i\",\"input\"})")
+    p.add_argument("--entry", required=True,
+                   help="module:function to execute (default fn: run); module "
+                        "resolves with the corpus file's directory as cwd")
+    p.add_argument("--runs", type=int, default=0, help="cap the corpus (0 = all)")
+    p.add_argument("--timeout", type=float, default=120.0, help="per-side timeout (s)")
+    p.set_defaults(func=cmd_corpus)
 
     p = sub.add_parser("compare", help="classify pre-captured runs (shadow mode)")
     p.add_argument("--runs", required=True, help="JSON {reference: [...], candidate: [...]}")

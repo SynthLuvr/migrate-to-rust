@@ -7,6 +7,7 @@ the judging path."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import oracle
 from conftest import run_tool
@@ -128,3 +129,136 @@ def test_judge_subprocess_end_to_end(monkeypatch, capsys, tmp_path):
     assert out["counts"] == {"equivalent": 1, "divergent": 1, "incomparable": 0}
     assert out["runs"][1]["diffs"][0]["kind"] == "swallowed-error"
     assert out["corpus"]["lines"] == 2
+
+
+# ---------------------------------------------------------- issue #29 ----
+# The module docstring used to imply the corpus file itself was JSONL
+# {"i": ..., "input": ...}; following it double-wraps every input, both
+# sides raise the same TypeError, and the judge reports a hollow 40/40
+# EQUIVALENT. The corpus file is one raw JSON value per line; the framing
+# is internal stdin protocol.
+
+def test_docs_pin_the_corpus_file_format():
+    # the docstring documents the raw-value format with the acceptance
+    # test's example verbatim, and names the framing as internal
+    doc = oracle.__doc__
+    assert "one raw JSON value per" in doc
+    assert '{"xs": [1, 2], "bad": false}' in doc
+    assert '{"xs": [], "bad": true}' in doc
+    assert "internal stdin framing" in doc
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    assert "one raw" in readme and "internal stdin framing" in readme
+    assert '{"xs": [1, 2], "bad": false}' in readme
+
+
+def test_judge_refuses_prewrapped_corpus(monkeypatch, capsys, tmp_path):
+    # following the OLD docstring produced exactly this corpus — and a
+    # hollow all-equivalent verdict. Now it must be a loud usage refusal.
+    (tmp_path / "impl.py").write_text("def run(v):\n    return v\n")
+    (tmp_path / "corpus.jsonl").write_text("\n".join([
+        json.dumps({"i": 0, "input": {"xs": [1, 2], "bad": False}}),
+        json.dumps({"i": 1, "input": {"xs": [], "bad": True}}),
+    ]) + "\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "unit": "u-1",
+        "reference": {"entry": "impl:run"},
+        "candidate": {"entry": "impl:run"},
+        "corpus": "corpus.jsonl",
+    }))
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["judge", "--manifest", str(manifest)])
+    assert code == 1
+    assert out["error"]["kind"] == "usage"
+    assert "pre-wrapped" in out["error"]["detail"]
+    assert "raw JSON values" in out["error"]["detail"]
+
+
+def test_prewrap_guard_tolerates_legitimate_keys(monkeypatch, capsys, tmp_path):
+    # a corpus whose inputs merely CONTAIN i/input-ish keys (or only some
+    # lines shaped like framing) is data, not a mistake — no refusal
+    values = [
+        {"input": "a"},                       # missing "i"
+        {"i": 2, "input": {"x": 1}, "extra": 0},  # extra key
+        {"i": "not-an-int", "input": [1]},    # i not an int
+        [1, 2, 3],                            # not even a dict
+    ]
+    path = tmp_path / "corpus.jsonl"
+    path.write_text("\n".join(json.dumps(v) for v in values) + "\n")
+    assert oracle._load_corpus(path) == values
+
+
+def test_corpus_validate_reports_per_row_status(monkeypatch, capsys, tmp_path):
+    (tmp_path / "impl.py").write_text(
+        "def run(v):\n"
+        "    if v['bad']:\n"
+        "        raise ValueError('bad input')\n"
+        "    return {'n': len(v['xs']), 'total': sum(v['xs'])}\n")
+    (tmp_path / "corpus.jsonl").write_text("\n".join([
+        json.dumps({"xs": [1, 2], "bad": False}),
+        json.dumps({"xs": [], "bad": True}),
+    ]) + "\n")
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["corpus", "--validate", str(tmp_path / "corpus.jsonl"),
+                          "--entry", "impl:run"])
+    assert code == 2  # one error row -> findings-class, attention needed
+    assert out["rows"][0]["status"] == "ok"
+    assert out["rows"][1]["status"] == "error"
+    assert "ValueError" in out["rows"][1]["detail"]
+    assert out["counts"] == {"ok": 1, "error": 1}
+    assert out["hollow_equivalent_risk"] is False
+    assert out["corpus"]["lines"] == 2
+
+
+def test_corpus_validate_flags_the_hollow_signature(monkeypatch, capsys, tmp_path):
+    # the issue #29 scenario: an entry that errors on EVERY input (e.g. a
+    # wrong input shape corpus-wide). Per-row dry-run must flag that a
+    # judge verdict over this corpus would be hollow.
+    (tmp_path / "impl.py").write_text(
+        "def run(v):\n"
+        "    return {'n': len(v['payload']['xs'])}\n")  # KeyError on every row
+    (tmp_path / "corpus.jsonl").write_text("\n".join([
+        json.dumps({"xs": [1, 2]}),
+        json.dumps({"xs": []}),
+    ]) + "\n")
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["corpus", "--validate", str(tmp_path / "corpus.jsonl"),
+                          "--entry", "impl:run"])
+    assert code == 2
+    assert all(r["status"] == "error" for r in out["rows"])
+    assert out["hollow_equivalent_risk"] is True
+    assert "hollow" in out["warning"]
+
+
+def test_corpus_validate_all_ok_exits_zero(monkeypatch, capsys, tmp_path):
+    (tmp_path / "impl.py").write_text("def run(v):\n    return v['x'] * 2\n")
+    (tmp_path / "corpus.jsonl").write_text("\n".join([
+        json.dumps({"x": 1}), json.dumps({"x": 2})]) + "\n")
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["corpus", "--validate", str(tmp_path / "corpus.jsonl"),
+                          "--entry", "impl:run"])
+    assert code == 0
+    assert out["ok"] == out["total"] == 2
+    assert out["hollow_equivalent_risk"] is False
+
+
+def test_corpus_validate_setup_failure_exits_four(monkeypatch, capsys, tmp_path):
+    (tmp_path / "corpus.jsonl").write_text(json.dumps({"x": 1}) + "\n")
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["corpus", "--validate", str(tmp_path / "corpus.jsonl"),
+                          "--entry", "no_such_module:run"])
+    assert code == 4
+    assert "setup_error" in out
+
+
+def test_corpus_validate_also_refuses_prewrapped(monkeypatch, capsys, tmp_path):
+    (tmp_path / "corpus.jsonl").write_text("\n".join([
+        json.dumps({"i": 0, "input": {"x": 1}}),
+        json.dumps({"i": 1, "input": {"x": 2}}),
+    ]) + "\n")
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["corpus", "--validate", str(tmp_path / "corpus.jsonl"),
+                          "--entry", "impl:run"])
+    assert code == 1
+    assert out["error"]["kind"] == "usage"
+    assert "pre-wrapped" in out["error"]["detail"]
