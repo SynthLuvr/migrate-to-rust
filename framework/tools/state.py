@@ -34,7 +34,16 @@ Subcommands
              validated, atomic; the policy evaluation itself lives in
              pipeline.py resolve-gates
   shim       emit the per-unit fallback switch (Python stays callable per
-             unit — reversible via one env var, no extra state anywhere)
+             unit — reversible via one env var, no extra state anywhere).
+             Import names fit the real target layouts (issue #53): the
+             Python side derives BOTH spellings of a src//lib-layout path
+             (``bars`` and ``src.bars`` — issue #26 heritage) and tries
+             them in order; flat PyO3 wheels (one extension module
+             exposing every unit's functions, e.g. ``wicksmith_core``)
+             get a re-export shim — ``--flat`` with names from
+             ``--names`` or the unit's schema-recorded ``rust_module`` +
+             ``rust_names[]`` (the API-freeze source of truth) — with
+             the same env-var switching semantics
   migrate    bring an older/partial state up to the current schema shape
   journal    print the journal (read-only), optionally filtered
   show       project a unit or a summary
@@ -53,7 +62,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_FINDINGS, EXIT_OK, ToolError, emit, module_name_of,
+    EXIT_FINDINGS, EXIT_OK, ToolError, emit, import_candidates_of,
     now_iso, run_cli, write_json_atomic,
 )
 
@@ -989,6 +998,10 @@ is deliberately retired in Stage 7. The switch is reversible per unit with
 NO extra state anywhere (anti-requirement: no state outside
 migration-state.json): set {env_var} to "all" (every unit falls back), a
 comma-separated list of unit ids, or "none" (default).
+
+Python import spellings, tried in order — src//lib-layout targets import
+under both and the adapters match either (issue #26; issue #53):
+{python_imports_comment}
 """
 
 import importlib
@@ -998,6 +1011,8 @@ _UNIT = {unit!r}
 _ENV = {env_var!r}
 _GENERATED_STATUS = {status!r}
 _RUST_LIVE = _GENERATED_STATUS in ("ported", "divergent_explained", "retired")
+_PYTHON_IMPORTS = {python_imports!r}
+_RUST_IMPORT = {rust_import!r}
 
 
 def _use_fallback() -> bool:
@@ -1009,11 +1024,19 @@ def _use_fallback() -> bool:
 
 
 def _python():
-    return importlib.import_module({python_import!r})
+    """The Python fallback module, trying every layout spelling in turn
+    (issue #53: src-layout targets import as src.<pkg> too)."""
+    last = None
+    for name in _PYTHON_IMPORTS:
+        try:
+            return importlib.import_module(name)
+        except ImportError as exc:
+            last = exc
+    raise last
 
 
 def _rust():
-    return importlib.import_module({rust_import!r})
+    return importlib.import_module(_RUST_IMPORT)
 
 
 def impl():
@@ -1024,6 +1047,114 @@ def impl():
 '''
 
 
+SHIM_FLAT_TEMPLATE = '''"""Auto-generated per-unit fallback switch — framework/tools/state.py shim.
+
+Unit:  {unit}  ({python_path} -> {rust_import}.{names_hint})
+Status at generation: {status}
+
+Flat PyO3 wheel layout (issue #53): ONE extension module
+({rust_import}) exposes every unit's functions flat — there is no
+per-unit rust module to import. This shim re-exports this unit's public
+names from whichever side is live, so the caller-visible API is exactly
+the Python original's.
+
+Dual-build discipline: the Python fallback stays callable per unit until it
+is deliberately retired in Stage 7. The switch is reversible per unit with
+NO extra state anywhere (anti-requirement: no state outside
+migration-state.json): set {env_var} to "all" (every unit falls back), a
+comma-separated list of unit ids, or "none" (default).
+
+Python import spellings, tried in order — src//lib-layout targets import
+under both and the adapters match either (issue #26; issue #53):
+{python_imports_comment}
+"""
+
+import importlib
+import os
+import types
+
+_UNIT = {unit!r}
+_ENV = {env_var!r}
+_GENERATED_STATUS = {status!r}
+_RUST_LIVE = _GENERATED_STATUS in ("ported", "divergent_explained", "retired")
+_PYTHON_IMPORTS = {python_imports!r}
+_RUST_IMPORT = {rust_import!r}
+# this unit's public API — the schema-recorded rust_names (issue #53),
+# one source of truth shared with the reviewer's API-freeze check
+_NAMES = {names!r}
+
+
+def _use_fallback() -> bool:
+    value = os.environ.get(_ENV, "none")
+    if value == "all":
+        return True
+    selected = [x.strip() for x in value.split(",") if x.strip()]
+    return _UNIT in selected
+
+
+def _python():
+    """The Python fallback module, trying every layout spelling in turn
+    (issue #53: src-layout targets import as src.<pkg> too)."""
+    last = None
+    for name in _PYTHON_IMPORTS:
+        try:
+            return importlib.import_module(name)
+        except ImportError as exc:
+            last = exc
+    raise last
+
+
+def _rust():
+    """The flat wheel module holding every unit's functions."""
+    return importlib.import_module(_RUST_IMPORT)
+
+
+def _rust_namespace():
+    """This unit's names lifted out of the flat wheel module; a name the
+    wheel does not expose is name drift, not a fallback trigger."""
+    mod = _rust()
+    missing = [n for n in _NAMES if not hasattr(mod, n)]
+    if missing:
+        raise AttributeError(
+            f"flat module {{_RUST_IMPORT!r}} does not expose "
+            + ", ".join(missing)
+            + " — rust-side name drift vs the recorded rust_names (issue #53)")
+    ns = types.SimpleNamespace()
+    for n in _NAMES:
+        setattr(ns, n, getattr(mod, n))
+    return ns
+
+
+def impl():
+    """Return a namespace exposing this unit's public names from the live
+    side (python module or flat rust wheel)."""
+    if _use_fallback() or not _RUST_LIVE:
+        return _python()
+    return _rust_namespace()
+
+
+def __getattr__(name):
+    """PEP 562 per-name dispatch: ``from <this shim> import <public name>``
+    resolves against the live side, so the shim drops in where the original
+    module was imported."""
+    if name in _NAMES:
+        return getattr(impl(), name)
+    raise AttributeError(f"module {{__name__!r}} has no attribute {{name!r}}")
+'''
+
+
+def _split_name_list(values: list[str] | None) -> list[str]:
+    """Flatten repeatable --names flags (each may be a comma-separated
+    list) into one deduplicated, order-preserving list of identifiers."""
+    out: list[str] = []
+    for chunk in values or []:
+        for name in chunk.split(","):
+            name = name.strip()
+            if name and name not in out:
+                out.append(name)
+    return out
+
+
 def cmd_shim(args) -> int:
     state = _load(Path(args.file))
     unit = _find_unit(state, args.unit)
@@ -1032,13 +1163,49 @@ def cmd_shim(args) -> int:
     if not unit.get("rust_path"):
         return _refusal(f"unit {args.unit!r} has no rust_path — nothing to "
                         f"switch to yet", args.human, unit=args.unit)
-    python_import = args.python_import or module_name_of(unit["python_path"])
-    rust_import = args.rust_import or _module_from_rust_path(unit["rust_path"])
+    # python side: both spellings of a src//lib layout, like the adapters
+    # (issue #26); an explicit --python-import overrides (comma-separated
+    # candidates allowed, tried in order) — issue #53
+    if args.python_import:
+        python_imports = [c.strip() for c in args.python_import.split(",")
+                          if c.strip()]
+    else:
+        python_imports = import_candidates_of(unit["python_path"])
+    if not python_imports:
+        return _refusal(f"no python import name for unit {args.unit!r} "
+                        f"(python_path {unit['python_path']!r} and any "
+                        f"--python-import given both yield none) — pass "
+                        f"--python-import <module[,module...]>", args.human,
+                        unit=args.unit)
+    # rust side: flat wheel (one extension module for every unit) when
+    # names are in play, else the per-unit module derived from rust_path.
+    # Names come from --names or the unit's schema-recorded rust_names —
+    # the same list the reviewer's API-freeze check audits (issue #53).
+    names = _split_name_list(args.names) or list(unit.get("rust_names") or [])
+    flat = bool(args.flat or names)
+    if flat and not names:
+        return _refusal(
+            f"--flat needs this unit's public names: --names <n1,n2,...> "
+            f"or units[{unit['id']}].rust_names in the state file (the "
+            f"schema-recorded source of truth, issue #53)",
+            args.human, unit=args.unit)
+    if flat and not (args.rust_import or unit.get("rust_module")):
+        return _refusal(
+            f"flat wheel mode needs the wheel's module name: --rust-import "
+            f"<module> or units[{unit['id']}].rust_module in the state file "
+            f"(issue #53)", args.human, unit=args.unit)
+    rust_import = (args.rust_import or unit.get("rust_module")
+                   or _module_from_rust_path(unit["rust_path"]))
     env_var = fallback_env_var(state, args.env_prefix)
-    code = SHIM_TEMPLATE.format(
+    python_imports_comment = "\n".join(
+        f"    -> {c}" for c in python_imports)
+    template = SHIM_FLAT_TEMPLATE if flat else SHIM_TEMPLATE
+    code = template.format(
         unit=unit["id"], python_path=unit["python_path"], rust_path=unit["rust_path"],
         status=unit.get("status", "pending"), env_var=env_var,
-        python_import=python_import, rust_import=rust_import)
+        python_imports=python_imports, rust_import=rust_import,
+        python_imports_comment=python_imports_comment,
+        names=names, names_hint="::".join(names[:2]) + ("..." if len(names) > 2 else ""))
     default_side = ("rust" if unit.get("status") in RUST_LIVE_STATUSES else "python")
     written = None
     if args.write:
@@ -1046,13 +1213,17 @@ def cmd_shim(args) -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(code, encoding="utf-8")
         written = str(target)
-    human = (f"shim for {unit['id']}: default side={default_side}, "
-             f"flip via {env_var}=<{'all' if default_side == 'rust' else 'none'}|{unit['id']}|...>"
+    human = (f"shim for {unit['id']}: default side={default_side}"
+             + (f" [flat: re-exports {len(names)} name(s) from {rust_import}]"
+                if flat else "")
+             + f", flip via {env_var}=<{'all' if default_side == 'rust' else 'none'}|{unit['id']}|...>"
              + (f", written to {written}" if written else ""))
     emit({"tool": TOOL, "version": VERSION, "unit": unit["id"],
           "status": unit.get("status"), "default_side": default_side,
-          "env_var": env_var, "python_import": python_import,
-          "rust_import": rust_import, "code": code, "written_to": written,
+          "env_var": env_var, "python_imports": python_imports,
+          "python_import": python_imports[0], "rust_import": rust_import,
+          "flat": flat, "names": names,
+          "code": code, "written_to": written,
           "summary": {"exit_code": EXIT_OK, "human": human}}, human_flag=args.human)
     return EXIT_OK
 
@@ -1219,8 +1390,23 @@ def main(argv=None) -> int:
     p = sub.add_parser("shim", help="emit the per-unit fallback switch shim")
     p.add_argument("file")
     p.add_argument("--unit", required=True)
-    p.add_argument("--python-import", help="override the derived python module")
-    p.add_argument("--rust-import", help="override the derived rust module")
+    p.add_argument("--python-import",
+                   help="override the derived python module(s); comma-separated "
+                        "candidates are tried in order (default: BOTH "
+                        "spellings of a src//lib layout, issue #26/#53)")
+    p.add_argument("--rust-import",
+                   help="override the derived rust module (default: "
+                        "units[].rust_module, else derived from rust_path)")
+    p.add_argument("--names", action="append",
+                   help="the unit's public names a flat-wheel shim re-exports "
+                        "(repeatable / comma-separated; default: "
+                        "units[].rust_names — the API-freeze source of "
+                        "truth, issue #53)")
+    p.add_argument("--flat", action="store_true",
+                   help="flat PyO3 wheel mode: --rust-import names the ONE "
+                        "extension module exposing every unit's functions "
+                        "flat; the shim re-exports the unit's names from "
+                        "the live side (implied when names are known)")
     p.add_argument("--env-prefix", help="override the env-var prefix (default: project name)")
     p.add_argument("--write", help="also write the shim to this path")
     p.set_defaults(func=cmd_shim)
