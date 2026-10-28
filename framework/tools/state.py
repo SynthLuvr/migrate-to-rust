@@ -16,7 +16,11 @@ Subcommands
              ``units[u-parse-1].status``, ``human_gates[gate=unit_escalation].state``
              (the exact field vocabulary the journal already uses); a leading
              ``@json:`` types one field as strict JSON so plain and JSON
-             fields mix in a single invocation (issue #35); every
+             fields mix in a single invocation (issue #35); the prefix also
+             works directly on the value (``path=@json:[...]``) and never
+             silently degrades to a string (issue #52); ``human_gates`` may
+             only be set wholesale while empty — after that gate history
+             only grows through resolve-gate/mark (issue #52); every
              changed field appends one journal entry; atomic write; invalid
              results roll back
   mark       status transitions with the MIGRATION_PROMPT.md discipline
@@ -531,11 +535,20 @@ def get_field(state: dict, path: str):
 
 def set_field(state: dict, path: str, value) -> bool:
     """Set one dotted field in-place. Returns True if the value changed.
-    `journal` itself is append-only and rejected here. Indexed segments
-    (units[u-1], human_gates[gate=g]) SELECT; the leaf key must be addressed
-    one level deeper, e.g. units[u-1].status."""
+    `journal` is append-only and rejected here, and so is a non-empty
+    `human_gates` — gate history grows through resolve-gate/mark, an empty
+    array may still be seeded wholesale (issue #52). Indexed segments
+    (units[u-1], human_gates[gate=g]) select; the leaf key must be
+    addressed one level deeper, e.g. units[u-1].status."""
     if _split_path(path)[0] == "journal":
         raise ValueError("journal[] is append-only — transitions go through set/mark")
+    if path == "human_gates" and state.get("human_gates"):
+        raise ValueError(
+            "human_gates is append-only once it has entries — replacing the "
+            "array would clobber gate history (issue #52); open/resolve "
+            "gates through resolve-gate --create / mark / pipeline "
+            "resolve-gates, or edit one record's fields via "
+            "human_gates[gate=<name>].<leaf>")
     node, key, index = _resolve_container(state, _split_path(path), create=True)
     if index is not None:
         raise ValueError(
@@ -697,24 +710,62 @@ def _refusal(reason: str, human_flag: bool, **extra) -> int:
     return EXIT_FINDINGS
 
 
+def _split_pair(spec: str) -> tuple[str, str] | None:
+    """Split 'path=value' on the first '=' outside [...] selectors, so gate
+    selectors survive: human_gates[gate=go_no_go].state=approved. Returns
+    None when the pair has no top-level '=' at all."""
+    depth = 0
+    for i, ch in enumerate(spec):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth = max(0, depth - 1)
+        elif ch == "=" and depth == 0:
+            return spec[:i], spec[i + 1:]
+    return None
+
+
+def _parse_pair(pair: str, strict_all: bool) -> tuple[str | None, object, str | None]:
+    """Decode one --field pair into (field, value, refusal); refusal is
+    None when the pair decoded fine.
+
+    '@json:' at the front of the pair types its value as strict JSON
+    (issue #35); on the value itself it is honored too — unambiguous
+    intent must not silently degrade to a string that later fails schema
+    validation with a confusing type error (issue #52). Plain pairs
+    decode JSON leniently (numbers, true/false, null, ...) and fall back
+    to the raw string unless strict_all (--json-value) makes the whole
+    invocation strict."""
+    strict = pair.startswith(JSON_FIELD_PREFIX)
+    spec = pair.removeprefix(JSON_FIELD_PREFIX)
+    split = _split_pair(spec)
+    if split is None:
+        return None, None, f"--field expects path=value, got {pair!r}"
+    field, raw = split
+    field = field.strip()
+    value_prefix = not strict and raw.startswith(JSON_FIELD_PREFIX)
+    if value_prefix:
+        raw = raw.removeprefix(JSON_FIELD_PREFIX)
+    try:
+        return field, json.loads(raw), None
+    except json.JSONDecodeError as e:
+        if not (strict or value_prefix or strict_all):
+            return field, raw, None
+        hint = (" — the '@json:' prefix types one value as strict "
+                "JSON; put it at the front of the pair "
+                "('@json:path=value') or quote the payload"
+                if value_prefix else "")
+        return field, None, f"--field {field}: value is not valid JSON: {e}{hint}"
+
+
 def cmd_set(args) -> int:
     path = Path(args.file)
     state = _load(path)
     changes = []
     for pair in args.field:
-        strict_json = pair.startswith(JSON_FIELD_PREFIX)
-        spec = pair.removeprefix(JSON_FIELD_PREFIX)
-        if "=" not in spec:
-            return _refusal(f"--field expects path=value, got {pair!r}", args.human)
-        field, raw = spec.split("=", 1)
-        field = field.strip()
-        try:
-            value = json.loads(raw)  # numbers, true/false, null, lists...
-        except json.JSONDecodeError as e:
-            if strict_json or args.json_value:
-                return _refusal(f"--field {field}: value is not valid JSON: {e}",
-                                args.human)
-            value = raw  # fall back to raw string
+        field, value, refusal = _parse_pair(pair, args.json_value)
+        if refusal:
+            return _refusal(refusal, args.human)
         try:
             old = get_field(state, field)
         except (KeyError, TypeError, ValueError):
@@ -1133,7 +1184,8 @@ def main(argv=None) -> int:
     p.add_argument("--field", action="append", required=True,
                    help="dotted path=value, e.g. units[u-1].status=ported "
                         "(repeatable); a leading '@json:' types that one "
-                        "value as strict JSON")
+                        "value as strict JSON (also accepted directly on "
+                        "the value: path=@json:[...])")
     p.add_argument("--actor", default="orchestrator")
     p.add_argument("--json-value", action="store_true",
                    help="treat every value as strict JSON (error on "
