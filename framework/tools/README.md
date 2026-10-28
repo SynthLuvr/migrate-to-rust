@@ -508,7 +508,13 @@ Design decisions worth knowing before you extend:
 - **state.py** journals every transition into the state file's own
   `journal[]` (append-only; `set`/`mark` refuse to touch it), writes
   atomically (tmp + rename), and *rolls back* any change that would leave
-  the file schema-invalid or coherence-broken. `mark` encodes the
+  the file schema-invalid or coherence-broken. `set`'s `@json:` prefix
+  types one `--field` value as strict JSON and is honored at the front of
+  the pair *or* directly on the value (`path=@json:[...]`) — a misplaced
+  prefix never silently falls back to a plain string (issue #52); the
+  `human_gates` array may only be set wholesale while empty, after that
+  gate history grows solely through `resolve-gate`/`mark` (issue #52).
+  `mark` encodes the
   MIGRATION_PROMPT.md discipline as hard guards: `ported` requires an
   equivalent verdict, `escalated` opens the `unit_escalation` gate — and at
   autonomy L2+ immediately resolves it as deferred via policy rule ESC-1
