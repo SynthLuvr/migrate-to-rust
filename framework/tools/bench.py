@@ -18,9 +18,10 @@ Manifest (JSON):
      "normalization": {}}                        # oracle rules (optional)
 
 Entries are python callables (module:function, default fn name ``run``) fed
-one JSON value per corpus line — the same protocol oracle.py uses. Parity
-runs through the oracle comparator (imported, not duplicated), so "faster"
-can never mean "wronger": divergent outputs abort the benchmark.
+one raw JSON value per corpus line — the same corpus format oracle.py uses
+(pre-wrapped lines are refused; issue #29). Parity runs through the oracle
+comparator (imported, not duplicated), so "faster" can never mean
+"wronger": divergent outputs abort the benchmark.
 
 Timing model: per side, `warmup` untimed passes, then `repeats` timed
 full-corpus passes (perf_counter_ns). Statistics: median/mean/min/max; the
@@ -44,10 +45,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, ToolError, emit, python_version_string,
-    read_json, read_jsonl, run_child, run_cli, sha256_bytes, sha256_file,
+    read_json, run_child, run_cli, sha256_bytes, sha256_file,
 )
 from oracle import (  # noqa: E402
-    RUNNER_SRC, _execute_entry_subprocess, classify_pair, merge_rules,
+    RUNNER_SRC, _execute_entry_subprocess, _load_corpus,
+    classify_pair, merge_rules,
 )
 
 TOOL = "bench.py"
@@ -167,10 +169,7 @@ def cmd_run(args) -> int:
     corpus_path = Path(manifest["corpus"])
     if not corpus_path.is_absolute():
         corpus_path = manifest_path.parent / corpus_path
-    rows = read_jsonl(corpus_path)
-    inputs = [v for _, v in rows]
-    if not inputs:
-        raise ToolError(f"corpus {corpus_path} is empty", kind="usage")
+    inputs = _load_corpus(corpus_path)
 
     try:
         corpus_info, warnings = corpus_commit_info(corpus_path, args.allow_dirty)

@@ -103,6 +103,8 @@ Quick reference (see each script's docstring for the full input formats):
 python framework/tools/oracle.py judge --manifest manifests/u-parse-1.json
 python framework/tools/oracle.py compare --runs shadow-runs.json   # Stage 6
 python framework/tools/oracle.py self-test   # Stage 2 gate: must catch 5/5
+# per-row corpus dry-run before a judge run (issue #29)
+python framework/tools/oracle.py corpus --validate corpus.jsonl --entry impl:run
 
 # #4 the only writer of the state file
 python framework/tools/state.py init state/migration-state.json --name X --python-path src/x --autonomy-level L2
@@ -130,15 +132,31 @@ python framework/tools/attribution.py check --original ../orig --port . --state 
 python framework/tools/upstream_watch.py watch --state state.json --repo ../upstream --base v1.2
 ```
 
+**Corpus file format (#1 `oracle.py`, #5 `bench.py`)** — JSONL, **one raw
+JSON value per line = one input**, exactly as the entry function receives
+it (verbatim from the acceptance test `test_judge_subprocess_end_to_end`):
+
+    {"xs": [1, 2], "bad": false}
+    {"xs": [], "bad": true}
+
+`{"i": n, "input": v}` is *internal stdin framing* `oracle.py` adds itself
+when streaming a corpus to a child process — it is **never** the corpus
+file format. Pre-wrapped lines double-wrap, both sides raise the same
+TypeError on every run, and the judge reports a hollow all-EQUIVALENT
+verdict, so `_load_corpus` refuses a corpus in which every line carries
+exactly the framing keys (issue #29). `oracle.py corpus --validate`
+dry-runs one entry per-row (ok / error / unserializable) and flags the
+hollow signature (`hollow_equivalent_risk`) before you spend a judge run.
+
 Design decisions worth knowing before you extend:
 
 - **oracle.py** runs both sides as Python callables (`module:function`,
   default fn `run`) — the Rust side ships as a PyO3 wheel with the API
-  frozen, so the wheel *is* the entry point. Inputs stream over stdin as
-  JSONL `{"i": n, "input": v}`; outputs must be JSON-serializable or the
-  run is honestly *Incomparable* (sets need a canonical adapter). The
-  normalization rules (float tolerances, int/float distinctness, dict-order
-  insensitivity, NFC, error type/message policy, `strip_fields`) are
+  frozen, so the wheel *is* the entry point. Outputs must be
+  JSON-serializable or the run is honestly *Incomparable*
+  (sets need a canonical adapter). The normalization rules (float
+  tolerances, int/float distinctness, dict-order insensitivity, NFC, error
+  type/message policy, `strip_fields`) are
   documented in `oracle.py rules` output — Stage 2 requires them written
   down, and `int_float_distinct=true` is deliberate: silent coercion is a
   divergence, not a normalization. `self-test` injects the 5 canonical bug
