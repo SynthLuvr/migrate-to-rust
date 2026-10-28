@@ -10,6 +10,13 @@ Module conformance (issue #48) is the default: one manifest judges the
 unit's WHOLE public API through a {fn: result | __error__} envelope —
 a first-public-only verdict must not green-light a unit whose other
 functions diverge.
+
+Realistic series (issue #49): list parameters draw 60-320 element
+random-walk rows (coherent OHLCV bars) instead of edge-dominated 0-9
+element lists, shapes the generator cannot inhabit realistically are
+hand-tune findings, and a dry-run reference-ok fraction below
+min_reference_ok_fraction gates the run (exit 2), never a warned-through
+exit 0.
 """
 
 from __future__ import annotations
@@ -347,6 +354,136 @@ def test_set_return_value_is_canonicalized_not_unserializable(monkeypatch, capsy
     assert out_json["verdict"] == "equivalent"
 
 
+# --------------------------------------------- realistic series (#49) ----
+
+ICHI_PY = ('"""ichimoku — needs 52+ bars; the issue #49 shape: the old\n'
+           '0-9 element lists errored on nearly every corpus row.\n'
+           "\n"
+           'Invariant: fewer than 52 bars raises ValueError\n"""\n'
+           "from dataclasses import dataclass\n"
+           "\n"
+           "\n"
+           "@dataclass\n"
+           "class Bar:\n"
+           "    open: float\n"
+           "    high: float\n"
+           "    low: float\n"
+           "    close: float\n"
+           "    volume: int\n"
+           "\n"
+           "\n"
+           "def ichimoku(bars: list[Bar], tenkan: int = 9, kijun: int = 26) -> dict:\n"
+           "    if len(bars) < 52:\n"
+           '        raise ValueError(f"needs 52+ bars, got {len(bars)}")\n'
+           "    t = min(max(tenkan, 1), len(bars))\n"
+           "    k = min(max(kijun, 1), len(bars))\n"
+           "    highs = [b.high for b in bars]\n"
+           "    lows = [b.low for b in bars]\n"
+           '    return {"tenkan": (max(highs[-t:]) + min(lows[-t:])) / 2,\n'
+           '            "kijun": (max(highs[-k:]) + min(lows[-k:])) / 2}\n')
+
+
+def test_min_length_series_functions_get_realistic_rows(monkeypatch, capsys, tmp_path):
+    """Issue #49's headline: list sizes drawn from 0-9 left min-length
+    series functions erroring on nearly every row (20%-ok corpora warned
+    through at exit 0). Series parameters must draw realistic 60-320
+    element random-walk rows — coherent OHLCV bars: high/low bracket the
+    bar, open chains to the previous close — so the reference actually
+    computes on most rows, with short lengths kept as deliberate error
+    coverage."""
+    proj, state = _project(tmp_path, name="ichi", unit="u-ichi",
+                           module="ichimoku", body=ICHI_PY)
+    out = tmp_path / "runs"
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, out, rows=24)
+    assert code == 0, payload["summary"]["human"]
+    unit = payload["units"][0]
+
+    rows = [json.loads(line)
+            for line in (out / "corpora/corpus-u-ichi.jsonl").read_text().splitlines()]
+    bars = [r["bars"] for r in rows if "bars" in r]
+    long_rows = [b for b in bars if len(b) >= 60]
+    short_rows = [b for b in bars if len(b) < 10]
+    assert len(long_rows) >= 12, "realistic series lengths must dominate"
+    assert short_rows, "short lengths stay as deliberate error rows"
+    for b in long_rows:  # intra-row relationships hold by construction
+        for bar in b:
+            assert bar["high"] >= max(bar["open"], bar["close"])
+            assert 0 < bar["low"] <= min(bar["open"], bar["close"])
+    for b in long_rows:  # and the walk is coherent bar-to-bar
+        assert all(b[i + 1]["open"] == b[i]["close"] for i in range(len(b) - 1))
+
+    # the unit is exercised, not merely warned about: ichimoku computes on
+    # the realistic rows (it errors on every short one — the error path)
+    stats = unit["corpus_dry_run"]["functions"]["ichimoku"]
+    assert stats["ok"] >= len(long_rows) - 1  # every realistic row computes
+    assert stats["error"] >= len(short_rows)  # short rows are its error path
+    assert not any("thin ground truth" in w for w in payload["warnings"])
+
+
+def test_thin_ground_truth_is_a_finding_not_a_warned_exit0(
+        monkeypatch, capsys, tmp_path):
+    """Issue #49's gate: when the dry-run reference-ok fraction is below
+    min_reference_ok_fraction, the scaffold must exit 2 with a finding —
+    the same class of problem as params the heuristic cannot express (the
+    hand-tune contract), never a warned-through exit 0 that judges on the
+    few surviving rows. Function mode: the single entry's own raises fail
+    the row (module mode's envelope would mask the fraction)."""
+    body = ('def only_empty(s: str) -> int:\n'
+            '    """Invariant: non-empty s raises — the generator can only\n'
+            '    rarely satisfy it, so the corpus is thin but not hollow\n'
+            '    (distinct from the degenerate all-error case, issue #30)."""\n'
+            '    if s != "":\n'
+            '        raise ValueError("needs empty")\n'
+            "    return 0\n")
+    proj, state = _project(tmp_path, name="thin", unit="u-thin",
+                           module="thin", body=body)
+    out = tmp_path / "runs"
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, out,
+                              "--mode", "function")
+    assert code == 2, "a corpus that cannot exercise the unit is a finding"
+    unit = payload["units"][0]
+    dry = unit["corpus_dry_run"]
+    assert dry["reference_ok_fraction"] == dry["reference_ok_fraction"]  # not None
+    assert 0 < dry["reference_ok"] and dry["reference_ok_fraction"] < 0.5
+    assert dry["degenerate"] is False  # not the issue #30 case
+    finding = next(f for f in payload["findings"]
+                   if f["kind"] == "thin_ground_truth")
+    assert finding["unit"] == "u-thin"
+    assert "min_reference_ok_fraction" in finding["detail"]
+    # the diagnostic text stays as a warning too — the finding gates, the
+    # warning explains
+    assert any("thin ground truth" in w for w in payload["warnings"])
+
+
+def test_unrealistic_item_shapes_are_flagged_for_hand_completion(
+        monkeypatch, capsys, tmp_path):
+    """Issue #49's fallback: a list whose items the heuristic cannot
+    inhabit (a non-dataclass class) cannot get realistic rows — flag it
+    hand_tune[] exactly like an unexpressible top-level type and exit 2;
+    never silently emit lists of JSON-any stand-ins that error on every
+    row."""
+    body = ("class Frame:  # a real class, but NOT a @dataclass — no\n"
+            "    pass      # mechanical JSON constructor exists\n"
+            "\n"
+            "\n"
+            "def total(items: list[Frame]) -> int:\n"
+            "    return len(items)\n")
+    proj, state = _project(tmp_path, name="uf", unit="u-frames", module="frames",
+                           body=body)
+    out = tmp_path / "runs"
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, out)
+    assert code == 2, "infeasible realistic generation is a finding"
+    unit = payload["units"][0]
+    flag = next(f for f in unit["hand_tune"]
+                if f["where"].endswith("param items[item]"))
+    assert "issue #49" in flag["reason"]
+    assert any(f["kind"] == "hand_tune" for f in payload["findings"])
+    ref = (out / "adapters/u_frames_ref.py").read_text()
+    cand = (out / "adapters/u_frames_cand.py").read_text()
+    assert "param items[item]" in ref and "param items[item]" in cand
+    assert unit["adapters"]["symmetric"] is True
+
+
 # --------------------------------------------- module conformance (#48) ---
 
 IND_PY = ('"""indicators — several public series functions sharing a domain\n'
@@ -450,7 +587,15 @@ def test_module_mode_catches_sibling_divergence_first_public_misses(
     code, payload = _scaffold(monkeypatch, capsys, state, proj, out2,
                               "--mode", "function",
                               "--candidate-module", "ind.indicators_rust")
-    assert code == 0
+    # issue #49: this corpus is thin — sma_series only survives on the rows
+    # where the drawn `period` int lands in its documented 1..64 — so the
+    # scaffold no longer green-lights it (a warned-through exit 0 is the
+    # gap the issue describes). Exit 2 is a finding, not a refusal: the
+    # artifacts exist and still judge, as below.
+    assert code == 2
+    thin = next(f for f in payload["findings"] if f["kind"] == "thin_ground_truth")
+    assert thin["unit"] == "u-ind" and "min_reference_ok_fraction" in thin["detail"]
+    assert payload["units"][0]["corpus_dry_run"]["reference_ok_fraction"] < 0.5
     assert payload["units"][0]["function"] == "sma_series"
     assert payload["units"][0]["function_source"] == "first-public"
     code, legacy = run_tool(monkeypatch, capsys, "oracle.py", [
