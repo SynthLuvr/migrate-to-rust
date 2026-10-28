@@ -94,6 +94,27 @@ Symmetry is by construction: both adapters are rendered from one template
 and differ ONLY inside the delimited BACKEND section; the payload records
 the sha256 of the shared remainder as evidence (identical on both sides).
 
+Derived inputs from dependency modules (issue #50): a parameter typed by a
+dataclass the unit module does not define — ``list[Bar]`` where ``Bar``
+comes from the unit's ``u-bars`` dependency — is recorded as a derived
+input (``derived_inputs[]`` in the payload and the manifest's scaffold
+block: name, module, path, the declared ``deps[]`` unit it maps to, the
+params that use it) and resolved on EACH SIDE'S OWN dependency modules:
+the reference adapter imports the python dependency module the spec
+records (the unit's imports — the unit need not re-export anything), the
+candidate adapter resolves the WHEEL'S OWN class — a flat wheel re-exports
+its dependencies in the wheel module itself; a split wheel gets its
+spellings hand-tuned into the candidate-only ``_WHEEL_DEP_MODULES`` table
+— never the python project, which pre-#50 adapters silently did (the
+wheel was fed reference-built objects: an asymmetric adapter, exactly
+what the symmetry design exists to prevent, and it surfaced only as an
+oracle divergence). Both adapters resolve every derived input at IMPORT
+time, so a side missing a class is an honest setup error naming it —
+never silent ``[]`` nor per-row noise masquerading as divergence; a
+dependency module that is neither the unit's own nor in its recorded
+``deps[]`` is called out in the warnings (the Stage-1 record may be
+stale, or the module is shared/unported).
+
 Self-check before reporting success: the freshly generated corpus is
 dry-run against the reference adapter through oracle.py's own subprocess
 runner, so a corpus that would judge hollow (all-error reference — issue
@@ -126,7 +147,7 @@ from _common import (  # noqa: E402
 from contract_extract import _find_source  # noqa: E402  — same-dir composition
 
 TOOL = "scaffold.py"
-VERSION = 3
+VERSION = 4
 DEFAULT_SEED = 20261028
 DEFAULT_RANDOM_ROWS = 96
 DRY_RUN_TIMEOUT = 120.0
@@ -694,8 +715,35 @@ def _resolve_module(rel_path: str, dotted: str):
         return mod
 
 
-def _dc_class(spec):
-    return getattr(_resolve_module(spec["path"], spec["module"]), spec["name"])
+def _walk_dc_specs(spec, out, seen):
+    """Collect the dataclass specs nested in a spec (dataclass fields
+    recurse), deduped by defining module+name (issue #50)."""
+    if not isinstance(spec, dict):
+        return
+    if spec.get("kind") == "dataclass":
+        key = (spec.get("module"), spec.get("name"))
+        if key not in seen:
+            seen.add(key)
+            out.append(spec)
+    for k in ("item", "key", "value"):
+        _walk_dc_specs(spec.get(k), out, seen)
+    for it in spec.get("items") or []:
+        _walk_dc_specs(it, out, seen)
+    for f in spec.get("fields") or []:
+        _walk_dc_specs(f.get("spec"), out, seen)
+
+
+def _precheck_dc_classes(specs):
+    """Resolve every dataclass the judged parameters need, on THIS side,
+    at import time (issue #50): a dependency class this side cannot
+    resolve becomes a setup error oracle.py reports honestly (exit 4),
+    not per-row error noise masquerading as divergence. _dc_class is per
+    side — see the BACKEND section."""
+    found, seen = [], set()
+    for spec in specs:
+        _walk_dc_specs(spec, found, seen)
+    for spec in found:
+        _dc_class(spec)
 
 
 def _require_exports(mod, names, owner, remedy):
@@ -976,11 +1024,13 @@ RUN_DEF_MODULE = '''def run(row):
 
 LOAD_CALL_FUNCTION = '''FN = _load_function()  # a failure here is a setup error for this side —
                        # oracle.py reports it honestly (exit 4) instead of
-                       # judging half an adapter'''
+                       # judging half an adapter
+_precheck_dc_classes(PARAM_SPECS.values())  # derived inputs (issue #50)'''
 
 LOAD_CALL_MODULE = '''FNS = _load_functions()  # a failure here is a setup error for this side —
                          # oracle.py reports it honestly (exit 4) instead of
-                         # judging half an adapter'''
+                         # judging half an adapter
+_precheck_dc_classes([info["spec"] for info in UNION_SPECS.values()])  # issue #50'''
 
 # The BACKEND sections are composed per side: each side's constants and
 # import dance (_load_module) are shared between function and module mode;
@@ -1034,6 +1084,55 @@ def _load_module():
         return importlib.import_module(CANDIDATE_MODULE)
 '''
 
+REF_DC = '''
+
+def _dc_class(spec):
+    """Reference side: a derived-input dataclass (issue #50) resolves to
+    the python dependency module the spec records (the unit's imports —
+    the unit need not re-export its dependency's types), never the unit
+    under test's namespace."""
+    mod = _resolve_module(spec["path"], spec["module"])
+    try:
+        return getattr(mod, spec["name"])
+    except AttributeError as e:
+        raise ImportError(f"reference dependency module {spec['module']!r} "
+                          f"exposes no dataclass {spec['name']!r} — the unit's "
+                          "signature imports it (issue #50)") from e
+'''
+
+CAND_DC = '''
+
+# Split-wheel spellings that may define the unit's dependency types —
+# HAND-TUNE only when the wheel is NOT flat (issue #50).@@DEP_NOTE@@
+_WHEEL_DEP_MODULES = @@WHEEL_DEP_MODULES@@
+
+
+def _dc_class(spec):
+    """Candidate side: a derived-input dataclass (issue #50) must be the
+    WHEEL'S OWN class, never the python project's — pre-#50 adapters
+    resolved the python module on both sides, so the wheel was fed
+    reference-built objects: an asymmetric adapter, exactly what the
+    symmetry design exists to prevent. A flat wheel re-exports its
+    dependencies in the wheel module itself (first lookup); a split
+    wheel lists the defining spellings in _WHEEL_DEP_MODULES above."""
+    cls = getattr(_load_module(), spec["name"], None)
+    if isinstance(cls, type):
+        return cls
+    for dotted in _WHEEL_DEP_MODULES:
+        try:
+            mod = importlib.import_module(dotted)
+        except ImportError:
+            continue
+        cls = getattr(mod, spec["name"], None)
+        if isinstance(cls, type):
+            return cls
+    raise ImportError(
+        f"candidate wheel {CANDIDATE_MODULE!r} exposes no {spec['name']!r} and "
+        "no _WHEEL_DEP_MODULES spelling defines it — the port must export the "
+        "dependency types the unit consumes (a flat wheel re-exports them) or "
+        "the spelling must be hand-tuned (issue #50)")
+'''
+
 REF_FUNCTION_TAIL = '''
 
 def _load_function():
@@ -1073,10 +1172,10 @@ def _load_functions():
                             "public API (issue #48)")
 '''
 
-REF_BACKEND = REF_HEADER + REF_IMPORT + REF_FUNCTION_TAIL
-CAND_BACKEND = CAND_HEADER + CAND_IMPORT + CAND_FUNCTION_TAIL
-REF_MODULE_BACKEND = REF_HEADER + REF_IMPORT + REF_MODULE_TAIL
-CAND_MODULE_BACKEND = CAND_HEADER + CAND_IMPORT + CAND_MODULE_TAIL
+REF_BACKEND = REF_HEADER + REF_IMPORT + REF_DC + REF_FUNCTION_TAIL
+CAND_BACKEND = CAND_HEADER + CAND_IMPORT + CAND_DC + CAND_FUNCTION_TAIL
+REF_MODULE_BACKEND = REF_HEADER + REF_IMPORT + REF_DC + REF_MODULE_TAIL
+CAND_MODULE_BACKEND = CAND_HEADER + CAND_IMPORT + CAND_DC + CAND_MODULE_TAIL
 
 GENERATOR_TEMPLATE = '''#!/usr/bin/env python3
 """gen_@@STEM@@.py — seeded corpus generator for unit @@UNIT@@ (issue #32).
@@ -1421,6 +1520,21 @@ def _hand_tune_block(items: list[dict]) -> str:
     return "\n" + "\n".join(f"  - {it['where']}: {it['reason']}" for it in items)
 
 
+def _wheel_dep_note(derived: list[dict]) -> str:
+    """The comment above _WHEEL_DEP_MODULES in the candidate adapter: the
+    unit's dependency dataclasses in their python spellings, as recorded
+    at scaffold time (the wheel's own spellings are unknown until it
+    exists)."""
+    if not derived:
+        return "\n# No dependency dataclasses recorded for this unit."
+    listed = ", ".join(
+        f"{d['name']} ({d['module']})"
+        + (f", declared dep {d['dep']}" if d["dep"] else ", UNDECLARED")
+        for d in derived)
+    return ("\n# Dependency dataclasses for this unit (python spellings, "
+            f"recorded at scaffold time): {listed}")
+
+
 def _render_adapter(*, side: str, plan: dict, unit: str, root: Path,
                     module_candidates: list[str], unit_path: str,
                     candidate_module: str | None) -> str:
@@ -1463,9 +1577,15 @@ def _render_adapter(*, side: str, plan: dict, unit: str, root: Path,
                    .replace("@@MODULE_CANDIDATES@@", repr(module_candidates))
                    .replace("@@UNIT_PATH_REPR@@", repr(unit_path)))
     else:
+        # the wheel layout is unknown at Stage 2 (issue #50): a flat wheel
+        # re-exports its dependencies in the wheel module itself; a split
+        # wheel hand-tunes its spellings into _WHEEL_DEP_MODULES
         backend = (backends[1]
                    .replace("@@CANDIDATE_MODULE@@", repr(candidate_module))
-                   .replace("@@ROOT_REPR@@", repr(str(root))))
+                   .replace("@@ROOT_REPR@@", repr(str(root)))
+                   .replace("@@WHEEL_DEP_MODULES@@", "[]")
+                   .replace("@@DEP_NOTE@@",
+                            _wheel_dep_note(plan.get("derived_inputs") or [])))
     if plan["mode"] == "function":
         backend = backend.replace("@@FUNCTION_REPR@@", repr(plan["function"]))
     return _fill_template(ADAPTER_TEMPLATE, {
@@ -1546,6 +1666,26 @@ def _load_contract(path: str, unit_id: str, warnings: list[str]) -> dict | None:
     return read_json(p)
 
 
+def _walk_spec(spec: dict, path: str = ""):
+    """Yield (path, spec) for every node of a generation/rebuild spec,
+    depth-first — ``bars[item]``, ``x.field``, ``d[key]``, ``u[i]``."""
+    yield path, spec
+    k = spec["kind"]
+    if k == "dataclass":
+        for f in spec["fields"]:
+            yield from _walk_spec(f["spec"], f"{path}.{f['name']}")
+    elif k in ("list", "set", "optional"):
+        yield from _walk_spec(spec["item"], f"{path}[item]")
+    elif k == "tuple" and spec.get("variadic"):
+        yield from _walk_spec(spec["item"], f"{path}[item]")
+    elif k in ("tuple", "union"):
+        for i, it in enumerate(spec["items"]):
+            yield from _walk_spec(it, f"{path}[{i}]")
+    elif k == "dict":
+        yield from _walk_spec(spec["key"], f"{path}[key]")
+        yield from _walk_spec(spec["value"], f"{path}[value]")
+
+
 def _infeasible_generation_paths(spec: dict) -> list[str]:
     """Paths at which an ``unknown`` kind sits *inside* a container or
     dataclass (``list[Frame]`` where Frame is not a @dataclass, an
@@ -1554,29 +1694,68 @@ def _infeasible_generation_paths(spec: dict) -> list[str]:
     infeasible — flagged for hand-completion like an unexpressible
     top-level type. A top-level ``unknown`` is flagged by the caller, so
     it is not re-walked here (one flag per cause, never duplicates)."""
-
-    def walk(s: dict, path: str) -> list[str]:
-        k = s["kind"]
-        if k == "unknown":
-            return [path]
-        if k in ("list", "set", "optional"):
-            return walk(s["item"], f"{path}[item]")
-        if k == "tuple" and s.get("variadic"):
-            return walk(s["item"], f"{path}[item]")
-        if k in ("tuple", "union"):
-            return [p for i, it in enumerate(s["items"])
-                    for p in walk(it, f"{path}[{i}]")]
-        if k == "dict":
-            return (walk(s["key"], f"{path}[key]")
-                    + walk(s["value"], f"{path}[value]"))
-        if k == "dataclass":
-            return [p for f in s["fields"]
-                    for p in walk(f["spec"], f"{path}.{f['name']}")]
-        return []  # JSON scalars / any / literal / none: generatable
-
     if spec["kind"] == "unknown":
         return []
-    return walk(spec, "")
+    return [p for p, s in _walk_spec(spec) if s["kind"] == "unknown"]
+
+
+def _dataclass_specs_of(spec: dict, path: str = "") -> list[tuple[str, dict]]:
+    """(param path, dataclass spec) for every dataclass in a spec, the
+    top level included (issue #50)."""
+    return [(p, s) for p, s in _walk_spec(spec, path) if s["kind"] == "dataclass"]
+
+
+def _derived_inputs(param_specs: dict, unit: dict, units_by_id: dict,
+                    uid: str, warnings: list[str]) -> list[dict]:
+    """The derived-input record (issue #50): every dataclass a judged
+    parameter needs that the unit module itself does not define — ``Bar``
+    in ``simple_moving_average(bars: list[Bar], ...)`` coming from the
+    unit's ``u-bars`` dependency. Each entry records the defining
+    module/path, the declared ``deps[]`` unit it maps to (None = an
+    undeclared dependency — the Stage-1 record may be stale, or the module
+    is shared/unported), and the parameter paths that use it."""
+    unit_modules = set(import_candidates_of(unit["python_path"]))
+    dep_modules: dict[str, str] = {}  # dependency module name -> unit id
+    for dep_id in unit.get("deps") or []:
+        dep = units_by_id.get(dep_id)
+        if dep is None:
+            warnings.append(f"unit {uid}: deps[] names {dep_id!r}, which is not "
+                            "a unit in the state file — the Stage-1 record is stale")
+            continue
+        for name in import_candidates_of(dep["python_path"]):
+            dep_modules[name] = dep_id
+    found: dict[tuple[str, str], dict] = {}
+    for pname, info in param_specs.items():
+        for ppath, spec in _dataclass_specs_of(info["spec"], pname):
+            if spec["module"] in unit_modules:
+                continue  # defined by the unit itself, not a dependency
+            key = (spec["module"], spec["name"])
+            entry = found.setdefault(key, {
+                "name": spec["name"], "module": spec["module"],
+                "path": spec.get("path"),
+                "dep": dep_modules.get(spec["module"]),
+                "params": [],
+            })
+            entry["params"].append(ppath)
+    for entry in found.values():
+        entry["params"] = sorted(set(entry["params"]))
+    items = sorted(found.values(), key=lambda e: (e["module"], e["name"]))
+    if items:
+        detail = "; ".join(
+            f"{it['name']} from {it['module']}"
+            + (f" (declared dep {it['dep']})" if it["dep"]
+               else " (NOT a declared dep — deps[] may be stale, or the module "
+                    "is shared/unported)")
+            + f" for {', '.join(it['params'])}"
+            for it in items)
+        warnings.append(
+            f"unit {uid}: {len(items)} derived-input dataclass(es) (issue #50): "
+            f"{detail} — each adapter resolves them on ITS OWN side at import "
+            "time (reference: the python dependency module; candidate: the "
+            "wheel's own class — a flat wheel re-exports it, split wheels "
+            "hand-tune _WHEEL_DEP_MODULES in the candidate adapter); a side "
+            "that cannot resolve one is an honest setup error, never silent []")
+    return items
 
 
 def _param_specs(params: dict[str, dict], ctx: FileCtx) -> tuple[dict, list[dict]]:
@@ -1690,7 +1869,8 @@ def _analyze_module_mode(tree: ast.Module, ctx: FileCtx, args, uid: str,
 
 
 def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
-                   args, targets: set, warnings: list[str]) -> dict:
+                   args, targets: set, units_by_id: dict,
+                   warnings: list[str]) -> dict:
     uid = u["id"]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", uid):
         raise ToolError(f"unit id {uid!r} is not a safe file-name component — "
@@ -1705,6 +1885,8 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
         plan = _analyze_module_mode(tree, ctx, args, uid, warnings)
     else:
         plan = _analyze_function_mode(tree, ctx, src.stem, args, uid, warnings)
+    plan["derived_inputs"] = _derived_inputs(plan["param_specs"], u,
+                                             units_by_id, uid, warnings)
 
     contract = _load_contract(args.contract, uid, warnings) if args.contract else None
     invariants = sorted(set((contract or {}).get("invariants") or []))
@@ -1751,6 +1933,7 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
     scaffold_block = {"tool": TOOL, "version": VERSION, "seed": args.seed,
                       "mode": plan["mode"], "function_source": plan["function_source"],
                       "candidate_module": args.candidate_module,
+                      "derived_inputs": plan["derived_inputs"],
                       "adapters_shared_sha256": ref_sha}
     manifest = {
         "unit": uid,
@@ -1765,6 +1948,7 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
         "module": module_name_of(u["python_path"]),
         "mode": plan["mode"], "function_source": plan["function_source"],
         "parameters": plan["param_specs"], "hand_tune": plan["hand_tune"],
+        "derived_inputs": plan["derived_inputs"],
         "files": {k: str(p) for k, p in files.items()},
         "texts": texts, "manifest": manifest,
         "adapters": {"symmetric": ref_sha == cand_sha,
@@ -2001,7 +2185,9 @@ def cmd_scaffold(args) -> int:
     # analyze every unit first, then refuse-before-write: hand-tuned
     # scaffolds must not be half-overwritten
     targets: set = set()
-    results = [_scaffold_unit(u, root, project_root, out, args, targets, warnings)
+    units_by_id = {x["id"]: x for x in units}
+    results = [_scaffold_unit(u, root, project_root, out, args, targets,
+                              units_by_id, warnings)
                for u in selected]
     existing = sorted(str(p) for p in targets if p.exists())
     if existing and not args.force:

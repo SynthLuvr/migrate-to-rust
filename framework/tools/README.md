@@ -120,6 +120,25 @@ open/high/low/close dataclass items, walked floats/ints otherwise — with
 a short-length minority kept as deliberate error rows; the old 0–9
 element lists left min-length series functions erroring on nearly every
 row.
+**Derived inputs resolve per side (issue #50).** A parameter typed by a
+dataclass the unit module does not define — `list[Bar]` where `Bar` comes
+from the unit's `u-bars` dependency — is recorded as a derived input
+(`derived_inputs[]` in the payload and the manifest's scaffold block:
+name, module, path, the declared `deps[]` unit it maps to, the params
+that use it) and resolved on **each side's own dependency modules**: the
+reference adapter imports the python dependency module the spec records;
+the candidate adapter resolves the **wheel's own class** — a flat wheel
+re-exports its dependencies in the wheel module itself, a split wheel
+gets its spellings hand-tuned into the candidate-only
+`_WHEEL_DEP_MODULES` table — never the python project, which pre-#50
+adapters silently did (the wheel was fed reference-built objects: an
+asymmetric adapter, exactly what the symmetry design exists to prevent,
+and it surfaced only as an oracle divergence). Both adapters resolve
+every derived input at import time, so a side missing a class is an
+honest setup error naming it — never silent `[]` nor per-row noise
+masquerading as divergence; a dependency module that is neither the
+unit's own nor in its recorded `deps[]` is called out in the warnings
+(the Stage-1 record may be stale, or the module is shared/unported).
 Before reporting success the scaffold also dry-runs its own fresh corpus
 against the reference adapter through `oracle.py`'s runner, so a corpus
 that would judge hollow (degenerate — issue #30), **thin** (reference ok
