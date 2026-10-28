@@ -19,7 +19,7 @@ acceptance-test suite in `tests/` wired into CI. Shared plumbing lives in
 | 3 | `contract_extract.py` | 2 | pytest collection + mypy JSON → per-unit `contract.json` (tests, types, invariants) | 100% of scoped units covered; dangling tests flagged |
 | 4 | `state.py` — dual-build state manager | 1–7 | validates/migrates `migration-state.json`; emits per-unit fallback switch shim (src-layout spellings + flat-wheel re-export, issue #53) | every state transition journaled (append to the state file's `journal[]`, per `../state/migration-state.schema.json`); Python fallback callable per unit |
 | 5 | `bench.py` — cross-language differential benchmark | 0,5 | matched corpus + both entry points → one verdict JSON + repro script + corpus commit | same inputs/coverage both sides; no number without repro |
-| 6 | `pyo3_review.py` — FFI linter | 4,5 | Rust diff → findings on refcounts, swallowed `PyErr`, `unwrap()` in exports, GIL `detach` misuse, free-threading hazards | complements miri/clippy (they don't cover these classes); reviewer checklist encoded |
+| 6 | `pyo3_review.py` — FFI linter | 4,5 | Rust diff → findings on refcounts, swallowed `PyErr`, `unwrap()` in exports, GIL `detach` misuse, free-threading hazards, Option-arg None-conflation | complements miri/clippy (they don't cover these classes); reviewer checklist encoded |
 | 7 | `attribution.py` — attribution checker | 4,5 | original tree + port tree → header/NOTICE diff report, fail on loss | byte-exact NOTICE check; provenance comment required per generated file |
 | 8 | `upstream_watch.py` — maintenance watcher | 7 | upstream diff → changed-units list → parity re-run plan → PR proposal | maps changes to state-file units; no silent skips |
 
@@ -590,7 +590,13 @@ Design decisions worth knowing before you extend:
   with a comment/string/lifetime-aware lexer, so exported-function rules
   apply to real bodies; diff mode applies line rules to added lines with
   `context: diff` (re-run file mode before recording a verdict). Findings
-  cite the reviewer-checklist item they encode.
+  cite the reviewer-checklist item they encode. `PYO3-OPTION` (issue #56)
+  is signature-aware in file mode — it reads the parameter list only
+  (multi-line signatures, return types excluded) and warns on
+  `Option<Py<PyAny>>`-style parameters, the case where an omitted argument
+  and an explicit Python `None` both extract to `None`; the `**kwargs`
+  idiom (`Option<&Bound<'_, PyDict>>`) and numeric options deliberately
+  do not fire.
 - **bench.py** runs the parity gate *first* and aborts without any timing
   claim on divergence — or on a degenerate corpus whose reference side
   errors on every row (issue #30: no ground truth, no number); refuses a

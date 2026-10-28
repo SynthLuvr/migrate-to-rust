@@ -150,6 +150,12 @@ fn old_api(py: Python) -> usize { py.allow_threads(|| 1) }
 
 #[pyfunction]
 fn new_api(py: Python) -> usize { py.detach(|| 2) }
+
+#[pyfunction]
+#[pyo3(signature = (value, default=None))]
+fn to_float(py: Python, value: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> Py<PyAny> {
+    default.unwrap_or_else(|| py.None())
+}
 """
 
 GOOD_RS = """use pyo3::prelude::*;
@@ -182,6 +188,7 @@ def test_pyo3_review_all_rules_fire(monkeypatch, capsys, tmp_path):
     assert "PYO3-DETACH" in rules       # py use inside detach closure
     assert "PYO3-GEN" in rules          # allow_threads + detach mixed
     assert "PYO3-THREADSAFE" in rules   # Rc in pyclass field
+    assert "PYO3-OPTION" in rules       # Option<Py<PyAny>> param (issue #56)
     for f in out["findings"]:
         assert f["checklist"].endswith("reviewer.md#2-pyo3-ffi-hazards")
         assert f["file"] and f["line"] >= 1
@@ -214,6 +221,78 @@ def test_pyo3_review_diff_mode(monkeypatch, capsys, tmp_path):
     assert rules == {"PYO3-REFCOUNT", "PYO3-SWALLOW", "PYO3-UNWRAP"}
     assert all(f["context"] == "diff" for f in out["findings"])
     assert [f["line"] for f in out["findings"]] == [6, 7, 8]
+
+
+OPTION_RS = """use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyTuple};
+
+#[pyfunction]
+#[pyo3(signature = (value, default=None))]
+fn to_float(
+    value: &Bound<'_, PyAny>,
+    default: Option<Py<PyAny>>,
+) -> Option<Py<PyAny>> {
+    default
+}
+
+#[pyfunction]
+#[pyo3(signature = (*args))]
+fn to_float_manual(py: Python<'_>, args: &Bound<'_, PyTuple>) -> Py<PyAny> {
+    py.None()
+}
+
+#[pyfunction]
+fn kwargs_ok(kwds: Option<&Bound<'_, PyDict>>) -> usize {
+    kwds.map_or(0, |dict| dict.len())
+}
+
+#[pyfunction]
+fn opt_int(period: Option<i64>) -> i64 {
+    period.unwrap_or(14)
+}
+"""
+
+
+def test_pyo3_review_option_arg_conflation(monkeypatch, capsys, tmp_path):
+    """PYO3-OPTION (issue #56): Option<Py-typed> params on exported fns warn;
+    the *args manual-binding pattern, **kwargs idiom, numeric Options, and
+    Option-typed RETURN types must not fire."""
+    rs = tmp_path / "option.rs"
+    rs.write_text(OPTION_RS)
+    code, out = run_tool(monkeypatch, capsys, "pyo3_review.py",
+                         ["review", "--files", str(rs)])
+    assert code == 0  # warning severity alone does not fail
+    fires = [f for f in out["findings"] if f["rule"] == "PYO3-OPTION"]
+    assert len(fires) == 1
+    f = fires[0]
+    assert f["severity"] == "warning"
+    assert f["line"] == 8                      # the param line, not the fn line
+    assert "to_float" in f["why"]
+    assert "*args" in f["why"]
+    assert {f["rule"] for f in out["findings"]} == {"PYO3-OPTION"}
+    # --strict promotes the warning to a failure
+    code, out = run_tool(monkeypatch, capsys, "pyo3_review.py",
+                         ["review", "--files", str(rs), "--strict"])
+    assert code == 2
+
+
+def test_pyo3_review_option_diff_mode(monkeypatch, capsys, tmp_path):
+    diff = tmp_path / "d.diff"
+    diff.write_text(
+        "diff --git a/src/lib.rs b/src/lib.rs\n"
+        "--- a/src/lib.rs\n+++ b/src/lib.rs\n"
+        "@@ -3,2 +3,3 @@ fn x() {\n"
+        "     let a = 1;\n"
+        "+    default: Option<Py<PyAny>>,\n"
+        "     let b = 2;\n")
+    code, out = run_tool(monkeypatch, capsys, "pyo3_review.py",
+                         ["review", "--diff", str(diff)])
+    assert code == 0  # warning only
+    rules = {f["rule"]: f for f in out["findings"]}
+    assert set(rules) == {"PYO3-OPTION"}
+    assert rules["PYO3-OPTION"]["severity"] == "warning"
+    assert rules["PYO3-OPTION"]["context"] == "diff"
+    assert rules["PYO3-OPTION"]["line"] == 4
 
 
 # ---------------------------------------------------------- upstream_watch --

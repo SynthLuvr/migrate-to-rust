@@ -4,8 +4,9 @@
 Stages 4, 5. Encodes the reviewer checklist (roles/reviewer.md §2) as
 deterministic rules for the FFI-hazard classes miri and clippy do NOT
 cover: refcount handling, swallowed ``PyErr``, panics at the boundary,
-GIL ``detach`` misuse, free-threading hazards, and PyO3 API-generation
-mixing (knowledge/substitutions.json: "pin one generation; never mix").
+GIL ``detach`` misuse, free-threading hazards, PyO3 API-generation
+mixing (knowledge/substitutions.json: "pin one generation; never mix"),
+and Option-arg conflation of omitted with explicit ``None`` (issue #56).
 
 Modes:
   files/dir   full-file analysis: tracks #[pyfunction]/#[pymethods] spans
@@ -32,6 +33,13 @@ Rules (id, severity): findings cite the reviewer checklist item they encode.
                           #[pyclass] fields (not Send/Sync — free-threading)
   PYO3-INTWIDTH   warning isize/usize casts on Py ints near the boundary
                           (Python ints are arbitrary-precision)
+  PYO3-OPTION     warning Option<Py-typed> parameter (Option<Py<PyAny>>,
+                          Option<&Bound<'_, PyAny>>, Option<PyObject>) on an
+                          exported function: an omitted argument and an
+                          explicit Python None both extract to None — diverges
+                          when the Python default is observable and explicit
+                          None is legal input (issue #56); bind manually with
+                          #[pyo3(signature = (*args))] + get_item(i) there
 
 Exit codes: 0 no error-severity findings · 2 findings present (errors, or
 warnings with --strict) · 1 usage/IO.
@@ -48,7 +56,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import EXIT_FINDINGS, EXIT_OK, ToolError, emit, run_cli  # noqa: E402
 
 TOOL = "pyo3_review.py"
-VERSION = 1
+VERSION = 2
 
 CHECKLIST = "framework/roles/reviewer.md#2-pyo3-ffi-hazards"
 
@@ -70,6 +78,16 @@ GEN_NEW_RE = re.compile(r"\bPython::(?:attach|detach)\b|\.(?:attach|detach)\s*\(
 PYCLASS_FIELD_RE = re.compile(r":\s*(Rc<|RefCell<|Cell<)|\bthread_local!")
 STATIC_MUT_RE = re.compile(r"\bstatic\s+mut\b")
 INT_CAST_RE = re.compile(r"as\s+(i|u)(size|\d+)|\.extract::<\(i|u\)\w*>")
+# Option<Py-typed> parameters: dynamic-object optionals where an omitted arg
+# and an explicit Python None both extract to None (issue #56). PyDict/PyTuple
+# optionals (the **kwargs / *args idiom) are deliberately NOT matched.
+OPTION_ARG_RE = re.compile(
+    r"Option\s*<\s*&?\s*(?:"
+    r"Bound\s*<\s*'[^>]*?\s*,\s*PyAny\s*>"   # Option<&Bound<'_, PyAny>>
+    r"|Bound\s*<\s*PyAny\s*>"                # Option<Bound<PyAny>>
+    r"|Py\s*<\s*PyAny\s*>"                   # Option<Py<PyAny>>
+    r"|PyObject"                             # pre-0.26 alias
+    r")\s*>")
 
 ATTR_RE = re.compile(r"#\[\s*(pyfunction|pymethods|pyclass)")
 FN_RE = re.compile(r"^\s*(?:pub\s+)?(?:unsafe\s+)?(?:extern\s+)?fn\s+(\w+)")
@@ -192,6 +210,35 @@ def _attr_block_ranges(code: str, attr_re: re.Pattern, keyword: str) -> list[tup
     return ranges
 
 
+def _param_list_text(code_lines: list[str], fn_start: int) -> tuple[str, int]:
+    """(text, last_line) of a fn's parameter list starting at the `fn` line:
+    text runs from the opening `(` to the matching `)` inclusive, so return
+    types / bodies are excluded. Multi-line signatures supported; '' when no
+    parameter list is found within a bounded window."""
+    joined: list[str] = []
+    depth = 0
+    seen_open = False
+    for j in range(fn_start, min(len(code_lines), fn_start + 40) + 1):
+        joined.append(code_lines[j - 1])
+        depth += code_lines[j - 1].count("(") - code_lines[j - 1].count(")")
+        if "(" in code_lines[j - 1]:
+            seen_open = True
+        if seen_open and depth <= 0:
+            text = "\n".join(joined)
+            depth2, seen2, cut = 0, False, len(text)
+            for i, ch in enumerate(text):
+                if ch == "(":
+                    depth2 += 1
+                    seen2 = True
+                elif ch == ")":
+                    depth2 -= 1
+                    if seen2 and depth2 == 0:
+                        cut = i + 1
+                        break
+            return text[:cut], j
+    return "", fn_start
+
+
 def review_file(path: Path, findings: list[dict]) -> None:
     raw = path.read_text(encoding="utf-8", errors="replace")
     code = strip_comments_strings(raw)
@@ -224,6 +271,24 @@ def review_file(path: Path, findings: list[dict]) -> None:
         findings.append({"rule": rule, "severity": severity, "file": str(path),
                          "line": lineno, "snippet": snippet.strip()[:120],
                          "why": why, "checklist": CHECKLIST, "context": context})
+
+    # signature rules: Option<Py-typed> params on exported fns conflate an
+    # omitted argument with an explicit Python None (issue #56)
+    for fn_start, _fn_end, fname in exported:
+        sig_text, _sig_last = _param_list_text(code_lines, fn_start)
+        if not sig_text:
+            continue
+        for m in OPTION_ARG_RE.finditer(sig_text):
+            lineno = fn_start + sig_text.count("\n", 0, m.start())
+            add("PYO3-OPTION", "warning", lineno, raw_lines[lineno - 1],
+                f"Option<Py-typed> parameter on exported fn {fname}: an omitted "
+                f"argument and an explicit Python None both extract to None — "
+                f"diverges when the Python default is observable and explicit "
+                f"None is legal input (e.g. to_float(value, default=0.0) called "
+                f"with default=None); bind manually with #[pyo3(signature = "
+                f"(*args))] + args.get_item(i) (omitted -> literal default, "
+                f"is_none() -> Python semantics) unless explicit None is "
+                f"illegal input")
 
     # exported-fn rules
     for lineno, line in enumerate(code_lines, start=1):
@@ -337,6 +402,17 @@ def review_diff(path: Path, findings: list[dict]) -> None:
                                  "why": "`let _ =` discards a fallible FFI call "
                                         "(diff-mode line rule)",
                                  "checklist": CHECKLIST, "context": "diff"})
+            if OPTION_ARG_RE.search(content):
+                findings.append({"rule": "PYO3-OPTION", "severity": "warning",
+                                 "file": current_file or "<diff>", "line": new_lineno,
+                                 "snippet": content[:120],
+                                 "why": "Option<Py-typed> parameter on an ADDED line: "
+                                        "omitted and explicit Python None both extract "
+                                        "to None — verify the Python default is not "
+                                        "observable (or explicit None is illegal) "
+                                        "before forgiving this (file mode is "
+                                        "signature-aware)",
+                                 "checklist": CHECKLIST, "context": "diff"})
             new_lineno += 1
         elif line.startswith("-"):
             continue
@@ -352,6 +428,7 @@ RULES_DOC = {
     "PYO3-GEN": "mixed PyO3 API generations in one scope",
     "PYO3-THREADSAFE": "non-Send/Sync interior mutability in pyclass fields",
     "PYO3-INTWIDTH": "unchecked fixed-width casts on Python ints",
+    "PYO3-OPTION": "Option<Py-typed> params conflate omitted with explicit None",
 }
 
 
