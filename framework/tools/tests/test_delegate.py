@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import shlex
 import sys
-from pathlib import Path
 
 from conftest import TOOLS, run_tool
 

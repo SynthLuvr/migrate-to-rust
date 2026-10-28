@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """delegate.py — the stage-4 candidate runner (issue #33).
 
-Mechanizes the repair-loop spec's per-unit translator delegation
-(``MIGRATION_PROMPT.md`` "The repair loop", ``stages/4-translate.md``):
-K candidates, strict file partitioning, compile-then-oracle ranking, and
-bounded fix rounds — as ONE command, so the bookkeeping is code instead of
-prose the orchestrator hand-rolls (the failure mode issue #33 reports: K=1
-under budget, partitioning by instruction, manual gates, manual judge
-invocation — and a delegate that hits its turn cap mid-unit, which is
-exactly when the loop must be cheap to restart).
+Mechanizes the repair loop's per-unit translator delegation
+(``MIGRATION_PROMPT.md`` "The repair loop", ``stages/4-translate.md``) as
+ONE command — K candidates, strict file partitioning, compile-then-oracle
+ranking, bounded fix rounds — so the bookkeeping is code instead of prose
+the orchestrator hand-rolls (the failure mode issue #33 reports: K=1 under
+budget, partitioning by instruction, manual gates, manual judge invocation,
+and a delegate hitting its turn cap mid-unit, which is exactly when the
+loop must be cheap to restart).
 
     python framework/tools/delegate.py run-candidates \
         --state runs/<project>/migration-state.json --unit u-foo \
         --k 3 --agent-cmd 'goose session run {brief_file} {feedback_file}'
 
-What it does per unit:
+Per unit it:
 
-  1. computes per-candidate target paths (``src/u_<unit>_c1.rs`` … ``_cK``,
+  1. derives per-candidate target paths (``src/u_<unit>_c1.rs`` … ``_cK``,
      under the unit's ``rust_path`` directory when recorded) and writes each
      delegate an assignment brief: its own file + the contract + the Python
      source + ``roles/translator.md`` — nothing else (strict file
@@ -24,18 +24,17 @@ What it does per unit:
   2. runs each candidate through the bounded repair loop: a mechanical
      import gate (extern crates must be a Cargo.toml dependency, the crate
      itself, or an approved ``knowledge/substitutions.json`` entry — most
-     "hallucinated crates" are mis-imported real modules), then the
-     compile gates (``cargo fmt`` / ``clippy`` / ``test`` by default), with
-     gate output fed back to the delegate **verbatim** — the strongest
-     signal, per the loop spec — up to MAX_ROUNDS taken from the unit's
-     budget (``--max-rounds`` overrides; round 0 is the initial
-     translation, repairs are rounds 1..MAX_ROUNDS);
+     "hallucinated crates" are mis-imported real modules), then the compile
+     gates (``cargo fmt`` / ``clippy`` / ``test`` by default), with gate
+     output fed back to the delegate **verbatim** — the strongest signal,
+     per the loop spec — up to MAX_ROUNDS taken from the unit's budget
+     (``--max-rounds`` overrides; round 0 is the initial translation,
+     repairs are rounds 1..MAX_ROUNDS);
   3. builds the wheel once (``--build-cmd``, default ``maturin develop``)
      and judges ONLY the gate-green candidates — one ``oracle.py judge``
      run per candidate via a derived manifest that retargets the
      scaffolded candidate adapter (issue #32) at that candidate's wheel
-     module — then prints the ranked table (equivalent/divergent/
-     incomparable counts, diff-kind histogram) and the winner;
+     module — then prints the ranked table and the winner;
   4. writes NOTHING to the state file (the orchestrator/driver stays the
      only writer, per the role-separation rule): it emits a JSON verdict
      pack — on stdout and at
@@ -145,8 +144,9 @@ def _load_state(path: Path) -> dict:
 
 
 def _unit_of(state: dict, uid: str, state_path: Path) -> dict:
-    unit = state_tool._find_unit(state, uid)  # noqa: SLF001 — family-internal,
-    if unit is None:                          # composed not duplicated
+    # _find_unit is family-internal: composed here, not duplicated
+    unit = state_tool._find_unit(state, uid)  # noqa: SLF001
+    if unit is None:
         raise ToolError(f"unknown unit {uid!r} in {state_path}", kind="usage")
     return unit
 
@@ -165,6 +165,14 @@ def _resolve_target_root(flag_value: str | None, state: dict) -> Path:
     if not root.is_dir():
         raise ToolError(f"target root {raw} is not a directory", kind="io")
     return root
+
+
+def _resolve_max_rounds(flag_value: int | None, budget: dict) -> int:
+    """--max-rounds wins; else the unit budget's max_rounds (a null value
+    counts as unset and falls back to the schema default)."""
+    if flag_value is not None:
+        return flag_value
+    return int(budget.get("max_rounds", MAX_ROUNDS_DEFAULT) or MAX_ROUNDS_DEFAULT)
 
 
 def _sanitize_stem(uid: str) -> str:
@@ -367,6 +375,7 @@ def _import_findings(rust_file: Path, allow: set[str]) -> list[str]:
 
 
 def _attributed_spans(output: str, rust_file_rel: str) -> dict:
+    """Own-span count + every cited file, from cargo-style `-->` lines."""
     spans = DIAG_SPAN_RE.findall(output)
     return {"own": sum(1 for s in spans if s.endswith(rust_file_rel)),
             "cited": sorted(set(spans))}
@@ -452,6 +461,7 @@ def _derive_judge_files(base_manifest_path: Path, manifest: dict, entry: dict,
         return None
     new_line = (f"CANDIDATE_MODULE = {wheel_module!r}  # retargeted by "
                 f"{TOOL} v{VERSION} (candidate {entry['candidate']})")
+    # replacement via callable: new_line must bypass re's escape processing
     patched, n = re.subn(r"(?m)^CANDIDATE_MODULE\s*=\s*.*$",
                          lambda _m: new_line, text, count=1)
     if n != 1:
@@ -473,7 +483,7 @@ def _derive_judge_files(base_manifest_path: Path, manifest: dict, entry: dict,
 def _judge_candidate(derived_manifest: Path, timeout: float) -> dict:
     """Run oracle.py judge over the derived manifest as a real subprocess —
     no verdict is ever produced in here: the oracle ranks, not the model
-    and not this tool)."""
+    and not this tool."""
     cmd = [sys.executable, str(ORACLE), "judge",
            "--manifest", str(derived_manifest), "--timeout", str(timeout)]
     try:
@@ -507,8 +517,23 @@ def _judge_candidate(derived_manifest: Path, timeout: float) -> dict:
 
 # ---------------------------------------------------------- the loop ----
 
+def _gates_after_agent(rec: dict, entry: dict, gates: list[str], subs: dict,
+                       import_allow: set[str], target_root: Path,
+                       gate_timeout: float) -> list[dict]:
+    """The import gate plus the compile gates, run only after a clean agent
+    exit; import findings ride rec for the verdict pack."""
+    findings = _import_findings(Path(entry["rust_file"]), import_allow)
+    rec["import_findings"] = findings
+    if findings:
+        return [{"cmd": "<mechanical import gate>",
+                 "exit_code": EXIT_FINDINGS,
+                 "output": "\n".join(findings),
+                 "truncated": False}]
+    return [_run_gate(g, subs, target_root, gate_timeout) for g in gates]
+
+
 def _run_candidate(entry: dict, args, gates: list[str], import_allow: set[str],
-                   target_root: Path, state_path: Path) -> dict:
+                   base_subs: dict, target_root: Path) -> dict:
     """Round 0 (initial translation) + up to MAX_ROUNDS repair rounds, each
     repairing against the previous round's verbatim gate output. Every
     invocation and gate result is recorded; nothing is retried silently."""
@@ -522,38 +547,21 @@ def _run_candidate(entry: dict, args, gates: list[str], import_allow: set[str],
     feedback_path.parent.mkdir(parents=True, exist_ok=True)
     total = 1 + args.max_rounds
     for round_no in range(total):
-        subs = {**entry, "unit": args.unit, "k": args.k, "round": round_no,
-                "max_rounds": args.max_rounds, "contract": args._contract_str,
-                "role_file": str(ROLE_FILE), "target_root": str(target_root),
-                "framework": str(FRAMEWORK), "state": str(state_path),
-                "python": sys.executable}
+        subs = {**base_subs, **entry, "round": round_no}
         if round_no == 0:
             # the file exists up front so the template contract holds even
             # for agents that read it unconditionally; round 0 has no signal
             feedback_path.write_text(
                 _feedback_text(entry, round_no, args.max_rounds, None, None),
                 encoding="utf-8")
-        # repair rounds: the file keeps the PREVIOUS round's verbatim gate
-        # output (written below) — never overwritten, or the loop would eat
-        # its own strongest signal
         rc, tail = _invoke_agent(args.agent_cmd, subs, target_root,
                                  args.agent_timeout)
         rec["agent_invocations"] += 1
         round_rec: dict = {"round": round_no, "agent_exit": rc,
                            "agent_tail": tail[-800:]}
-        gate_recs: list[dict] = []
-        if rc == 0:
-            findings = _import_findings(Path(entry["rust_file"]), import_allow)
-            rec["import_findings"] = findings
-            if findings:
-                gate_recs.append({"cmd": "<mechanical import gate>",
-                                  "exit_code": EXIT_FINDINGS,
-                                  "output": "\n".join(findings),
-                                  "truncated": False})
-            else:
-                for g in gates:
-                    gate_recs.append(_run_gate(g, subs, target_root,
-                                               args.gate_timeout))
+        gate_recs = (_gates_after_agent(rec, entry, gates, subs, import_allow,
+                                        target_root, args.gate_timeout)
+                     if rc == 0 else [])
         round_rec["gates"] = gate_recs
         green = rc == 0 and bool(gate_recs) and \
             all(g["exit_code"] == 0 for g in gate_recs)
@@ -567,16 +575,18 @@ def _run_candidate(entry: dict, args, gates: list[str], import_allow: set[str],
         if green:
             rec["gate_green"] = True
             break
-        if round_no < total - 1:   # the repair signal: verbatim, on disk
+        if round_no < total - 1:
+            # the next round's repair signal: this round's gate output,
+            # verbatim and never overwritten
             feedback_path.write_text(
                 _feedback_text(entry, round_no, args.max_rounds, (rc, tail),
                                gate_recs or None), encoding="utf-8")
     if not rec["gate_green"]:
         last = rec["rounds"][-1]
+        gate_output = "\n".join(g["output"] for g in last["gates"])
         rec["stall"] = {  # best candidate + the exact failing diff (rule 8)
             "agent_exit": last["agent_exit"],
-            "gate_output": "\n".join(g["output"] for g in last["gates"])
-            [:OUTPUT_CAP]}
+            "gate_output": gate_output[:OUTPUT_CAP]}
     return rec
 
 
@@ -631,45 +641,65 @@ def _state_commands(unit_id: str, winner: dict | None,
                     state_path: Path) -> list[str]:
     """The exact commands the orchestrator runs to record the pack (this
     tool stays read-only on the state file — role separation)."""
-    cmds = []
+
+    def set_cmd(field: str) -> str:
+        return (f"python framework/tools/state.py set {state_path} "
+                f"--field {shlex.quote(field)}")
+
+    def mark_cmd(status: str, note: str) -> str:
+        return (f"python framework/tools/state.py mark {state_path} "
+                f"--unit {unit_id} --status {status} "
+                f"--note {shlex.quote(note)}")
+
     if winner is None:
-        note = "delegate.py: no gate-green candidate after bounded rounds"
-        return [f"python framework/tools/state.py mark {state_path} "
-                f"--unit {unit_id} --status escalated "
-                f"--note {shlex.quote(note)}"]
+        return [mark_cmd("escalated",
+                         "delegate.py: no gate-green candidate after bounded "
+                         "rounds")]
     j = winner.get("judge") or {}
     counts = j.get("counts") or {}
+    cmds = []
     if counts:
         parity = {"runs": j.get("total", 0),
                   "equivalent": counts.get("equivalent", 0),
                   "divergent": counts.get("divergent", 0),
                   "incomparable": counts.get("incomparable", 0),
                   "last_verdict": j.get("verdict", "unjudged")}
-        field = "units[%s].parity=%s" % (unit_id,
-                                         json.dumps(parity, separators=(",", ":")))
-        cmds.append(f"python framework/tools/state.py set {state_path} "
-                    f"--field {shlex.quote(field)}")
-    field = "units[%s].rust_path=%s" % (unit_id,
-                                        json.dumps(winner["rust_file_rel"]))
-    cmds.append(f"python framework/tools/state.py set {state_path} "
-                f"--field {shlex.quote(field)}")
+        cmds.append(set_cmd("units[%s].parity=%s"
+                            % (unit_id, json.dumps(parity, separators=(",", ":")))))
+    cmds.append(set_cmd("units[%s].rust_path=%s"
+                        % (unit_id, json.dumps(winner["rust_file_rel"]))))
     note = (f"delegate.py: winner {winner['candidate']} "
             f"({j.get('verdict', 'unjudged')}, "
             f"{counts.get('equivalent', 0)}/{j.get('total', 0)} equivalent, "
             f"{winner['rounds_used']} repair round(s))")
     if j.get("verdict") == "equivalent":
-        cmds.append(f"python framework/tools/state.py mark {state_path} "
-                    f"--unit {unit_id} --status ported "
-                    f"--note {shlex.quote(note)}")
+        cmds.append(mark_cmd("ported", note))
     else:
-        note += " — rounds exhausted / divergence unexplained"
-        cmds.append(f"python framework/tools/state.py mark {state_path} "
-                    f"--unit {unit_id} --status escalated "
-                    f"--note {shlex.quote(note)}")
+        cmds.append(mark_cmd("escalated",
+                             note + " — rounds exhausted / divergence unexplained"))
     return cmds
 
 
 # ------------------------------------------------------------- command ----
+
+def _validate_usage(args) -> None:
+    if not args.dry_run and not args.agent_cmd:
+        raise ToolError("--agent-cmd is required (goose / Claude Code / Codex — "
+                        "any CLI agent; placeholders below) unless --dry-run",
+                        kind="usage")
+    if args.agent_cmd and args.max_rounds > 0 \
+            and "{feedback_file}" not in args.agent_cmd:
+        raise ToolError(
+            "--agent-cmd must reference {feedback_file}: repair rounds feed "
+            "gate/compiler output back VERBATIM through that file (the "
+            "strongest signal, MIGRATION_PROMPT.md repair loop) — that "
+            "placeholder is the runner-agnostic feedback contract",
+            kind="usage")
+    if args.candidate_module and "{candidate}" not in args.candidate_module:
+        raise ToolError("--candidate-module must contain {candidate} so each "
+                        "candidate judges its own wheel module "
+                        "(e.g. 'mycrate.units.u_foo_{candidate}')", kind="usage")
+
 
 def _resolve_manifest(args, state_path: Path) -> Path | None:
     if args.manifest:
@@ -677,6 +707,114 @@ def _resolve_manifest(args, state_path: Path) -> Path | None:
         return p if p.is_file() else None
     p = state_path.parent / "manifests" / f"{args.unit}.json"
     return p if p.is_file() else None
+
+
+def _emit_dry_run(args, plan: list[dict], gates: list[str],
+                  contract: Path | None, contract_note: str,
+                  target_root: Path, import_allow: set[str],
+                  cargo_note: str | None) -> int:
+    human = (f"dry-run: {args.unit} k={args.k} max_rounds={args.max_rounds} "
+             f"gates={len(gates) + 1} target={target_root} — no agent, "
+             f"no writes")
+    emit({
+        "tool": TOOL, "version": VERSION, "unit": args.unit,
+        "dry_run": True, "k": args.k, "max_rounds": args.max_rounds,
+        "gates": ["<mechanical import gate>", *gates],
+        "build_cmd": None if args.no_build else args.build_cmd,
+        "candidate_module": args.candidate_module,
+        "target_root": str(target_root),
+        "contract": str(contract) if contract else None,
+        "contract_note": contract_note,
+        "candidates": plan, "import_allowlist_size": len(import_allow),
+        "cargo_note": cargo_note,
+        "contract_resolved": contract is not None,
+        "summary": {"exit_code": EXIT_OK, "human": human},
+    }, human_flag=args.human)
+    return EXIT_OK
+
+
+def _build_wheel(args, target_root: Path) -> dict:
+    """One wheel build over the whole candidate set; only gate-green
+    candidates reach it (the wheel carries only the best-structured
+    candidates forward to judging)."""
+    build: dict = {"attempted": True, "cmd": args.build_cmd}
+    try:
+        rc, out, err = run_child(shlex.split(args.build_cmd),
+                                 cwd=str(target_root),
+                                 timeout=args.build_timeout)
+    except subprocess.TimeoutExpired:
+        rc, out, err = 124, "", f"build timed out after {args.build_timeout:g}s"
+    except FileNotFoundError as e:
+        rc, out, err = 127, "", f"build command not found: {e}"
+    build["exit_code"] = rc
+    build["output_tail"] = ((out or "") + (err or ""))[-TAIL:]
+    build["failed"] = rc != 0
+    return build
+
+
+def _skip_judging(results: list[dict], reason: str) -> None:
+    for r in results:
+        r["judge"] = {"judged": False, "verdict": "unjudged",
+                      "skip_reason": reason}
+
+
+def _judge_green_candidates(plan: list[dict], green: list[dict], args,
+                            state_path: Path) -> bool:
+    """One real oracle.py judge run per gate-green candidate (via a derived
+    manifest — see _derive_judge_files). Returns whether the last judged
+    candidate was actually judged."""
+    base_manifest = _resolve_manifest(args, state_path)
+    if base_manifest is None:
+        _skip_judging(green, "no judge manifest found — pass --manifest "
+                             "(scaffold.py writes manifests/<unit>.json)")
+        return False
+    if not args.candidate_module:
+        _skip_judging(green, "no --candidate-module: the wheel module per "
+                             "candidate is unknown (e.g. "
+                             "mycrate.units.u_foo_{candidate})")
+        return False
+    manifest = read_json(base_manifest)
+    judged_any = False
+    for r in green:
+        entry = next(p for p in plan if p["candidate"] == r["candidate"])
+        wheel_module = args.candidate_module.replace(
+            "{candidate}", r["candidate"])
+        derived = _derive_judge_files(base_manifest, manifest, entry,
+                                      wheel_module)
+        if derived is None:
+            _skip_judging([r], "candidate entry is not a scaffolded *.py "
+                               "adapter with a CANDIDATE_MODULE line — "
+                               "cannot retarget per candidate")
+            continue
+        r["judge"] = _judge_candidate(derived, args.judge_timeout)
+        r["judge"]["manifest"] = str(derived)
+        r["judge"]["wheel_module"] = wheel_module
+        judged_any = bool(r["judge"].get("judged"))
+    return judged_any
+
+
+def _session_entries(unit_id: str, results: list[dict]) -> list[dict]:
+    sessions = []
+    for r in results:
+        outcome = f"gate_green={r['gate_green']} rounds={r['rounds_used']}"
+        if (r.get("judge") or {}).get("judged"):
+            outcome += f" verdict={r['judge'].get('verdict')}"
+        sessions.append({
+            "id": f"local-{unit_id}-{r['candidate']}",
+            "name": f"unit-{unit_id}-translator-{r['candidate']}",
+            "role": "translator", "outcome": outcome})
+    return sessions
+
+
+def _exit_code(winner: dict | None, build: dict, judged_any: bool) -> int:
+    if winner is None:
+        return EXIT_FINDINGS
+    if build.get("failed"):
+        return EXIT_SETUP
+    verdict = (winner.get("judge") or {}).get("verdict")
+    fallback = EXIT_INCOMPARABLE if judged_any else EXIT_FINDINGS
+    return {"equivalent": EXIT_OK, "divergent": EXIT_FINDINGS,
+            "incomparable": EXIT_INCOMPARABLE}.get(verdict, fallback)
 
 
 def cmd_run_candidates(args) -> int:
@@ -689,149 +827,56 @@ def cmd_run_candidates(args) -> int:
                        f"the ceiling or escalate; the repair loop refuses to "
                        f"run over budget (MIGRATION_PROMPT.md rule 6)")
     target_root = _resolve_target_root(args.target_root, state)
-    max_rounds = (args.max_rounds if args.max_rounds is not None else
-                  int(budget.get("max_rounds", MAX_ROUNDS_DEFAULT)
-                      or MAX_ROUNDS_DEFAULT))
-    args.max_rounds = max_rounds
+    args.max_rounds = _resolve_max_rounds(args.max_rounds, budget)
     only = [c.strip() for c in args.only.split(",")] if args.only else None
     plan = _candidate_plan(state_path, unit, target_root, args.k, only)
     contract, contract_note = _contract_path(args, state_path)
-    args._contract_str = str(contract) if contract else ""
     gates = args.gate or DEFAULT_GATES
-    if not args.dry_run and not args.agent_cmd:
-        raise ToolError("--agent-cmd is required (goose / Claude Code / Codex — "
-                        "any CLI agent; placeholders below) unless --dry-run",
-                        kind="usage")
-    if args.agent_cmd and max_rounds > 0 \
-            and "{feedback_file}" not in args.agent_cmd:
-        raise ToolError(
-            "--agent-cmd must reference {feedback_file}: repair rounds feed "
-            "gate/compiler output back VERBATIM through that file (the "
-            "strongest signal, MIGRATION_PROMPT.md repair loop) — that "
-            "placeholder is the runner-agnostic feedback contract",
-            kind="usage")
-    if args.candidate_module and "{candidate}" not in args.candidate_module:
-        raise ToolError("--candidate-module must contain {candidate} so each "
-                        "candidate judges its own wheel module "
-                        "(e.g. 'mycrate.units.u_foo_{candidate}')", kind="usage")
+    _validate_usage(args)
     dep_names, cargo_note = _cargo_dep_names(target_root)
     import_allow = ({"std", "core", "alloc"} | dep_names
                     | _load_substitution_crates(args.substitutions))
 
     if args.dry_run:
-        human = (f"dry-run: {args.unit} k={args.k} max_rounds={max_rounds} "
-                 f"gates={len(gates) + 1} target={target_root} — no agent, "
-                 f"no writes")
-        emit({
-            "tool": TOOL, "version": VERSION, "unit": args.unit,
-            "dry_run": True, "k": args.k, "max_rounds": max_rounds,
-            "gates": ["<mechanical import gate>", *gates],
-            "build_cmd": None if args.no_build else args.build_cmd,
-            "candidate_module": args.candidate_module,
-            "target_root": str(target_root),
-            "contract": str(contract) if contract else None,
-            "contract_note": contract_note,
-            "candidates": plan, "import_allowlist_size": len(import_allow),
-            "cargo_note": cargo_note,
-            "contract_resolved": contract is not None,
-            "summary": {"exit_code": EXIT_OK, "human": human},
-        }, human_flag=args.human)
-        return EXIT_OK
+        return _emit_dry_run(args, plan, gates, contract, contract_note,
+                             target_root, import_allow, cargo_note)
 
+    base_subs = {"unit": args.unit, "k": args.k,
+                 "max_rounds": args.max_rounds,
+                 "contract": str(contract) if contract else "",
+                 "role_file": str(ROLE_FILE), "target_root": str(target_root),
+                 "framework": str(FRAMEWORK), "state": str(state_path),
+                 "python": sys.executable}
     for entry in plan:
         if entry["run"]:
             _write_brief(entry, unit, contract=contract,
                          contract_note=contract_note, k=args.k,
-                         max_rounds=max_rounds, gates=gates,
+                         max_rounds=args.max_rounds, gates=gates,
                          candidate_module=args.candidate_module,
                          target_root=target_root)
 
-    results = [_run_candidate(entry, args, gates, import_allow, target_root,
-                              state_path)
+    results = [_run_candidate(entry, args, gates, import_allow, base_subs,
+                              target_root)
                for entry in plan if entry["run"]]
 
-    # wheel build: once, and only when something survived the gates
-    # ("compiles only the best-structured candidates into the wheel")
-    build: dict = {"attempted": False}
     green = [r for r in results if r["gate_green"]]
-    if green and not args.no_build:
-        build["attempted"] = True
-        build["cmd"] = args.build_cmd
-        try:
-            rc, out, err = run_child(shlex.split(args.build_cmd),
-                                     cwd=str(target_root),
-                                     timeout=args.build_timeout)
-        except subprocess.TimeoutExpired:
-            rc, out, err = 124, "", f"build timed out after {args.build_timeout:g}s"
-        except FileNotFoundError as e:
-            rc, out, err = 127, "", f"build command not found: {e}"
-        build["exit_code"] = rc
-        build["output_tail"] = ((out or "") + (err or ""))[-TAIL:]
-        build["failed"] = rc != 0
-
+    build = (_build_wheel(args, target_root)
+             if green and not args.no_build else {"attempted": False})
     judged_any = False
     if green and not build.get("failed"):
-        base_manifest = _resolve_manifest(args, state_path)
-        if base_manifest is None:
-            for r in green:
-                r["judge"] = {"judged": False, "verdict": "unjudged",
-                              "skip_reason": "no judge manifest found — pass "
-                                             "--manifest (scaffold.py writes "
-                                             "manifests/<unit>.json)"}
-        elif not args.candidate_module:
-            for r in green:
-                r["judge"] = {"judged": False, "verdict": "unjudged",
-                              "skip_reason": "no --candidate-module: the wheel "
-                                             "module per candidate is unknown "
-                                             "(e.g. mycrate.units.u_foo_{candidate})"}
-        else:
-            manifest = read_json(base_manifest)
-            for r in green:
-                entry = next(p for p in plan
-                             if p["candidate"] == r["candidate"])
-                wheel_module = args.candidate_module.replace(
-                    "{candidate}", r["candidate"])
-                derived = _derive_judge_files(base_manifest, manifest, entry,
-                                              wheel_module)
-                if derived is None:
-                    r["judge"] = {"judged": False, "verdict": "unjudged",
-                                  "skip_reason": "candidate entry is not a "
-                                                 "scaffolded *.py adapter with "
-                                                 "a CANDIDATE_MODULE line — "
-                                                 "cannot retarget per candidate"}
-                    continue
-                r["judge"] = _judge_candidate(derived, args.judge_timeout)
-                r["judge"]["manifest"] = str(derived)
-                r["judge"]["wheel_module"] = wheel_module
-                judged_any = bool(r["judge"].get("judged"))
+        judged_any = _judge_green_candidates(plan, green, args, state_path)
 
     ranked = _rank(results)
     winner = ranked[0] if ranked and ranked[0]["gate_green"] else None
     table = _table(args.unit, ranked, winner)
     state_cmds = _state_commands(args.unit, winner, state_path)
-    sessions = [{"id": f"local-{args.unit}-{r['candidate']}",
-                 "name": f"unit-{args.unit}-translator-{r['candidate']}",
-                 "role": "translator",
-                 "outcome": (f"gate_green={r['gate_green']} "
-                             f"rounds={r['rounds_used']}"
-                             + (f" verdict={r['judge'].get('verdict')}"
-                                if (r.get("judge") or {}).get("judged") else ""))}
-                for r in results]
-
-    if winner is None:
-        code = EXIT_FINDINGS
-    elif build.get("failed"):
-        code = EXIT_SETUP
-    else:
-        verdict = (winner.get("judge") or {}).get("verdict")
-        code = {"equivalent": EXIT_OK, "divergent": EXIT_FINDINGS,
-                "incomparable": EXIT_INCOMPARABLE}.get(
-                    verdict, EXIT_INCOMPARABLE if judged_any else EXIT_FINDINGS)
+    sessions = _session_entries(args.unit, results)
+    code = _exit_code(winner, build, judged_any)
 
     pack = {
         "tool": TOOL, "version": VERSION, "unit": args.unit,
         "unit_status_before": unit.get("status"),
-        "k": args.k, "max_rounds": max_rounds,
+        "k": args.k, "max_rounds": args.max_rounds,
         "gates": ["<mechanical import gate>", *gates],
         "build": build, "target_root": str(target_root),
         "contract": str(contract) if contract else None,
