@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import copy
+import csv
 import json
+from pathlib import Path
 
 from conftest import run_tool
 
@@ -194,19 +197,12 @@ def test_parse_error_is_tooling_note_not_risk_flag(monkeypatch, capsys, tmp_path
 
 
 # ------------------------------------- issue #51: system time, not units --
-# Stdlib files that appear in the profile (copy.py, csv, statistics, ...)
-# exist on disk, so the issue #28 "path not found" guard never fired and
-# they became units — inflating the backlog and adding risk-flag noise to
-# Stage-1 exit criteria. Only code under --project-root is a port unit.
+# Stdlib files exist on disk, so the issue #28 not-found guard never fired
+# and they became units; only code under --project-root is a port unit.
 
 def test_plan_skips_stdlib_hotspots_outside_root(monkeypatch, capsys, tmp_path):
-    """Hotspot files that exist but live outside --project-root (stdlib,
-    site-packages, the interpreter) are system time, never port units —
-    the crate replaces them with Rust idioms, SUB-1 doesn't apply (issue
-    #51). Their time must stay visible as signal, not backlog."""
-    import copy
-    import csv
-    from pathlib import Path
+    """Hotspot files outside --project-root are system time, never units;
+    their self-CPU stays visible as Stage-0 signal (issue #51)."""
     proj = _quiet_project(tmp_path)
     stdlib_copy = str(Path(copy.__file__).resolve())
     stdlib_csv = str(Path(csv.__file__).resolve())
@@ -227,7 +223,7 @@ def test_plan_skips_stdlib_hotspots_outside_root(monkeypatch, capsys, tmp_path):
     assert "system time" in sys_warnings[0]
     assert "copy.py" in sys_warnings[0] and "csv.py" in sys_warnings[0]
     st = out["system_time"]
-    assert st["self_cpu_s"] == 12.5  # 9.0 + 3.5 kept as Stage-0 signal
+    assert st["self_cpu_s"] == 12.5
     assert [m["module"] for m in st["modules"]] == ["copy", "csv"]  # cpu-desc
     assert st["modules"][0]["self_cpu_s"] == 9.0
     assert "2 system-time file(s)" in out["summary"]["human"]
@@ -235,8 +231,8 @@ def test_plan_skips_stdlib_hotspots_outside_root(monkeypatch, capsys, tmp_path):
 
 
 def test_plan_absolute_paths_inside_root_still_units(monkeypatch, capsys, tmp_path):
-    """The root-containment rule must not over-match: a profiler recording
-    ABSOLUTE paths inside the project still yields units for them."""
+    """No over-matching: a profiler recording ABSOLUTE paths inside the
+    project still yields units for them."""
     proj = _quiet_project(tmp_path)
     hotspots = tmp_path / "abs.json"
     hotspots.write_text(json.dumps([
@@ -252,9 +248,9 @@ def test_plan_absolute_paths_inside_root_still_units(monkeypatch, capsys, tmp_pa
 
 
 def test_plan_vendored_venv_inside_root_is_system_time(monkeypatch, capsys, tmp_path):
-    """A venv checked into the repo sits under the project root but the
-    project doesn't own its code: site-packages/venv hotspot files are
-    system time too (issue #51 names site-packages explicitly)."""
+    """A venv checked into the repo sits under the project root, but the
+    project doesn't own its code — site-packages hotspots are system time
+    too (issue #51)."""
     proj = _quiet_project(tmp_path)
     dep = proj / ".venv" / "lib" / "python3.12" / "site-packages" / "dep.py"
     dep.parent.mkdir(parents=True)
@@ -273,10 +269,8 @@ def test_plan_vendored_venv_inside_root_is_system_time(monkeypatch, capsys, tmp_
 
 
 def test_plan_refuses_when_only_system_time_resolves(monkeypatch, capsys, tmp_path):
-    """Every hotspot being outside the root (or unresolvable noise) still
+    """Every hotspot outside the root (or unresolvable noise) still
     refuses: there is nothing under the project root to port."""
-    import copy
-    from pathlib import Path
     proj = _quiet_project(tmp_path)
     hotspots = tmp_path / "onlysys.json"
     hotspots.write_text(json.dumps([
