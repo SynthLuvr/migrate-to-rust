@@ -289,7 +289,7 @@ def test_judge_all_error_reference_corpus_is_incomparable(monkeypatch, capsys, t
     code, out = run_tool(monkeypatch, capsys, "oracle.py",
                          ["judge", "--manifest", str(manifest)])
     assert code == 3
-    assert out["verdict"] == "incomparable"       # never EQUIVALENT
+    assert out["verdict"] == "incomparable"
     assert out["counts"] == {"equivalent": 4, "divergent": 0, "incomparable": 0}
     assert out["ground_truth"] == {
         "reference_ok": 0, "runs": 4, "reference_ok_fraction": 0.0,
@@ -321,8 +321,7 @@ def test_degenerate_overrides_divergent_error_pairs(monkeypatch, capsys, tmp_pat
 
 def test_judge_setup_failure_still_incomparable_with_detail(monkeypatch, capsys, tmp_path):
     # a reference that cannot even be imported: no ground truth on any row
-    manifest = _degenerate_scaffold(
-        tmp_path, cand_src=None)
+    manifest = _degenerate_scaffold(tmp_path)
     m = json.loads((tmp_path / "manifest.json").read_text())
     m["reference"] = {"entry": "no_such_module:run"}
     (tmp_path / "manifest.json").write_text(json.dumps(m))
@@ -447,8 +446,8 @@ def test_self_test_proves_the_degenerate_corpus_guard(monkeypatch, capsys):
     guard = out["degenerate_corpus_guard"]
     assert guard["held"] is True
     assert guard["summary_verdict"] == "incomparable"
-    assert guard["per_run_equivalent"] == 2   # error==error pairs...
-    assert guard["reference_ok"] == 0         # ...with zero ground truth
+    assert guard["per_run_equivalent"] == 2
+    assert guard["reference_ok"] == 0
     assert "guard held" in out["summary"]["human"]
 
 

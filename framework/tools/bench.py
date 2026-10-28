@@ -51,7 +51,7 @@ from _common import (  # noqa: E402
 )
 from oracle import (  # noqa: E402
     RUNNER_SRC, _execute_entry_subprocess, _load_corpus,
-    classify_pair, merge_rules, reference_ground_truth,
+    classify_pair, count_verdicts, merge_rules, reference_ground_truth,
 )
 
 TOOL = "bench.py"
@@ -162,6 +162,17 @@ cd "{manifest_dir}"
 """
 
 
+def _parity_abort_human(name: str, counts: dict, runs: int, gt: dict) -> str:
+    """Human summary when parity fails — no timing claim, ever."""
+    if gt["degenerate"]:
+        return (f"benchmark {name}: ABORTED — {gt['detail']} "
+                f"(reference ok on 0/{runs} runs — no ground truth); "
+                "no timing claim")
+    return (f"benchmark {name}: ABORTED — outputs diverge "
+            f"({counts['divergent']} divergent, {counts['incomparable']} "
+            f"incomparable of {runs} runs); no timing claim")
+
+
 def cmd_run(args) -> int:
     manifest_path = Path(args.manifest).resolve()
     manifest = read_json(manifest_path)
@@ -198,12 +209,10 @@ def cmd_run(args) -> int:
 
     verdicts = [classify_pair(i, rec(py_recs, i), rec(rs_recs, i), rules)
                 for i in range(len(inputs))]
-    counts = {"equivalent": 0, "divergent": 0, "incomparable": 0}
-    for v in verdicts:
-        counts[v["verdict"]] += 1
-    # issue #30 ground-truth guard: a corpus the reference (python) side
-    # fully rejects has no parity evidence — error==error matches are not
-    # ground truth to hang a timing claim on
+    counts = count_verdicts(verdicts)
+    # issue #30: a corpus the reference (python) side fully rejects carries
+    # no parity evidence — error==error matches are not ground truth to
+    # hang a timing claim on
     gt = reference_ground_truth(py_recs, len(inputs), rules)
     if gt["degenerate"]:
         parity_verdict = "incomparable"
@@ -215,25 +224,19 @@ def cmd_run(args) -> int:
               "counts": counts, "runs": len(inputs),
               "input_digest": sha256_bytes("\n".join(
                   json.dumps(v, sort_keys=True) for v in inputs).encode())[:16]}
-    if parity["verdict"] != "equivalent":
+    if parity_verdict != "equivalent":
         first_div = next((v for v in verdicts if v["verdict"] != "equivalent"), None)
-        code = EXIT_FINDINGS
-        if gt["degenerate"]:
-            human = (f"benchmark {manifest['name']}: ABORTED — {gt['detail']} "
-                     f"(reference ok on 0/{len(inputs)} runs — no ground "
-                     "truth); no timing claim")
-        else:
-            human = (f"benchmark {manifest['name']}: ABORTED — outputs diverge "
-                     f"({counts['divergent']} divergent, {counts['incomparable']} "
-                     f"incomparable of {len(inputs)} runs); no timing claim")
         emit({"tool": TOOL, "version": VERSION, "name": manifest["name"],
               "parity": parity, "ground_truth": gt,
               "first_divergence": (first_div or {}).get("diffs", [])[:3],
               "corpus": corpus_info, "warnings": warnings,
-              "summary": {"exit_code": code, "human": human}}, human_flag=args.human)
-        return code
+              "summary": {"exit_code": EXIT_FINDINGS,
+                          "human": _parity_abort_human(
+                              manifest["name"], counts, len(inputs), gt)}},
+             human_flag=args.human)
+        return EXIT_FINDINGS
     if gt["warning"]:
-        warnings = warnings + [gt["warning"]]
+        warnings.append(gt["warning"])
 
     # ---- matched inputs both sides: verified by construction (same list),
     # recorded for audit

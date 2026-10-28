@@ -74,9 +74,9 @@ def test_bench_divergent_outputs_abort_without_timing(monkeypatch, capsys, tmp_p
 
 
 def test_bench_degenerate_corpus_aborts_without_timing(monkeypatch, capsys, tmp_path):
-    # issue #30: the reference (python) side rejects every corpus row and
-    # the candidate errors identically — per-run "equivalent" pairs are not
-    # ground truth to hang a timing claim on
+    # issue #30: the reference side rejects every row and the candidate
+    # errors identically — per-run error==error pairs are not ground truth
+    # to hang a timing claim on
     manifest = _bench_scaffold(tmp_path)
     for name in ("py_impl.py", "rs_impl.py"):
         (tmp_path / "bench" / "impl" / name).write_text(
@@ -93,8 +93,8 @@ def test_bench_degenerate_corpus_aborts_without_timing(monkeypatch, capsys, tmp_
 
 
 def test_bench_thin_ground_truth_warns_but_times(monkeypatch, capsys, tmp_path):
-    # reference ok on only 5 of 20 rows (25% < 50%): parity still equivalent
-    # per run, timings proceed, but the thin-ground-truth warning surfaces
+    # reference ok on only 5 of 20 rows (25% < 50%): parity still
+    # equivalent per run, timings proceed, but the warning surfaces
     manifest = _bench_scaffold(tmp_path)
     src = ("def run(v):\n"
            "    if v['nums'][3] % 4:\n"
