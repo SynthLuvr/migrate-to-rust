@@ -14,7 +14,9 @@ Subcommands
   init       create a minimal valid state file
   set        change fields via dotted paths — ``stage``,
              ``units[u-parse-1].status``, ``human_gates[gate=unit_escalation].state``
-             (the exact field vocabulary the journal already uses); every
+             (the exact field vocabulary the journal already uses); a leading
+             ``@json:`` types one field as strict JSON so plain and JSON
+             fields mix in a single invocation (issue #35); every
              changed field appends one journal entry; atomic write; invalid
              results roll back
   mark       status transitions with the MIGRATION_PROMPT.md discipline
@@ -53,6 +55,7 @@ from _common import (  # noqa: E402
 
 TOOL = "state.py"
 VERSION = 1
+JSON_FIELD_PREFIX = "@json:"
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "state" / "migration-state.schema.json"
 POLICY_PATH = Path(__file__).resolve().parent.parent / "autonomy" / "policy.json"
 STATUSES = ["pending", "ported", "divergent_explained", "escalated", "fallback_python", "retired"]
@@ -634,14 +637,16 @@ def cmd_set(args) -> int:
     state = _load(path)
     changes = []
     for pair in args.field:
-        if "=" not in pair:
+        strict_json = pair.startswith(JSON_FIELD_PREFIX)
+        spec = pair.removeprefix(JSON_FIELD_PREFIX)
+        if "=" not in spec:
             return _refusal(f"--field expects path=value, got {pair!r}", args.human)
-        field, raw = pair.split("=", 1)
+        field, raw = spec.split("=", 1)
         field = field.strip()
         try:
             value = json.loads(raw)  # numbers, true/false, null, lists...
         except json.JSONDecodeError as e:
-            if args.json_value:
+            if strict_json or args.json_value:
                 return _refusal(f"--field {field}: value is not valid JSON: {e}",
                                 args.human)
             value = raw  # fall back to raw string
@@ -1061,10 +1066,14 @@ def main(argv=None) -> int:
     p = sub.add_parser("set", help="set field(s) — journaled, validated, atomic")
     p.add_argument("file")
     p.add_argument("--field", action="append", required=True,
-                   help="dotted path=value, e.g. units[u-1].status=ported (repeatable)")
+                   help="dotted path=value, e.g. units[u-1].status=ported "
+                        "(repeatable); a leading '@json:' types that one "
+                        "value as strict JSON")
     p.add_argument("--actor", default="orchestrator")
     p.add_argument("--json-value", action="store_true",
-                   help="treat values as strict JSON (error on non-JSON)")
+                   help="treat every value as strict JSON (error on "
+                        "non-JSON); to mix, use the per-field '@json:' "
+                        "prefix")
     p.set_defaults(func=cmd_set)
 
     p = sub.add_parser("mark", help="guarded unit status transition")

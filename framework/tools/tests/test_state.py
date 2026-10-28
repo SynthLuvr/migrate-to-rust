@@ -42,6 +42,43 @@ def test_every_transition_journaled(monkeypatch, capsys, mini_state):
         assert set(e) >= {"timestamp", "unit", "field", "from", "to"}
 
 
+def test_set_mixes_plain_and_json_fields_in_one_invocation(
+        monkeypatch, capsys, mini_state):
+    code, out = run_tool(monkeypatch, capsys, "state.py", [
+        "set", str(mini_state),
+        "--field", "project.workload=some plain string",
+        "--field", '@json:go_no_go={"decision": "pending", "scope": ["u1"]}'])
+    assert code == 0
+    st = _load(mini_state)
+    assert st["project"]["workload"] == "some plain string"
+    assert st["go_no_go"] == {"decision": "pending", "scope": ["u1"]}
+    assert len(st["journal"]) == 2
+
+
+def test_set_json_prefix_is_exact_typing(monkeypatch, capsys, mini_state):
+    code, _ = run_tool(monkeypatch, capsys, "state.py", [
+        "set", str(mini_state), "--field", '@json:project.workload="4"'])
+    assert code == 0
+    assert _load(mini_state)["project"]["workload"] == "4"
+
+
+def test_set_json_prefix_rejects_non_json_without_landing(
+        monkeypatch, capsys, mini_state):
+    before = _load(mini_state)
+    code, out = run_tool(monkeypatch, capsys, "state.py", [
+        "set", str(mini_state), "--field", "@json:project.workload=oops"])
+    assert code == 2 and "not valid JSON" in out["error"]
+    assert _load(mini_state) == before
+
+
+def test_set_json_value_flag_keeps_whole_invocation_strictness(
+        monkeypatch, capsys, mini_state):
+    code, out = run_tool(monkeypatch, capsys, "state.py", [
+        "set", str(mini_state), "--field", "project.workload=oops",
+        "--json-value"])
+    assert code == 2 and "not valid JSON" in out["error"]
+
+
 def test_set_journal_directly_rejected(monkeypatch, capsys, mini_state):
     code, out = run_tool(monkeypatch, capsys, "state.py",
                          ["set", str(mini_state), "--field", "journal=[]"])
