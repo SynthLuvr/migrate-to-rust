@@ -445,7 +445,7 @@ def test_src_layout_imports_cover_units(monkeypatch, capsys, tmp_path):
     assert out["layout_mismatch_suspected"] is False
 
 
-def test_src_layout_still_flags_true_uncovered_and_dangling(monkeypatch, capsys, tmp_path):
+def test_src_layout_still_flags_true_uncovered_and_out_of_scope(monkeypatch, capsys, tmp_path):
     """The fix must not over-match: a genuinely untested unit stays uncovered
     and an unrelated engine test is reported as out-of-scope noise."""
     proj, state = _srcpkg(tmp_path)

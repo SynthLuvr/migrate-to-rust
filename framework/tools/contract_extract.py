@@ -13,7 +13,7 @@ Test → unit mapping (deterministic, in priority order):
      layout-stripped name and the un-stripped ``src.``-prefixed one
      (issue #26) — authoritative;
   2. filename convention ``test_<module>.py`` / ``<module>_test.py`` when the
-     test file has no scoped imports at all.
+     test file has no absolute imports at all.
 
 Coverage is TRANSITIVE over the state file's ``deps[]`` graph (issue #57): a
 test covering unit A also exercises everything A (transitively) imports, so a
@@ -96,39 +96,6 @@ def parse_collect_file(path: Path) -> list[str]:
     return out
 
 
-def stem_tail_of(test_file: str) -> str | None:
-    """Module-name tail a test FILENAME claims by convention:
-    ``tests/test_parse.py`` / ``tests/parse_test.py`` -> ``parse``."""
-    m = TEST_STEM_RE.match(Path(test_file).stem)
-    return m.group(1) if m else None
-
-
-def module_resides_in(mod: str, bases: list[Path]) -> bool:
-    """True when an imported dotted name resolves to project source under one
-    of the bases (unit directories, the project root, and their src//lib/
-    layout variants) — i.e. it is project code, scoped or not. Imports of
-    stdlib/third-party modules (``os``, ``zlib``, ...) do not resolve."""
-    rel = Path(*mod.split("."))
-    for base in bases:
-        if (base / rel).with_suffix(".py").is_file() or (base / rel / "__init__.py").is_file():
-            return True
-    return False
-
-
-def dep_closure_of(uid: str, deps_of: dict[str, list[str]]) -> set[str]:
-    """Transitive dependency closure over the state file's ``deps[]`` unit-id
-    graph, cycle-safe: back-edges and unknown ids are not expanded."""
-    seen: set[str] = set()
-    work = list(deps_of.get(uid, ()))
-    while work:
-        d = work.pop()
-        if d in seen or d not in deps_of:
-            continue
-        seen.add(d)
-        work.extend(deps_of[d])
-    return seen
-
-
 # ------------------------------------------------------------------ AST ----
 
 def imports_of(tree: ast.Module) -> set[str]:
@@ -202,6 +169,91 @@ def signatures_of(tree: ast.Module) -> list[str]:
     return sigs
 
 
+# ------------------------------------------------ test ↔ unit mapping ---
+
+def stem_tail_of(test_file: str) -> str | None:
+    """Module-name tail a test filename claims by convention:
+    ``tests/test_parse.py`` / ``tests/parse_test.py`` -> ``parse``."""
+    m = TEST_STEM_RE.match(Path(test_file).stem)
+    return m.group(1) if m else None
+
+
+def units_covered_by(tmods: set[str], test_file: str,
+                     candidates_of_unit: dict[str, list[str]],
+                     module_of_unit: dict[str, str]) -> list[str]:
+    """Unit ids a test file covers: the authoritative scoped-import match,
+    then the filename convention — but only when the file has no absolute
+    imports at all, so a test that imports something yet misses every scoped
+    unit stays unmatched (and gets scope-classified) instead of silently
+    mapping by name."""
+    matched = [uid for uid, cands in candidates_of_unit.items()
+               if imports_any_of(tmods, cands)]
+    if not matched and not tmods:
+        tail = stem_tail_of(test_file)
+        if tail:
+            matched = [uid for uid, umod in module_of_unit.items()
+                       if umod.split(".")[-1] == tail]
+    return matched
+
+
+def is_project_module(mod: str, bases: list[Path]) -> bool:
+    """True when an imported dotted name resolves to source under one of the
+    bases — project code, scoped or not; stdlib/third-party imports
+    (``os``, ``zlib``, ...) do not resolve."""
+    rel = Path(*mod.split("."))
+    return any((base / rel).with_suffix(".py").is_file()
+               or (base / rel / "__init__.py").is_file()
+               for base in bases)
+
+
+def project_code_bases(root: Path, project_root: Path,
+                       unit_files: dict[str, Path]) -> list[Path]:
+    """Directories ``is_project_module`` may resolve under: the roots and the
+    unit files' own directories, plus their src/ and lib/ layout variants."""
+    bases: list[Path] = []
+    for base in (root, project_root, *(f.parent for f in unit_files.values())):
+        for variant in (base, base / "src", base / "lib"):
+            if variant not in bases:
+                bases.append(variant)
+    return bases
+
+
+def dep_closure_of(uid: str, deps_of: dict[str, list[str]]) -> set[str]:
+    """Transitive dependency closure over the deps[] unit-id graph; cycle-safe
+    (a back-edge only ends the walk) and ids that are not units are skipped."""
+    seen: set[str] = set()
+    work = list(deps_of.get(uid, ()))
+    while work:
+        dep = work.pop()
+        if dep in seen or dep not in deps_of:
+            continue
+        seen.add(dep)
+        work.extend(deps_of[dep])
+    return seen
+
+
+def transitive_coverage(
+        covering: dict[str, list[str]],
+        units: list[dict]) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Per-unit (transitive tests, consumer unit ids) for coverage reached
+    only through a consumer's deps[] closure (issue #57): a test of unit A
+    exercises everything A transitively imports, so consumer suites cover a
+    shared helper with no directly-importing test file."""
+    deps_of = {u["id"]: [d for d in (u.get("deps") or []) if isinstance(d, str)]
+               for u in units}
+    tests_of: dict[str, set[str]] = {uid: set() for uid in covering}
+    via_of: dict[str, set[str]] = {uid: set() for uid in covering}
+    for uid, tests in covering.items():
+        if not tests:
+            continue
+        for dep in dep_closure_of(uid, deps_of):
+            if dep == uid or dep not in tests_of:
+                continue
+            tests_of[dep].update(tests)
+            via_of[dep].add(uid)
+    return tests_of, via_of
+
+
 # ----------------------------------------------------------- the command ---
 
 def cmd_extract(args) -> int:
@@ -231,10 +283,10 @@ def cmd_extract(args) -> int:
     # parse every test file once
     test_trees: dict[str, ast.Module] = {}
     for nodeid in nodeids:
-        tf = nodeid.split("::", 1)[0]
-        if tf not in test_trees:
-            path = _find_source(tf, root, project_root)
-            test_trees[tf] = ast.parse(path.read_text()) if path else None
+        test_file = nodeid.split("::", 1)[0]
+        if test_file not in test_trees:
+            path = _find_source(test_file, root, project_root)
+            test_trees[test_file] = ast.parse(path.read_text()) if path else None
 
     # module names come from the DECLARED python_path (project-relative),
     # matching how test files import them — never from the resolved location
@@ -245,62 +297,35 @@ def cmd_extract(args) -> int:
     covering: dict[str, list[str]] = {uid: [] for uid in unit_files}
     dangling: list[dict] = []      # within scope — the real signal (exit 2)
     out_of_scope: list[dict] = []  # informational; never drives the exit code
-    unit_tails = {module_of_unit[uid].split(".")[-1] for uid in unit_files}
-    # bases an imported module may resolve under and still count as project
-    # code: the unit files' own directories, the roots, + src//lib/ variants
-    project_bases: list[Path] = []
-    for base in [root, project_root, *(unit_files[uid].parent for uid in unit_files)]:
-        for b in (base, base / "src", base / "lib"):
-            if b not in project_bases:
-                project_bases.append(b)
+    unit_tails = {mod.split(".")[-1] for mod in module_of_unit.values()}
+    bases = project_code_bases(root, project_root, unit_files)
 
     for nodeid in nodeids:
-        tf = nodeid.split("::", 1)[0]
-        tree = test_trees.get(tf)
+        test_file = nodeid.split("::", 1)[0]
+        tree = test_trees.get(test_file)
         if tree is None:
             dangling.append({"nodeid": nodeid, "reason": "test file not found in project"})
             continue
         tmods = imports_of(tree)
-        tail = stem_tail_of(tf)
-        matched = [uid for uid, cands in candidates_of_unit.items()
-                   if imports_any_of(tmods, cands)]
-        if not matched and not tmods and tail:
-            # filename convention fallback: tests/test_parse.py -> *.parse
-            matched = [uid for uid, umod in module_of_unit.items()
-                       if umod.split(".")[-1] == tail]
+        matched = units_covered_by(tmods, test_file, candidates_of_unit, module_of_unit)
         if matched:
             for uid in matched:
                 covering[uid].append(nodeid)
             continue
-        # no scoped unit matched — split by scope (issue #57)
-        if tail and tail in unit_tails:
-            # the test file NAMES a scoped unit module yet imports none of
-            # them: a mapping failure worth a human look, not scope noise
+        # matched no scoped unit — split the finding by scope (issue #57)
+        tail = stem_tail_of(test_file)
+        if tail in unit_tails:
+            # the file NAMES a scoped unit module yet imports none of them:
+            # a mapping failure worth a human look, not scope noise
             dangling.append({"nodeid": nodeid,
                              "reason": NAMED_FOR_SCOPED_UNIT.format(tail=tail)})
             continue
-        resident = sorted(m for m in tmods if module_resides_in(m, project_bases))
-        if resident:
-            out_of_scope.append({"nodeid": nodeid,
-                                 "reason": "tests unscoped project module(s): "
-                                           + ", ".join(resident)})
-        else:
-            out_of_scope.append({"nodeid": nodeid, "reason": NO_UNIT_MATCH})
+        resident = sorted(m for m in tmods if is_project_module(m, bases))
+        reason = (f"tests unscoped project module(s): {', '.join(resident)}"
+                  if resident else NO_UNIT_MATCH)
+        out_of_scope.append({"nodeid": nodeid, "reason": reason})
 
-    # transitive coverage over the state deps[] graph (issue #57): a test
-    # covering unit A exercises A's whole dependency closure, so consumer
-    # suites cover a shared helper that has no directly-importing test file
-    deps_of = {u["id"]: [d for d in (u.get("deps") or []) if isinstance(d, str)]
-               for u in units}
-    transitive_tests: dict[str, set[str]] = {uid: set() for uid in unit_files}
-    covered_via: dict[str, set[str]] = {uid: set() for uid in unit_files}
-    for uid, tests in covering.items():
-        if not tests:
-            continue
-        for dep in dep_closure_of(uid, deps_of):
-            if dep != uid and dep in transitive_tests:
-                transitive_tests[dep].update(tests)
-                covered_via[dep].add(uid)
+    transitive_tests, covered_via = transitive_coverage(covering, units)
 
     # mypy rows (optional): {"path": ..., "line": ..., "symbol": ..., "signature": ...}
     mypy_rows = read_json(args.mypy) if args.mypy else []
@@ -355,10 +380,8 @@ def cmd_extract(args) -> int:
                         f"(direct or via consumers)")
     for d in dangling:
         findings.append(f"dangling test {d['nodeid']}: {d['reason']}")
-    # within-scope dangling always fails (acceptance: "dangling tests
-    # flagged"); uncovered units fail unless explicitly tolerated (still
-    # reported); tests of modules outside the approved tranche are
-    # informational only and never drive the exit code (issue #57)
+    # only within-scope findings drive the exit code: dangling always fails,
+    # uncovered units fail unless --allow-uncovered, out-of-scope never does
     hard = dangling + ([] if args.allow_uncovered else uncovered)
     code = EXIT_FINDINGS if hard else EXIT_OK
     # every unit uncovered while a within-scope test still went unmatched is
