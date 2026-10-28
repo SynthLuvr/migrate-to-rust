@@ -16,6 +16,13 @@ def _load(path):
     return json.loads(path.read_text())
 
 
+def _seed_gates(state_file, *gates):
+    """Give a mini_state fixture some gate history (it ships empty)."""
+    st = _load(state_file)
+    st["human_gates"] = list(gates)
+    state_file.write_text(json.dumps(st))
+
+
 def test_example_state_validates(monkeypatch, capsys):
     code, out = run_tool(monkeypatch, capsys, "state.py", ["validate", str(EXAMPLE)])
     assert code == 0
@@ -84,7 +91,7 @@ def test_set_value_position_json_prefix_types_as_strict_json(
     """issue #52: 'path=@json:[...]' (prefix on the value, not the pair) is
     unambiguous intent — it must land typed, not silently degrade to a
     string that later fails schema validation with a confusing type error."""
-    code, out = run_tool(monkeypatch, capsys, "state.py", [
+    code, _ = run_tool(monkeypatch, capsys, "state.py", [
         "set", str(mini_state), "--field", 'go_no_go.scope=@json:["src/bars.py"]'])
     assert code == 0
     assert _load(mini_state)["go_no_go"]["scope"] == ["src/bars.py"]
@@ -96,7 +103,7 @@ def test_set_value_position_json_prefix_bad_payload_refuses_with_hint(
     code, out = run_tool(monkeypatch, capsys, "state.py", [
         "set", str(mini_state), "--field", "go_no_go.scope=@json:[oops]"])
     assert code == 2 and "not valid JSON" in out["error"]
-    assert "front of the pair" in out["error"]  # says where the prefix goes
+    assert "front of the pair" in out["error"]
     assert _load(mini_state) == before
 
 
@@ -114,10 +121,8 @@ def test_set_literal_json_prefix_string_still_possible(
 def test_set_human_gates_whole_array_refused(monkeypatch, capsys, mini_state):
     """issue #52: replacing the human_gates array clobbers gate history —
     the array only grows through resolve-gate/mark (like journal[])."""
-    st = _load(mini_state)
-    st["human_gates"] = [{"gate": "go_no_go", "state": "approved",
-                          "decided_by": "human"}]
-    mini_state.write_text(json.dumps(st))
+    _seed_gates(mini_state, {"gate": "go_no_go", "state": "approved",
+                             "decided_by": "human"})
     before = _load(mini_state)
     code, out = run_tool(monkeypatch, capsys, "state.py", [
         "set", str(mini_state), "--field",
@@ -125,7 +130,7 @@ def test_set_human_gates_whole_array_refused(monkeypatch, capsys, mini_state):
     assert code == 2 and "append-only" in out["error"]
     assert "resolve-gate" in out["error"]
     after = _load(mini_state)
-    assert after["human_gates"] == before["human_gates"]  # history intact
+    assert after["human_gates"] == before["human_gates"]
     assert after["journal"] == before["journal"]
 
 
@@ -134,7 +139,7 @@ def test_set_human_gates_whole_array_allowed_while_empty(
     """Seeding a fresh state's (still empty) human_gates stays possible —
     the pipeline tests' bootstrap pattern; the guard protects history, not
     initial seeding."""
-    code, out = run_tool(monkeypatch, capsys, "state.py", [
+    code, _ = run_tool(monkeypatch, capsys, "state.py", [
         "set", str(mini_state), "--json-value", "--field",
         'human_gates=[{"gate": "go_no_go", "state": "open"}]'])
     assert code == 0
@@ -144,10 +149,8 @@ def test_set_human_gates_whole_array_allowed_while_empty(
 def test_set_human_gates_leaf_field_still_works(monkeypatch, capsys, mini_state):
     """The refusal is whole-array only: per-record edits stay in the set
     vocabulary (human_gates[gate=<name>].<leaf>)."""
-    st = _load(mini_state)
-    st["human_gates"] = [{"gate": "go_no_go", "state": "open"}]
-    mini_state.write_text(json.dumps(st))
-    code, out = run_tool(monkeypatch, capsys, "state.py", [
+    _seed_gates(mini_state, {"gate": "go_no_go", "state": "open"})
+    code, _ = run_tool(monkeypatch, capsys, "state.py", [
         "set", str(mini_state),
         "--field", "human_gates[gate=go_no_go].note=scope locked"])
     assert code == 0
@@ -158,10 +161,8 @@ def test_set_gate_selector_survives_equals_inside_brackets(
         monkeypatch, capsys, mini_state):
     """'[gate=<name>]' itself contains '=' — the path=value split must cut
     at the top-level '=' only, and a value may still contain '='."""
-    st = _load(mini_state)
-    st["human_gates"] = [{"gate": "go_no_go", "state": "open"}]
-    mini_state.write_text(json.dumps(st))
-    code, out = run_tool(monkeypatch, capsys, "state.py", [
+    _seed_gates(mini_state, {"gate": "go_no_go", "state": "open"})
+    code, _ = run_tool(monkeypatch, capsys, "state.py", [
         "set", str(mini_state),
         "--field", "human_gates[gate=go_no_go].note=a=b"])
     assert code == 0

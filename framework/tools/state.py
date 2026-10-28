@@ -16,12 +16,11 @@ Subcommands
              ``units[u-parse-1].status``, ``human_gates[gate=unit_escalation].state``
              (the exact field vocabulary the journal already uses); a leading
              ``@json:`` types one field as strict JSON so plain and JSON
-             fields mix in a single invocation (issue #35) — the prefix is
-             also honored directly on the value (``path=@json:[...]``),
-             never silently degraded to a string (issue #52); the
-             ``human_gates`` array may only be set wholesale while empty —
-             after that gate history only grows through
-             resolve-gate/mark (issue #52); every
+             fields mix in a single invocation (issue #35); the prefix also
+             works directly on the value (``path=@json:[...]``) and never
+             silently degrades to a string (issue #52); ``human_gates`` may
+             only be set wholesale while empty — after that gate history
+             only grows through resolve-gate/mark (issue #52); every
              changed field appends one journal entry; atomic write; invalid
              results roll back
   mark       status transitions with the MIGRATION_PROMPT.md discipline
@@ -536,11 +535,11 @@ def get_field(state: dict, path: str):
 
 def set_field(state: dict, path: str, value) -> bool:
     """Set one dotted field in-place. Returns True if the value changed.
-    `journal` is append-only and rejected here; `human_gates` may only be
-    set wholesale while empty — after that gate history grows through
-    resolve-gate/mark (issue #52). Indexed segments
-    (units[u-1], human_gates[gate=g]) SELECT; the leaf key must be addressed
-    one level deeper, e.g. units[u-1].status."""
+    `journal` is append-only and rejected here, and so is a non-empty
+    `human_gates` — gate history grows through resolve-gate/mark, an empty
+    array may still be seeded wholesale (issue #52). Indexed segments
+    (units[u-1], human_gates[gate=g]) select; the leaf key must be
+    addressed one level deeper, e.g. units[u-1].status."""
     if _split_path(path)[0] == "journal":
         raise ValueError("journal[] is append-only — transitions go through set/mark")
     if path == "human_gates" and state.get("human_gates"):
@@ -726,37 +725,47 @@ def _split_pair(spec: str) -> tuple[str, str] | None:
     return None
 
 
+def _parse_pair(pair: str, strict_all: bool) -> tuple[str | None, object, str | None]:
+    """Decode one --field pair into (field, value, refusal); refusal is
+    None when the pair decoded fine.
+
+    '@json:' at the front of the pair types its value as strict JSON
+    (issue #35); on the value itself it is honored too — unambiguous
+    intent must not silently degrade to a string that later fails schema
+    validation with a confusing type error (issue #52). Plain pairs
+    decode JSON leniently (numbers, true/false, null, ...) and fall back
+    to the raw string unless strict_all (--json-value) makes the whole
+    invocation strict."""
+    strict = pair.startswith(JSON_FIELD_PREFIX)
+    spec = pair.removeprefix(JSON_FIELD_PREFIX)
+    split = _split_pair(spec)
+    if split is None:
+        return None, None, f"--field expects path=value, got {pair!r}"
+    field, raw = split
+    field = field.strip()
+    value_prefix = not strict and raw.startswith(JSON_FIELD_PREFIX)
+    if value_prefix:
+        raw = raw.removeprefix(JSON_FIELD_PREFIX)
+    try:
+        return field, json.loads(raw), None
+    except json.JSONDecodeError as e:
+        if not (strict or value_prefix or strict_all):
+            return field, raw, None
+        hint = (" — the '@json:' prefix types one value as strict "
+                "JSON; put it at the front of the pair "
+                "('@json:path=value') or quote the payload"
+                if value_prefix else "")
+        return field, None, f"--field {field}: value is not valid JSON: {e}{hint}"
+
+
 def cmd_set(args) -> int:
     path = Path(args.file)
     state = _load(path)
     changes = []
     for pair in args.field:
-        strict_json = pair.startswith(JSON_FIELD_PREFIX)
-        spec = pair.removeprefix(JSON_FIELD_PREFIX)
-        pair_split = _split_pair(spec)
-        if pair_split is None:
-            return _refusal(f"--field expects path=value, got {pair!r}", args.human)
-        field, raw = pair_split
-        field = field.strip()
-        value_prefix = False
-        if not strict_json and raw.startswith(JSON_FIELD_PREFIX):
-            # issue #52: '@json:' belongs at the front of the pair, but a
-            # value-position prefix is still unambiguous intent — honor it
-            # as strict JSON instead of silently landing a string that
-            # surfaces later as a confusing schema type error.
-            strict_json = value_prefix = True
-            raw = raw[len(JSON_FIELD_PREFIX):]
-        try:
-            value = json.loads(raw)  # numbers, true/false, null, lists...
-        except json.JSONDecodeError as e:
-            if strict_json or args.json_value:
-                hint = (" — the '@json:' prefix types one value as strict "
-                        "JSON; put it at the front of the pair "
-                        "('@json:path=value') or quote the payload"
-                        if value_prefix else "")
-                return _refusal(f"--field {field}: value is not valid JSON: {e}{hint}",
-                                args.human)
-            value = raw  # fall back to raw string
+        field, value, refusal = _parse_pair(pair, args.json_value)
+        if refusal:
+            return _refusal(refusal, args.human)
         try:
             old = get_field(state, field)
         except (KeyError, TypeError, ValueError):

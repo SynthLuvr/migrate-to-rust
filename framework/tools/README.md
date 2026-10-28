@@ -512,12 +512,12 @@ Design decisions worth knowing before you extend:
   types one `--field` value as strict JSON and is honored at the front of
   the pair *or* directly on the value (`path=@json:[...]`) — a misplaced
   prefix never silently falls back to a plain string (issue #52); the
-  `human_gates` array may only be set wholesale while empty, after that
-  gate history grows solely through `resolve-gate`/`mark` (issue #52).
-  `mark` encodes the
-  MIGRATION_PROMPT.md discipline as hard guards: `ported` requires an
-  equivalent verdict, `escalated` opens the `unit_escalation` gate — and at
-  autonomy L2+ immediately resolves it as deferred via policy rule ESC-1
+  `human_gates` array may only be set wholesale while empty — after
+  that, gate history grows solely through `resolve-gate`/`mark`
+  (issue #52). `mark` encodes the MIGRATION_PROMPT.md discipline as hard
+  guards: `ported` requires an equivalent verdict, `escalated` opens the
+  `unit_escalation` gate — and at autonomy L2+ immediately resolves it as
+  deferred via policy rule ESC-1
   (defer, not halt; the Python fallback stays live) — `divergent_explained`
   requires the written explanation. `resolve-gate` records gate decisions
   (`--by human` or `--by policy:<rule-id>`, rule ids checked against
