@@ -16,8 +16,10 @@ is instant and trustworthy.
 
    `pipeline.py preflight` (issue #31) already captured the template's HEAD
    SHA in the state file (`preflight.checks.template.head_sha`) — reuse it
-   for the provenance header so the scaffold cites the same run that proved
-   the template reachable.
+   for the provenance header (`// Scaffold provenance: rust-template @
+   <sha>` — the form `attribution.py` accepts for scaffold-owned files
+   not derived from a Python unit, issue #54) so the scaffold cites the
+   same run that proved the template reachable.
 
    The template pre-wires the gate stack Stage 4 depends on: `rustfmt`,
    `clippy` (`-D warnings`; `unwrap_used`/`expect_used`/`unsafe_code`

@@ -19,8 +19,11 @@ and better).
 3. **Semantics drift:** silent coercions, dropped error branches, changed
    iteration/dict order that the normalization rules wrongly forgive,
    integer/float distinctions (`isize` vs Python's arbitrary precision).
-4. **Attribution:** license header + provenance present; NOTICE files intact;
-   comments not stripped; variable names not obfuscated.
+4. **Attribution:** license header + provenance present (`// Ported from
+   <python_path> [@ <sha>] [(<license>)]` per unit file — the path token
+   must name the unit's python_path; `// Scaffold provenance: <detail>`
+   for files not derived from a unit); NOTICE files intact; comments not
+   stripped; variable names not obfuscated.
 5. **Hygiene:** `clippy` pedantic + `rustfmt` clean; no new `unsafe` without
    a justification comment; no new dependencies outside
    `knowledge/substitutions.json`.

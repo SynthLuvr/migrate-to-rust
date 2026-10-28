@@ -17,15 +17,30 @@ migration state file):
   provenance every port file of a unit with a rust_path must carry a
              provenance comment — ``// Ported from <python_path>`` — naming
              EXACTLY the unit's python_path (wrong provenance fails too).
+             The path is the first whitespace-delimited token (or a quoted
+             string): a ``@ <sha>`` pin after it and a trailing
+             parenthetical are provenance detail, not a spelling error
+             (issue #54).
   headers    the original file's leading comment block (the license header)
              must appear in the port file, comment markers forgiven (# vs
              //), whitespace collapsed. An original without a header block
              trivially passes and is noted.
   strays     port-tree files claimed by no unit are listed explicitly
              (never silently skipped) — claim them via --allowlist with a
-             reason (scaffold, vendored, generated-by-template...), because
-             "independent rewrite" is exactly the masquerade this gate exists
-             to catch.
+             reason (scaffold, vendored, generated-by-template...), or give
+             them a ``// Scaffold provenance: <what it came from>`` header
+             (scaffold-owned files not derived from a Python unit:
+             rust-template's lib.rs, main.rs, build.rs, ...; reported in
+             ``scaffold_files``, never silently skipped), because
+             "independent rewrite" is exactly the masquerade this gate
+             exists to catch.
+
+The original tree: pass ``--original`` the target REPO root — python_path
+values are target-repo-relative, so the package dir (e.g. ``<repo>/src``)
+is the wrong root. ``--original`` may be omitted when the state file
+records the root a previous ``pipeline.py preflight`` captured
+(``preflight.target.root``); a deeper ``--original`` still resolves units
+via suffix and prefix-stripped matches (issue #54).
 
 Exit codes: 0 attribution preserved · 2 any loss · 1 usage/IO.
 """
@@ -46,14 +61,40 @@ from _common import (  # noqa: E402
 )
 
 TOOL = "attribution.py"
-VERSION = 1
+VERSION = 2
 
 NOTICE_NAMES = ("NOTICE", "NOTICE.md", "NOTICE.txt", "NOTICE.rst")
 LICENSE_NAMES = ("LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING", "COPYING.txt",
                  "COPYRIGHT", "AUTHORS")
 SOURCE_EXTENSIONS = {".rs", ".py"}
-PORTED_FROM_RE = re.compile(r"^(?://|#)\s*Ported from\s+(.+?)\s*$", re.MULTILINE)
+PORTED_FROM_RE = re.compile(r"^(?://|#)[ \t]*Ported from[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+# A scaffold-owned file is not derived from a Python unit, so it is not held
+# to a python_path — but the header must cite something (non-empty capture).
+# Both patterns are line-bounded ([ \t], not \s: \s crosses newlines).
+SCAFFOLD_PROVENANCE_RE = re.compile(
+    r"^(?://|#)[ \t]*Scaffold provenance:[ \t]*(\S.*?)[ \t]*$", re.MULTILINE)
 HEADER_REGION_LINES = 80
+
+CHECK_HELP = """\
+original tree + port tree + state -> report; fail on loss
+
+provenance grammar (two accepted header forms, issue #54):
+  // Ported from <python_path> [@ <sha>] [(<advisory notes>)]
+      unit-owned files: the PATH is the first whitespace-delimited token
+      (or a quoted string); everything after it — an `@ <git sha>` pin, a
+      parenthetical license/note — is provenance detail, not a path error
+  // Scaffold provenance: <what the file came from>    (must be non-empty)
+      scaffold-owned files not derived from a Python unit (rust-template's
+      lib.rs, main.rs, build.rs, tests/...): reported under scaffold_files,
+      never silently skipped
+  non-source scaffold files (Cargo.toml, justfile, deny.toml, ...) are
+  outside the stray check (source extensions only: .rs, .py)
+
+--original is the target REPO root (python_path values are repo-relative)
+and may be omitted when the state file records preflight.target.root; a
+deeper --original (e.g. <repo>/src) still resolves units via suffix and
+prefix-stripped (unique) matches.
+"""
 
 
 def _header_block(lines: list[str]) -> list[str]:
@@ -107,13 +148,28 @@ def header_preserved(original: Path, port_file: Path) -> tuple[bool, list[str]]:
     return (not missing), missing
 
 
+def _declared_path(declared: str) -> str:
+    """The python_path of one ``Ported from`` declaration: drop the advisory
+    trailing parenthetical, then take a quoted string verbatim (paths may
+    contain spaces) or the first whitespace token — an ``@ <sha>`` pin or
+    free-form notes after it are provenance detail, not the path."""
+    body = re.sub(r"\s*\([^()]*\)\s*$", "", declared).strip()
+    if body[:1] in ('"', "'"):
+        end = body.find(body[0], 1)
+        return body[1:end] if end > 0 else body.strip(body[0])
+    return body.split()[0] if body else ""
+
+
 def cmd_check(args) -> int:
-    original = Path(args.original).resolve()
+    original = Path(args.original).expanduser().resolve() if args.original else None
+    if original is not None and not original.is_dir():
+        raise ToolError(f"original tree {original} is not a directory")
     port = Path(args.port).resolve()
-    for label, p in (("original", original), ("port", port)):
-        if not p.is_dir():
-            raise ToolError(f"{label} tree {p} is not a directory")
+    if not port.is_dir():
+        raise ToolError(f"port tree {port} is not a directory")
     state = read_json(args.state)
+    if original is None:  # repo root recorded by a previous preflight
+        original = _resolve_original(state)
     units = [u for u in state.get("units", []) if u.get("rust_path")]
     allowlist = _load_allowlist(args.allowlist)
 
@@ -152,79 +208,34 @@ def cmd_check(args) -> int:
     covered_port_files: set[str] = set()
     provenance_rows = []
     for unit in units:
-        rel_rust = _normalize_rel(unit["rust_path"])
-        candidates = [r for r in port_files if r == rel_rust or r.endswith("/" + rel_rust)
-                      or r.endswith(rel_rust)]
-        if not candidates:
-            failures.append({"check": "port-file", "unit": unit["id"], "path": rel_rust,
-                             "status": "missing",
-                             "detail": f"unit {unit['id']} declares rust_path not found in port tree"})
-            continue
-        rel = candidates[0]
-        covered_port_files.add(rel)
-        port_file = port_files[rel]
-        text = port_file.read_text(encoding="utf-8", errors="replace")
-        # translator.md rule 5: `// Ported from <python_path> (<license>)` —
-        # compare the PATH; the license parenthetical is advisory (headers
-        # carry the binding form)
-        declared = [re.sub(r"\s*\([^()]*\)\s*$", "", m).strip().strip('"\'')
-                    for m in PORTED_FROM_RE.findall(text)]
-        row = {"unit": unit["id"], "port_path": rel,
-               "python_path": unit["python_path"], "declared": declared,
-               "declared_ok": unit["python_path"] in declared}
-        if not declared:
-            failures.append({"check": "provenance", "unit": unit["id"], "path": rel,
-                             "status": "missing-provenance",
-                             "detail": "no '// Ported from <python_path>' comment — every "
-                                       "generated file must carry its provenance"})
-        elif not row["declared_ok"]:
-            failures.append({"check": "provenance", "unit": unit["id"], "path": rel,
-                             "status": "wrong-provenance",
-                             "detail": f"declares {declared!r}, unit's python_path is "
-                                       f"{unit['python_path']!r}"})
-        orig_py = _find_original(unit["python_path"], orig_files, original)
-        if orig_py is None:
-            warnings.append({"check": "original-missing", "unit": unit["id"],
-                             "path": unit["python_path"],
-                             "detail": "original python file not found under the original tree "
-                                       "(header check skipped)"})
-            row["header_preserved"] = None
-        else:
-            ok, missing_lines = header_preserved(orig_py, port_file)
-            row["header_preserved"] = ok
-            if not ok:
-                failures.append({"check": "header", "unit": unit["id"], "path": rel,
-                                 "status": "header-lost",
-                                 "detail": f"original header line(s) not found in the first "
-                                           f"{HEADER_REGION_LINES} lines of the port file: "
-                                           f"{missing_lines[:3]}"})
-        provenance_rows.append(row)
+        row = _check_unit(unit, port_files, orig_files, failures, warnings)
+        if row is not None:
+            covered_port_files.add(row["port_path"])
+            provenance_rows.append(row)
 
     # ---- strays: port files claimed by nobody ------------------------------
-    strays = []
-    for rel in sorted(port_files):
-        if os.path.splitext(rel)[1].lower() not in SOURCE_EXTENSIONS:
-            continue
-        if rel in covered_port_files or rel in allowlist:
-            continue
-        strays.append({"path": rel, "reason": allowlist.get(rel, "claimed by no unit "
-                                                                 "and not allowlisted")})
-    for s in strays:
-        failures.append({"check": "unattributed-file", "path": s["path"],
-                         "status": "unattributed", "detail": s["reason"]})
+    strays, scaffold_files = _classify_unclaimed(port_files, covered_port_files,
+                                                 allowlist)
+    failures.extend({"check": "unattributed-file", "path": s["path"],
+                     "status": "unattributed", "detail": s["reason"]} for s in strays)
 
     ok = not failures
     code = EXIT_OK if ok else EXIT_FINDINGS
     counts = {"units_checked": len(units), "notices": len(notices), "licenses": len(licenses),
-              "failures": len(failures), "warnings": len(warnings), "strays": len(strays)}
+              "failures": len(failures), "warnings": len(warnings), "strays": len(strays),
+              "scaffold_files": len(scaffold_files)}
     human = ("attribution: PRESERVED" if ok else
-             f"attribution: LOSS DETECTED ({len(failures)} failure(s))") + \
-            (f", {len(warnings)} warning(s)" if warnings else "")
+             f"attribution: LOSS DETECTED ({len(failures)} failure(s))")
+    if scaffold_files:
+        human += f", {len(scaffold_files)} scaffold file(s)"
+    if warnings:
+        human += f", {len(warnings)} warning(s)"
     emit({
         "tool": TOOL, "version": VERSION,
         "original": str(original), "port": str(port), "state": str(Path(args.state).resolve()),
         "notices": notices, "licenses": licenses,
         "provenance": provenance_rows,
+        "scaffold_files": scaffold_files,
         "unattributed_files": strays,
         "failures": failures, "warnings": warnings, "infos": infos,
         "counts": counts, "ok": ok,
@@ -237,12 +248,129 @@ def _normalize_rel(path: str) -> str:
     return path.replace("\\", "/").lstrip("./")
 
 
-def _find_original(python_path: str, orig_files: dict, original: Path) -> Path | None:
+def _resolve_original(state: dict) -> Path:
+    """The original (Python) tree when ``--original`` is absent: the target
+    repo root a previous ``pipeline.py preflight`` recorded
+    (``preflight.target.root``) — the same resolution pipeline.py/delegate.py
+    use. python_path values are target-repo-relative, so the repo root (not
+    the package dir) is the tree they resolve against."""
+    raw = ((state.get("preflight") or {}).get("target") or {}).get("root")
+    if not raw:
+        raise ToolError(
+            "no original tree: pass --original (the target REPO root — python_path "
+            "values are repo-relative) or run pipeline.py preflight first so "
+            "preflight.target.root is recorded in the state file", kind="usage")
+    original = Path(raw).expanduser().resolve()
+    if not original.is_dir():
+        raise ToolError(f"original tree {original} (preflight.target.root) is not a "
+                        "directory — re-run pipeline.py preflight or pass --original",
+                        kind="io")
+    return original
+
+
+def _check_unit(unit: dict, port_files: dict[str, Path], orig_files: dict[str, Path],
+                failures: list[dict], warnings: list[dict]) -> dict | None:
+    """Provenance + header checks for one unit; appends failures/warnings and
+    returns the report row, or None when the unit's rust_path is missing
+    from the port tree (recorded as a failure)."""
+    rel_rust = _normalize_rel(unit["rust_path"])
+    candidates = [r for r in port_files if r == rel_rust or r.endswith("/" + rel_rust)
+                  or r.endswith(rel_rust)]
+    if not candidates:
+        failures.append({"check": "port-file", "unit": unit["id"], "path": rel_rust,
+                         "status": "missing",
+                         "detail": f"unit {unit['id']} declares rust_path not found in port tree"})
+        return None
+    rel = candidates[0]
+    port_file = port_files[rel]
+    text = port_file.read_text(encoding="utf-8", errors="replace")
+    # translator.md rule 5: `// Ported from <python_path> (<license>)` — the
+    # license parenthetical is advisory and an `@ <sha>` pin after the path
+    # is provenance; the path token is what must match
+    declared = PORTED_FROM_RE.findall(text)
+    declared_paths = [_declared_path(m) for m in declared]
+    row = {"unit": unit["id"], "port_path": rel,
+           "python_path": unit["python_path"], "declared": declared,
+           "declared_paths": declared_paths,
+           "declared_ok": unit["python_path"] in declared_paths}
+    if not declared:
+        failures.append({"check": "provenance", "unit": unit["id"], "path": rel,
+                         "status": "missing-provenance",
+                         "detail": "no '// Ported from <python_path>' comment — every "
+                                   "generated file must carry its provenance"})
+    elif not row["declared_ok"]:
+        failures.append({"check": "provenance", "unit": unit["id"], "path": rel,
+                         "status": "wrong-provenance",
+                         "detail": f"declares {declared!r} (paths {declared_paths!r}), "
+                                   f"unit's python_path is {unit['python_path']!r}"})
+    orig_py = _find_original(unit["python_path"], orig_files)
+    if orig_py is None:
+        warnings.append({"check": "original-missing", "unit": unit["id"],
+                         "path": unit["python_path"],
+                         "detail": "original python file not found under the original tree "
+                                   "(header check skipped)"})
+        row["header_preserved"] = None
+    else:
+        ok, missing_lines = header_preserved(orig_py, port_file)
+        row["header_preserved"] = ok
+        if not ok:
+            failures.append({"check": "header", "unit": unit["id"], "path": rel,
+                             "status": "header-lost",
+                             "detail": f"original header line(s) not found in the first "
+                                       f"{HEADER_REGION_LINES} lines of the port file: "
+                                       f"{missing_lines[:3]}"})
+    return row
+
+
+def _classify_unclaimed(port_files: dict[str, Path], covered: set[str],
+                        allowlist: dict[str, str]) -> tuple[list[dict], list[dict]]:
+    """Split source files claimed by no unit into scaffold-owned (carrying a
+    ``// Scaffold provenance:`` header — reported, never silently skipped)
+    and strays (failures; excused only by --allowlist with a reason)."""
+    strays, scaffold_files = [], []
+    for rel in sorted(port_files):
+        if os.path.splitext(rel)[1].lower() not in SOURCE_EXTENSIONS:
+            continue
+        if rel in covered or rel in allowlist:
+            continue
+        provenance = SCAFFOLD_PROVENANCE_RE.findall(
+            port_files[rel].read_text(encoding="utf-8", errors="replace"))
+        if provenance:
+            scaffold_files.append({"path": rel, "provenance": provenance})
+        else:
+            strays.append({"path": rel, "reason": allowlist.get(
+                rel, "claimed by no unit and not allowlisted")})
+    return strays, scaffold_files
+
+
+def _suffix_matches(candidate: str, orig_files: dict[str, Path]) -> list[Path]:
+    return [path for rel, path in orig_files.items() if rel.endswith("/" + candidate)]
+
+
+def _find_original(python_path: str, orig_files: dict[str, Path]) -> Path | None:
+    """Locate the unit's original Python file under the original tree.
+    python_path values are target-repo-relative, so try in order: the exact
+    spelling (original tree rooted at the repo root), an anchored suffix
+    match (original tree rooted deeper), then the same two with leading
+    components dropped — the ``--original <repo>/src`` case — accepted only
+    on a unique hit so a dangling python_path can't false-positive onto an
+    unrelated same-named file (issue #54: header checks must run, not
+    silently skip)."""
     rel = _normalize_rel(python_path)
     if rel in orig_files:
         return orig_files[rel]
-    suffix_matches = [p for r, p in orig_files.items() if r.endswith("/" + rel) or r == rel]
-    return suffix_matches[0] if suffix_matches else None
+    hits = _suffix_matches(rel, orig_files)
+    if hits:
+        return hits[0]
+    parts = rel.split("/")
+    for i in range(1, len(parts)):
+        candidate = "/".join(parts[i:])
+        if candidate in orig_files:
+            return orig_files[candidate]
+        hits = _suffix_matches(candidate, orig_files)
+        if len(hits) == 1:
+            return hits[0]
+    return None
 
 
 def _compare_bytes(rel: str, opath: Path, ppath: Path | None, port_root: Path) -> dict:
@@ -278,8 +406,12 @@ def main(argv=None) -> int:
     ap.add_argument("--human", action="store_true", help="echo human summary to stderr")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("check", help="original tree + port tree + state -> report; fail on loss")
-    p.add_argument("--original", required=True, help="original (Python) tree")
+    p = sub.add_parser("check", help="original tree + port tree + state -> report; fail on loss",
+                       description=CHECK_HELP,
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--original",
+                   help="original (Python) tree — the target REPO root; defaults to the root "
+                        "recorded by pipeline.py preflight (preflight.target.root)")
     p.add_argument("--port", required=True, help="port (Rust) tree")
     p.add_argument("--state", required=True,
                    help="migration-state.json; its units define the port scope")
