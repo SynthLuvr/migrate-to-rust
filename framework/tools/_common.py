@@ -160,13 +160,18 @@ def run_cli(main_func, argv=None, *, tool: str | None = None,
 
 
 def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,
-              input_text: str | None = None, timeout: float = 120.0) -> tuple[int, str, str]:
+              input_text: str | None = None, timeout: float = 120.0,
+              env_extra: dict[str, str] | None = None) -> tuple[int, str, str]:
     """Deterministic child-process helper: fixed env additions, captured
-    stdout/stderr, hard timeout. Returns (returncode, stdout, stderr)."""
+    stdout/stderr, hard timeout. `env_extra` layers caller variables on top
+    (e.g. a per-unit CARGO_TARGET_DIR) without loosening the fixed ones.
+    Returns (returncode, stdout, stderr)."""
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = "0"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.pop("PYTHONSTARTUP", None)
+    if env_extra:
+        env.update(env_extra)
     proc = subprocess.run(
         cmd, cwd=cwd, env=env, input=input_text, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,

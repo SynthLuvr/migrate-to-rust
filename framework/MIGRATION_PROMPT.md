@@ -142,6 +142,11 @@ mechanical import fix, compile gates with verbatim feedback, oracle
 ranking, and the winner's verdict pack for `state.py` — is mechanized as
 one command by [`tools/delegate.py`](tools/delegate.py)
 `run-candidates` (issue #33); delegates report, the orchestrator records.
+The runner also owns **build isolation** (issue #55): every candidate's
+gates and the wheel build run in a per-candidate sandbox copy of the
+crate with the sibling candidates stripped, under the unit's own
+`CARGO_TARGET_DIR` — compile feedback cites only the candidate's own
+file, never a sibling's half-written module.
 
 Judge = output hash / structured comparison / property tests. **Never an LLM
 judge** (CETBench: unreliable). Every run classified `Equivalent /
@@ -150,7 +155,13 @@ Divergent / Incomparable`; every Divergent carries a written explanation.
 ## Role separation (when delegating)
 
 - **translator** (`roles/translator.md`): mechanical implementation of one
-  unit; strict file partitioning; may run in parallel across units.
+  unit; strict file partitioning; parallel only across **separate crates** —
+  on one shared crate, cargo compiles every wired `src/*.rs`, so a
+  sibling's half-written module fails everyone's verify loop (issue #55):
+  run one unit's delegates at a time, or a tranche at a time with the
+  crate green between tranches, and let `delegate.py`'s per-candidate
+  sandboxes isolate the K candidates. Compile errors in files that are
+  not yours are not yours to fix — report and wait.
 - **reviewer** (`roles/reviewer.md`): adversarial parity + PyO3-FFI review
   (refcounts, PyErr hygiene, GIL detach, free-threading) + attribution diff.
   Use a *different* model for review than translation if available —

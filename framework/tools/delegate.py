@@ -10,6 +10,18 @@ budget, partitioning by instruction, manual gates, manual judge invocation,
 and a delegate hitting its turn cap mid-unit, which is exactly when the
 loop must be cheap to restart).
 
+**Build isolation (issue #55):** strict *file* partitioning does not
+partition *feedback* — cargo compiles every wired ``src/*.rs``, so a
+stalled sibling's half-written module fails everyone else's gates and
+burns their repair rounds on errors that are not theirs. Each
+candidate's gates and the wheel build therefore run in a per-candidate
+**sandbox copy** of the crate with every other candidate's module
+stripped (file deleted, its ``mod`` line removed), under a per-unit
+``CARGO_TARGET_DIR``, so compiler feedback cites only the candidate's
+own file. The real crate stays the authoritative tree the delegates
+write into; ``--no-isolate-builds`` restores shared-crate behavior for
+custom gates that cannot tolerate a copy.
+
     python framework/tools/delegate.py run-candidates \
         --state runs/<project>/migration-state.json --unit u-foo \
         --k 3 --agent-cmd 'goose session run {brief_file} {feedback_file}'
@@ -64,8 +76,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -78,7 +92,7 @@ from _common import (  # noqa: E402
 )
 
 TOOL = "delegate.py"
-VERSION = 1
+VERSION = 2
 FRAMEWORK = Path(__file__).resolve().parent.parent
 ROLE_FILE = FRAMEWORK / "roles" / "translator.md"
 SUBSTITUTIONS = FRAMEWORK / "knowledge" / "substitutions.json"
@@ -96,6 +110,15 @@ BUILD_TIMEOUT = 1800.0
 JUDGE_TIMEOUT = 300.0
 OUTPUT_CAP = 65536                  # feedback/record cap; 'truncated' flags honesty
 TAIL = 4000
+
+# what a sandbox crate copy never carries: heavy caches (slow to copy,
+# stale artifacts would leak between candidates). "delegates" keeps a state
+# dir living inside the crate from recursing into its own sandboxes.
+SANDBOX_IGNORE = {"target", ".git", "__pycache__", ".venv", "venv",
+                  "node_modules", "dist", "build", ".mypy_cache",
+                  ".pytest_cache", ".tox", ".ruff_cache", "delegates"}
+NOT_YOURS_RULE = ("compile errors in files that are not yours are not yours "
+                  "to fix — report and wait (translator rule 9)")
 
 VERDICT_RANK = {"equivalent": 3, "divergent": 2, "incomparable": 1, "unjudged": 0}
 PLACEHOLDERS = ("unit", "k", "candidate", "module", "rust_file", "rust_file_rel",
@@ -293,7 +316,7 @@ def _contract_path(args, state_path: Path) -> tuple[Path | None, str]:
 def _write_brief(entry: dict, unit: dict, *, contract: Path | None,
                  contract_note: str, k: int, max_rounds: int,
                  gates: list[str], candidate_module: str | None,
-                 target_root: Path) -> None:
+                 target_root: Path, isolate: bool = True) -> None:
     """The delegate's whole world: its own file + the contract + the
     Python source + the role sheet (strict file partitioning)."""
     wheel_module = (candidate_module.replace("{candidate}", entry["candidate"])
@@ -303,7 +326,7 @@ def _write_brief(entry: dict, unit: dict, *, contract: Path | None,
         f"{entry['candidate']} (of {k})",
         "",
         f"Read first (verbatim, they bind you): `{ROLE_FILE}` — the "
-        "translator role sheet. Rules 1-8 apply in full.",
+        "translator role sheet. Rules 1-9 apply in full.",
         "",
         "## Inputs (read-only)",
         f"- role sheet: `{ROLE_FILE}`",
@@ -337,6 +360,14 @@ def _write_brief(entry: dict, unit: dict, *, contract: Path | None,
         "modules (Stage 4 step 3)",
     ]
     lines += [f"- `{g}`" for g in gates]
+    if isolate:
+        lines += [
+            "",
+            "Gates run in an isolated sandbox copy of the crate carrying "
+            "only YOUR module (every other candidate's is stripped), under "
+            "the unit's own CARGO_TARGET_DIR — compile feedback reflects "
+            "only your file, never a sibling's half-written one (issue #55).",
+        ]
     lines += [
         "",
         "## Budget",
@@ -351,6 +382,124 @@ def _write_brief(entry: dict, unit: dict, *, contract: Path | None,
     p = Path(entry["brief_file"])
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ------------------------------------------------ build isolation (#55) ----
+
+def _mod_line_re(module: str) -> re.Pattern:
+    """The `mod <module>;` declaration line that wires a candidate's file
+    into the crate (any visibility, indented, trailing comment tolerated) —
+    what a sandbox must remove for every OTHER candidate, or cargo demands
+    a file we just deleted."""
+    return re.compile(rf"^[ \t]*(?:pub(?:\([-\w]+\))?[ \t]+)?mod[ \t]+"
+                      rf"{re.escape(module)}[ \t]*;", re.M)
+
+
+def _strip_mod_lines(text: str, modules: set[str]) -> str:
+    """Drop each `mod <m>;` line plus the attribute lines (`#[...]`)
+    directly above it — a dangling attribute is itself a compile error."""
+    patterns = [_mod_line_re(m) for m in modules]
+    kept: list[str] = []
+    attrs: list[str] = []
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith("#["):
+            attrs.append(line)
+        elif any(p.match(line) for p in patterns):
+            attrs.clear()               # the attributes belonged to the mod
+        else:
+            kept.extend(attrs)
+            attrs.clear()
+            kept.append(line)
+    kept.extend(attrs)
+    return "".join(kept)
+
+
+def _strip_candidate(sandbox: Path, entry: dict,
+                     rust_files: list[Path]) -> bool:
+    """Remove one non-kept candidate from a sandbox copy: delete its file
+    and the `mod` line wiring it. Returns whether the sandbox carried
+    either."""
+    path = sandbox / entry["rust_file_rel"]
+    found = path.exists()
+    if found:
+        path.unlink()
+    pattern = _mod_line_re(entry["module"])
+    wired = False
+    for rs in rust_files:
+        try:
+            text = rs.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if pattern.search(text):
+            wired = True
+            rs.write_text(_strip_mod_lines(text, {entry["module"]}),
+                          encoding="utf-8")
+    return found or wired
+
+
+def _materialize_sandbox(target_root: Path, sandbox: Path, plan: list[dict],
+                         keep: set[str], cargo_target: Path) -> dict:
+    """Fresh source-only copy of the crate at `sandbox` with every candidate
+    NOT in `keep` stripped. The real crate is never touched — it stays the
+    authoritative tree the delegates write into; only the gate/build
+    criterion runs against the sandbox, so compiler feedback cites only the
+    kept candidate's own file. Returns the record for the verdict pack."""
+    if sandbox.exists():
+        shutil.rmtree(sandbox)
+    sandbox.parent.mkdir(parents=True, exist_ok=True)
+
+    def _ignore(directory: str, names: list[str]) -> set[str]:
+        # never recurse into this run's own scratch (the sandbox tree and
+        # the shared cargo target), even when the state dir lives in the crate
+        avoid = (sandbox, sandbox.parent, cargo_target)
+        ignored = set()
+        for n in names:
+            p = Path(directory) / n
+            if n in SANDBOX_IGNORE or p in avoid or sandbox in p.parents:
+                ignored.add(n)
+        return ignored
+
+    shutil.copytree(target_root, sandbox, ignore=_ignore,
+                   symlinks=True, ignore_dangling_symlinks=True)
+    rust_files = [rs for rs in sandbox.rglob("*.rs") if rs.is_file()]
+    others = sorted((e for e in plan if e["candidate"] not in keep),
+                    key=lambda e: e["candidate"])
+    stripped = [e["candidate"] for e in others
+                if _strip_candidate(sandbox, e, rust_files)]
+    return {"root": str(sandbox), "kept": sorted(keep),
+            "stripped": stripped}
+
+
+def _cargo_env(cargo_target: Path) -> dict[str, str]:
+    """One CARGO_TARGET_DIR per unit: shared across its sandboxes (deps
+    build once) and never the crate's own target/ (no build-lock
+    contention between candidates)."""
+    return {"CARGO_TARGET_DIR": str(cargo_target)}
+
+
+def _build_isolation(args, delegates_dir: Path, plan: list[dict]) -> dict | None:
+    """Where the unit's sandbox copies and CARGO_TARGET_DIR live, or None
+    when --no-isolate-builds."""
+    if not args.isolate_builds:
+        return None
+    sandbox_root = (Path(args.sandbox_root) if args.sandbox_root
+                    else delegates_dir / "sandboxes")
+    cargo_target = (Path(args.cargo_target_dir) if args.cargo_target_dir
+                    else delegates_dir / "cargo-target")
+    cargo_target.mkdir(parents=True, exist_ok=True)
+    return {"sandbox_root": sandbox_root, "cargo_target": cargo_target,
+            "plan": plan}
+
+
+def _isolation_summary(isolation: dict | None) -> dict:
+    """The verdict pack's build_isolation block."""
+    if isolation is None:
+        return {"mode": "shared"}
+    return {"mode": "sandbox",
+            "sandbox_root": str(isolation["sandbox_root"]),
+            "cargo_target_dir": str(isolation["cargo_target"]),
+            "note": "per-candidate sandbox crates, sibling candidates "
+                    "stripped, one CARGO_TARGET_DIR per unit (issue #55)"}
 
 
 # --------------------------------------------------------------- gates ----
@@ -381,11 +530,13 @@ def _attributed_spans(output: str, rust_file_rel: str) -> dict:
             "cited": sorted(set(spans))}
 
 
-def _run_gate(cmd: str, subs: dict, cwd: Path, timeout: float) -> dict:
+def _run_gate(cmd: str, subs: dict, cwd: Path, timeout: float,
+              env: dict[str, str] | None = None) -> dict:
     rendered = cmd.format_map(_Template(subs))
     argv = shlex.split(rendered)
     try:
-        rc, out, err = run_child(argv, cwd=str(cwd), timeout=timeout)
+        rc, out, err = run_child(argv, cwd=str(cwd), timeout=timeout,
+                                 env_extra=env)
     except subprocess.TimeoutExpired:
         return {"cmd": rendered, "exit_code": 124,
                 "output": f"timed out after {timeout:g}s", "truncated": False}
@@ -398,11 +549,13 @@ def _run_gate(cmd: str, subs: dict, cwd: Path, timeout: float) -> dict:
 
 
 def _invoke_agent(cmd_template: str, subs: dict, cwd: Path,
-                  timeout: float) -> tuple[int, str]:
+                  timeout: float, env: dict[str, str] | None = None
+                  ) -> tuple[int, str]:
     cmd = cmd_template.format_map(_Template(subs))
     try:
         proc = subprocess.run(shlex.split(cmd), cwd=str(cwd),
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, timeout=timeout,
+                              env={**dict(os.environ), **(env or {})})
     except FileNotFoundError as e:
         return 127, f"agent command not found: {e}"
     except subprocess.TimeoutExpired:
@@ -418,7 +571,8 @@ def _feedback_text(entry: dict, round_no: int, max_rounds: int,
             f"candidate {entry['candidate']}, round {round_no}/{max_rounds}",
             "Everything below the markers is gate/agent output VERBATIM "
             "(compiler errors are the strongest signal — MIGRATION_PROMPT.md "
-            "repair loop). Fix YOUR file only, then finish.",
+            f"repair loop). Fix YOUR file only, then finish. "
+            f"{NOT_YOURS_RULE}.",
             ""]
     if agent is not None:
         rc, tail = agent
@@ -519,24 +673,42 @@ def _judge_candidate(derived_manifest: Path, timeout: float) -> dict:
 
 def _gates_after_agent(rec: dict, entry: dict, gates: list[str], subs: dict,
                        import_allow: set[str], target_root: Path,
-                       gate_timeout: float) -> list[dict]:
+                       gate_timeout: float, isolation: dict | None = None
+                       ) -> tuple[list[dict], dict | None]:
     """The import gate plus the compile gates, run only after a clean agent
-    exit; import findings ride rec for the verdict pack."""
+    exit; import findings ride rec for the verdict pack. Under isolation
+    the compile gates run in a fresh sandbox copy of the crate carrying
+    only this candidate's module, so a stalled sibling's half-written file
+    cannot fail this verify loop. Returns (gate records, sandbox record)."""
     findings = _import_findings(Path(entry["rust_file"]), import_allow)
     rec["import_findings"] = findings
     if findings:
-        return [{"cmd": "<mechanical import gate>",
-                 "exit_code": EXIT_FINDINGS,
-                 "output": "\n".join(findings),
-                 "truncated": False}]
-    return [_run_gate(g, subs, target_root, gate_timeout) for g in gates]
+        return ([{"cmd": "<mechanical import gate>",
+                  "exit_code": EXIT_FINDINGS,
+                  "output": "\n".join(findings),
+                  "truncated": False}], None)
+    if isolation is None:
+        return [_run_gate(g, subs, target_root, gate_timeout)
+                for g in gates], None
+    sandbox = _materialize_sandbox(
+        target_root, isolation["sandbox_root"] / entry["candidate"],
+        isolation["plan"], {entry["candidate"]}, isolation["cargo_target"])
+    root = Path(sandbox["root"])
+    gate_subs = {**subs, "rust_file": str(root / entry["rust_file_rel"]),
+                 "target_root": sandbox["root"]}
+    return [_run_gate(g, gate_subs, root, gate_timeout,
+                      env=_cargo_env(isolation["cargo_target"]))
+            for g in gates], sandbox
 
 
 def _run_candidate(entry: dict, args, gates: list[str], import_allow: set[str],
-                   base_subs: dict, target_root: Path) -> dict:
+                   base_subs: dict, target_root: Path,
+                   isolation: dict | None = None) -> dict:
     """Round 0 (initial translation) + up to MAX_ROUNDS repair rounds, each
     repairing against the previous round's verbatim gate output. Every
-    invocation and gate result is recorded; nothing is retried silently."""
+    invocation and gate result is recorded; nothing is retried silently.
+    The agent works in the REAL crate (its writes are the deliverable);
+    only the gates isolate."""
     rec: dict = {"candidate": entry["candidate"], "index": entry["index"],
                  "module": entry["module"],
                  "rust_file": entry["rust_file"],
@@ -545,6 +717,7 @@ def _run_candidate(entry: dict, args, gates: list[str], import_allow: set[str],
                  "import_findings": [], "agent_invocations": 0}
     feedback_path = Path(entry["feedback_file"])
     feedback_path.parent.mkdir(parents=True, exist_ok=True)
+    agent_env = _cargo_env(isolation["cargo_target"]) if isolation else None
     total = 1 + args.max_rounds
     for round_no in range(total):
         subs = {**base_subs, **entry, "round": round_no}
@@ -555,13 +728,22 @@ def _run_candidate(entry: dict, args, gates: list[str], import_allow: set[str],
                 _feedback_text(entry, round_no, args.max_rounds, None, None),
                 encoding="utf-8")
         rc, tail = _invoke_agent(args.agent_cmd, subs, target_root,
-                                 args.agent_timeout)
+                                 args.agent_timeout, env=agent_env)
         rec["agent_invocations"] += 1
         round_rec: dict = {"round": round_no, "agent_exit": rc,
                            "agent_tail": tail[-800:]}
-        gate_recs = (_gates_after_agent(rec, entry, gates, subs, import_allow,
-                                        target_root, args.gate_timeout)
-                     if rc == 0 else [])
+        gate_recs: list[dict] = []
+        sandbox = None
+        if rc == 0:
+            gate_recs, sandbox = _gates_after_agent(
+                rec, entry, gates, subs, import_allow, target_root,
+                args.gate_timeout, isolation)
+        # evidence stays exact: a round blocked by the import gate ran in no
+        # sandbox, so the pack must not cite an earlier round's
+        if sandbox is not None:
+            round_rec["sandbox"] = rec["sandbox"] = sandbox
+        else:
+            rec.pop("sandbox", None)
         round_rec["gates"] = gate_recs
         green = rc == 0 and bool(gate_recs) and \
             all(g["exit_code"] == 0 for g in gate_recs)
@@ -723,6 +905,7 @@ def _emit_dry_run(args, plan: list[dict], gates: list[str],
         "build_cmd": None if args.no_build else args.build_cmd,
         "candidate_module": args.candidate_module,
         "target_root": str(target_root),
+        "isolate_builds": args.isolate_builds,
         "contract": str(contract) if contract else None,
         "contract_note": contract_note,
         "candidates": plan, "import_allowlist_size": len(import_allow),
@@ -733,15 +916,27 @@ def _emit_dry_run(args, plan: list[dict], gates: list[str],
     return EXIT_OK
 
 
-def _build_wheel(args, target_root: Path) -> dict:
-    """One wheel build over the whole candidate set; only gate-green
-    candidates reach it (the wheel carries only the best-structured
-    candidates forward to judging)."""
+def _build_wheel(args, target_root: Path, plan: list[dict],
+                 green: list[dict], isolation: dict | None = None) -> dict:
+    """One wheel build over the candidate set; only gate-green candidates
+    reach it (they are what the wheel carries forward to judging). Under
+    isolation the build runs in a sandbox copy carrying only this run's
+    gate-green candidates, so a stalled candidate's half-written module
+    cannot fail the winners' wheel."""
     build: dict = {"attempted": True, "cmd": args.build_cmd}
+    cwd, env = target_root, None
+    if isolation is not None:
+        keep = {r["candidate"] for r in green}
+        sandbox = _materialize_sandbox(
+            target_root, isolation["sandbox_root"] / "build", plan, keep,
+            isolation["cargo_target"])
+        build["sandbox"] = sandbox
+        build["cargo_target_dir"] = str(isolation["cargo_target"])
+        cwd, env = Path(sandbox["root"]), _cargo_env(isolation["cargo_target"])
     try:
         rc, out, err = run_child(shlex.split(args.build_cmd),
-                                 cwd=str(target_root),
-                                 timeout=args.build_timeout)
+                                 cwd=str(cwd),
+                                 timeout=args.build_timeout, env_extra=env)
     except subprocess.TimeoutExpired:
         rc, out, err = 124, "", f"build timed out after {args.build_timeout:g}s"
     except FileNotFoundError as e:
@@ -841,6 +1036,9 @@ def cmd_run_candidates(args) -> int:
         return _emit_dry_run(args, plan, gates, contract, contract_note,
                              target_root, import_allow, cargo_note)
 
+    delegates_dir = state_path.parent / "delegates" / args.unit
+    isolation = _build_isolation(args, delegates_dir, plan)
+
     base_subs = {"unit": args.unit, "k": args.k,
                  "max_rounds": args.max_rounds,
                  "contract": str(contract) if contract else "",
@@ -853,14 +1051,15 @@ def cmd_run_candidates(args) -> int:
                          contract_note=contract_note, k=args.k,
                          max_rounds=args.max_rounds, gates=gates,
                          candidate_module=args.candidate_module,
-                         target_root=target_root)
+                         target_root=target_root,
+                         isolate=args.isolate_builds)
 
     results = [_run_candidate(entry, args, gates, import_allow, base_subs,
-                              target_root)
+                              target_root, isolation=isolation)
                for entry in plan if entry["run"]]
 
     green = [r for r in results if r["gate_green"]]
-    build = (_build_wheel(args, target_root)
+    build = (_build_wheel(args, target_root, plan, green, isolation=isolation)
              if green and not args.no_build else {"attempted": False})
     judged_any = False
     if green and not build.get("failed"):
@@ -879,6 +1078,7 @@ def cmd_run_candidates(args) -> int:
         "k": args.k, "max_rounds": args.max_rounds,
         "gates": ["<mechanical import gate>", *gates],
         "build": build, "target_root": str(target_root),
+        "build_isolation": _isolation_summary(isolation),
         "contract": str(contract) if contract else None,
         "plan": plan,
         "candidates": ranked,
@@ -892,7 +1092,7 @@ def cmd_run_candidates(args) -> int:
                      "separation; sessions[] entries are ready to append)"),
     }
     pack_out = Path(args.pack_out) if args.pack_out else \
-        state_path.parent / "delegates" / args.unit / "verdict-pack.json"
+        delegates_dir / "verdict-pack.json"
     write_json_atomic(pack_out, pack)
 
     human = table + f"\nverdict pack: {pack_out}"
@@ -951,6 +1151,22 @@ def main(argv=None) -> int:
     p.add_argument("--no-build", action="store_true",
                    help="skip the wheel build (judging then needs an "
                         "already-installed wheel)")
+    p.add_argument("--no-isolate-builds", dest="isolate_builds",
+                   action="store_false", default=True,
+                   help="run gates/build in the REAL crate instead of "
+                        "per-candidate sandbox copies (issue #55: cargo "
+                        "compiles every wired src/*.rs, so a sibling's "
+                        "half-written module fails everyone's gates — "
+                        "isolation is the default; disable only for custom "
+                        "gates that cannot tolerate a crate copy)")
+    p.add_argument("--sandbox-root",
+                   help="where per-candidate sandbox crate copies live "
+                        "(default: <state_dir>/delegates/<unit>/sandboxes)")
+    p.add_argument("--cargo-target-dir",
+                   help="the unit's CARGO_TARGET_DIR for sandboxed gates/"
+                        "builds, shared across candidates so dependencies "
+                        "compile once (default: <state_dir>/delegates/<unit>/"
+                        "cargo-target)")
     p.add_argument("--only",
                    help="comma-separated candidate subset (c2,c3) — restart a "
                         "budget-exhausted unit mid-loop (issue #25)")

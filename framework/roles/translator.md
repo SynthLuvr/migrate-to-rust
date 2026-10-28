@@ -29,6 +29,13 @@ knowledge-pack excerpt.
 8. You have `MAX_ROUNDS`. On stall, return your best candidate **plus the
    exact failing diff**. Never weaken a test, skip a check, or descope to go
    green — that is the ScanCode failure mode and it voids the whole migration.
+9. Compile errors in files that are **not yours** are not yours to fix —
+   report and wait. Your verify loop may share the crate with in-flight
+   siblings: cargo compiles every wired `src/*.rs`, so their half-written
+   modules surface in your build output. Fix only spans citing files in
+   your partition; anything else goes in your report (issue #55 —
+   `delegate.py`'s sandboxed gates already strip sibling candidates, but
+   any cargo you run yourself still sees them).
 
 ## Knowledge pack pointers
 - PyO3 user guide: error handling, `detach`/parallelism, free-threading,

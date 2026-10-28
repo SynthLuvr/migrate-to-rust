@@ -45,7 +45,14 @@ is instant and trustworthy.
      maturin build backend.
 2. PyO3 module skeleton matching the installed API generation: Bound API
    (0.21+), gil-refs removed (0.23), `attach`/`detach` + thread-safe default
-   (0.28+). Do not mix generations.
+   (0.28+). Do not mix generations. Then **pre-wire every planned unit as a
+   placeholder module** — its `mod <unit>;` line plus a no-op
+   `register()` (unit list from `port_plan.py`) — so the crate compiles
+   green with any unit missing and Stage-4 translators replace only their
+   unit's file. Placeholders fix *missing* files, not half-written ones:
+   Stage 4 still serializes per crate / isolates candidate builds
+   (issue #55, `4-translate.md`). Mark placeholders so `attribution.py`
+   sees scaffold provenance, not a missing port header.
 3. `maturin`: wheel build + `pip install` smoke test. Choose abi3 vs
    version-specific wheels; free-threaded Python needs `cp314t` wheels
    (`abi3t` arrives with 3.15).

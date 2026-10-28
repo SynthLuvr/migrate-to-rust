@@ -293,6 +293,26 @@ via a derived manifest that retargets the scaffolded candidate adapter
 ranked table (equivalent/divergent/incomparable counts, diff-kind
 histogram) with the winner.
 
+**Build isolation (issue #55).** Strict *file* partitioning does not
+partition *feedback*: `cargo build`/`clippy`/`maturin develop` compile
+every wired `src/*.rs`, so a sibling candidate's half-written module
+fails everyone's gates — in a real run, delegates burned their whole
+budgets triaging other units' compile errors. The runner therefore runs
+each candidate's compile gates **and** the wheel build in a per-candidate
+**sandbox copy** of the crate — every other candidate's module stripped
+(file deleted, its `mod` line removed) — under a per-unit
+`CARGO_TARGET_DIR` (dependencies build once, shared; the crate's own
+`target/` is never contended). Compiler feedback then cites only the
+candidate's own file; the sandbox is re-materialized from the live crate
+before every gate run, and the real crate stays the authoritative tree
+the delegates write into. `--no-isolate-builds` restores shared-target
+behavior for custom gates that cannot tolerate a copy;
+`--sandbox-root`/`--cargo-target-dir` relocate the scratch. The same
+contention rule is documented for hand-run delegation in
+`../stages/4-translate.md` (serialize per crate), and the briefs carry
+translator rule 9 verbatim: compile errors in files that are not yours
+are not yours to fix — report and wait.
+
 **It never writes the state file** — the orchestrator/driver stays the
 only writer (role separation). It emits a JSON verdict pack (stdout +
 `<state_dir>/delegates/<unit>/verdict-pack.json`) carrying the ranking,
