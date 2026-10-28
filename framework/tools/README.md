@@ -49,6 +49,29 @@ python runs/corpora/gen_u_bars.py --seed <fresh> --out corpus-fresh.jsonl
 python framework/tools/oracle.py judge --manifest runs/manifests/u-bars.json
 ```
 
+**Module conformance is the default (issue #48).** A unit's contract is its
+*whole public API* — hard rule 2 and the Stage-4 exit criteria are per
+unit — so the scaffolded adapter calls **every public function** in the
+unit per corpus row and returns a
+`{fn: result | {"__error__": {"type", "message"}}}` envelope: one manifest
+judges the module API, a function's own raised exception is per-function
+evidence (compared type-and-message through the value rules) instead of
+failing the row, and a first-public-only verdict can no longer green-light
+a unit whose other functions diverge (the acceptance test proves the
+hazard: the same buggy candidate verdicts EQUIVALENT under
+`--mode function` and DIVERGENT under the default, with the diff naming
+the diverging function as `$.<fn>`). Corpus rows are `{param: value}`
+objects over the *union* of the judged functions' parameters — each
+function takes the row's values for its own parameters, rebuilt through
+its own spec; `--function NAME` (repeatable / comma-separated) narrows the
+judged subset; a parameter annotated differently across functions is
+flagged for hand-completion, never guessed. `--mode function` keeps the
+legacy single-entry scaffold. The module-mode dry-run tallies per-function
+envelope errors: every function erroring on every row is a
+degenerate-corpus finding (the module face of #30), a single all-error
+function is a warning that its parity is unjudged, and a candidate wheel
+missing any judged export is a setup error naming it.
+
 Per unit, under `--out` (default `runs/`, gitignored — scaffolded files
 name the target project's private code):
 
@@ -60,7 +83,9 @@ name the target project's private code):
   constructors, sets/tuples/dicts rebuilt per annotation, int/float never
   silently coerced), calls the function, and serializes back to JSON —
   canonicalizing non-JSON shapes (set → sorted list, tuple → list,
-  dataclass → dict) so the verdict measures only the port.
+  dataclass → dict) so the verdict measures only the port. In the default
+  module mode the row's result is the per-function envelope above (issue
+  #48); in `--mode function` it is the single function's result.
 - `corpora/gen_<unit>.py` — seeded generator (`--seed/--rows/--out`);
   same seed → byte-identical corpus; prints a row-status summary. Edge
   rows (zero values, boundaries, defaults-exercising) come from the
@@ -343,8 +368,9 @@ python framework/tools/oracle.py self-test   # Stage 2 gate: must catch 5/5
 # per-row corpus dry-run before a judge run (issue #29)
 python framework/tools/oracle.py corpus --validate corpus.jsonl --entry impl:run
 
-# the Stage 2/4 scaffold (issue #32): symmetric ref/cand adapters + seeded
-# corpus generator + judge-ready manifest per unit, under runs/ (gitignored)
+# the Stage 2/4 scaffold (issues #32/#48): symmetric ref/cand adapters + seeded
+# corpus generator + judge-ready manifest per unit, under runs/ (gitignored);
+# default mode judges the unit's WHOLE public API via a per-function envelope
 python framework/tools/scaffold.py scaffold state.json --unit u-bars --seed 20261028
 python runs/corpora/gen_u_bars.py --seed <fresh> --out corpus-fresh.jsonl  # reviewer
 python framework/tools/oracle.py judge --manifest runs/manifests/u-bars.json
