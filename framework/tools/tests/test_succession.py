@@ -19,7 +19,7 @@ below pins that)."""
 from __future__ import annotations
 
 import json
-import sys
+import os
 from pathlib import Path
 
 import pytest
@@ -419,34 +419,25 @@ def test_chain_monotonic_progress_guard_kills_resume_loops(
 
 # ---------------------------------------------- GLV self-bootstrap (#47) ----
 
-def _wire_selfbootstrap(monkeypatch, fake, *, minted=None, ensure=None,
-                        fail_mint=None):
+def _wire_selfbootstrap(monkeypatch, fake, *, ensure=None):
     """Wire the chain for the issue-#47 cold-start path: NO GLV_* env,
     nothing assumed — the harness must bootstrap itself. The transport
-    seams (_ensure_server / _mint_token / GlvClient) are faked; minted
-    collects the token names minted (the `glv token list` audit trail)."""
+    seams (_ensure_server / _mint_token / GlvClient) are faked; returns
+    the minted token names (the `glv token list` audit trail)."""
     monkeypatch.delenv("GLV_BASE_URL", raising=False)
     monkeypatch.delenv("GLV_API_TOKEN", raising=False)
     monkeypatch.setattr(succession_tool, "GlvClient",
                         lambda url, token: fake)
-    minted = minted if minted is not None else []
-    seen_tokens = []
+    monkeypatch.setattr(succession_tool, "_ensure_server",
+                        ensure or (lambda url, **kw: "up"))
+    minted = []
 
     def fake_mint(base_url, name):
-        if fail_mint:
-            raise state_tool.ToolError(fail_mint, kind="io")
         minted.append(name)
-        token = f"glv_at_fake_{name}"
-        seen_tokens.append(token)
-        return token
+        return f"glv_at_fake_{name}"
 
     monkeypatch.setattr(succession_tool, "_mint_token", fake_mint)
-    if ensure is not None:
-        monkeypatch.setattr(succession_tool, "_ensure_server", ensure)
-    else:
-        monkeypatch.setattr(succession_tool, "_ensure_server",
-                            lambda url, **kw: "up")
-    return minted, seen_tokens
+    return minted
 
 
 def test_chain_bootstraps_glv_and_mints_a_token_per_session(
@@ -460,7 +451,7 @@ def test_chain_bootstraps_glv_and_mints_a_token_per_session(
         _session_exhausts(stage=4, unit_status={"u1": "ported"}),
         _session_completes(unit_status={"u2": "ported", "u3": "ported"}),
     ])
-    minted, _ = _wire_selfbootstrap(monkeypatch, fake)
+    minted = _wire_selfbootstrap(monkeypatch, fake)
 
     code, out = run_tool(monkeypatch, capsys, "succession.py",
                          ["chain", str(p), "--prompt-file", "/dev/null"])
@@ -477,7 +468,6 @@ def test_chain_bootstraps_glv_and_mints_a_token_per_session(
     assert {"event": "glv-token-minted",
             "token_name": "run-demo-s2"} in out["events"]
     # the harness exported the transport it provisioned itself
-    import os
     assert os.environ["GLV_BASE_URL"] == "http://localhost:3000"
     assert os.environ["GLV_API_TOKEN"].startswith("glv_at_fake_run-demo-s2")
     # a raw token never leaks into the tool output
@@ -609,7 +599,7 @@ def test_chain_re_mints_on_401_without_ending_the_chain(
         _session_exhausts(stage=4, unit_status={"u1": "ported"}),
         _session_completes(unit_status={"u2": "ported", "u3": "ported"}),
     ])
-    minted, _ = _wire_selfbootstrap(monkeypatch, fake)
+    minted = _wire_selfbootstrap(monkeypatch, fake)
     code, out = run_tool(monkeypatch, capsys, "succession.py",
                          ["chain", str(p), "--prompt-file", "/dev/null"])
     assert code == 0, out

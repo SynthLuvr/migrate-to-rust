@@ -79,8 +79,8 @@ Auth/transport per ``tools/glv-subagents.md`` § *GLV bootstrap*
 (issue #47): the harness ensures the server itself and mints one named
 token per chain session, exporting ``GLV_BASE_URL``/``GLV_API_TOKEN``
 (explicit flags/env are honored as configuration); bearer on every
-``/api`` path. This
-tool writes the state file ONLY through ``state.py``'s save_validated
+``/api`` path. This tool writes the state file ONLY through
+``state.py``'s save_validated
 (the "state.py is the ONLY writer" discipline — succession.py composes
 it, the way pipeline.py does).
 
@@ -267,7 +267,7 @@ def _serve_start() -> bool:
     fd, log = tempfile.mkstemp(prefix="glv-serve-", suffix=".log")
     os.close(fd)
     with open(log, "wb") as log_fh:
-        subprocess.Popen(  # the operator-installed CLI, by resolved path
+        subprocess.Popen(
             [cli, "serve"], stdin=subprocess.DEVNULL,
             stdout=log_fh, stderr=subprocess.STDOUT,
             start_new_session=True)
@@ -275,16 +275,14 @@ def _serve_start() -> bool:
 
 
 def _ensure_server(base_url: str, *,
-                   wait_s: float = SERVE_STARTUP_TIMEOUT_S,
-                   probe=None, serve_start=None) -> str:
+                   wait_s: float = SERVE_STARTUP_TIMEOUT_S) -> str:
     """``'up'`` when the server answers; otherwise start ``glv serve``
     and wait for it. Raises ToolError(kind='io') when nothing answers
     and the server cannot be started — an environment failure reported
     as such (install glv); the answer is never a second transport."""
-    probe = probe or _probe_server
-    if probe(base_url):
+    if _probe_server(base_url):
         return "up"
-    if not (serve_start or _serve_start)():
+    if not _serve_start():
         raise ToolError(
             f"nothing is serving at {base_url} and the glv CLI is not on "
             f"PATH, so the server cannot be started — install glv "
@@ -293,7 +291,7 @@ def _ensure_server(base_url: str, *,
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
         time.sleep(0.5)
-        if probe(base_url):
+        if _probe_server(base_url):
             return "started"
     raise ToolError(
         f"`glv serve` was started but {base_url} still answers nothing "
@@ -301,11 +299,21 @@ def _ensure_server(base_url: str, *,
         kind="io")
 
 
-def _mint_token_via_cli(name: str, *, cli: str | None = None) -> str:
+def _raw_token_from(output: str, source: str) -> str:
+    """The raw token (``glv_at_…``) from a mint response; it is printed
+    once and never stored server-side, so a missing match is fatal."""
+    match = TOKEN_RE.search(output)
+    if not match:
+        raise ToolError(f"{source} printed no raw token (expected "
+                        f"glv_at_…): {output.strip()[:300]}", kind="io")
+    return match.group(0)
+
+
+def _mint_token_via_cli(name: str) -> str:
     """``glv token create --name <name>`` — the CLI path, for a host with
     filesystem access to the GLV data dir. The raw token is printed
     once (only its SHA-256 hash is stored server-side)."""
-    cli = cli or _glv_cli_path()
+    cli = _glv_cli_path()
     if not cli:
         raise ToolError("the glv CLI is not on PATH — `glv token create` "
                         "needs it", kind="io")
@@ -320,12 +328,7 @@ def _mint_token_via_cli(name: str, *, cli: str | None = None) -> str:
         raise ToolError(
             f"glv token create --name {name} exited {proc.returncode}: "
             f"{(proc.stderr or proc.stdout).strip()[:300]}", kind="io")
-    match = TOKEN_RE.search(proc.stdout)
-    if not match:
-        raise ToolError(
-            f"glv token create printed no raw token (expected glv_at_… on "
-            f"stdout): {proc.stdout.strip()[:300]}", kind="io")
-    return match.group(0)
+    return _raw_token_from(proc.stdout, "glv token create")
 
 
 def _mint_token_via_loopback(base_url: str, name: str) -> str:
@@ -351,11 +354,7 @@ def _mint_token_via_loopback(base_url: str, name: str) -> str:
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise ToolError(f"loopback POST /api/tokens: no answer from the "
                         f"server: {e}", kind="io") from e
-    match = TOKEN_RE.search(raw)
-    if not match:
-        raise ToolError(f"POST /api/tokens returned no raw token "
-                        f"(expected glv_at_…): {raw[:300]}", kind="io")
-    return match.group(0)
+    return _raw_token_from(raw, "POST /api/tokens")
 
 
 def _mint_token(base_url: str, name: str) -> str:
@@ -401,52 +400,51 @@ class GlvTransport:
     def _build_client(self) -> None:
         self.client = GlvClient(self.base_url, self.token)
 
-    def begin_session(self, *, index: int, name: str) -> None:
+    def begin_session(self, *, name: str) -> None:
         """The session's first act (issue #47), unconditional: server
         ensured, this session's own named token minted, env exported,
         client built. Called before every session start and before
         adopting a live session — no human step anywhere."""
         self.current_name = name
         if self.client is None:
-            if self.explicit_token is not None and self.url_explicit:
-                # fully configured via flags/env: trusted as-is; the first
-                # call proves it, self-heal fixes it (re-mint on 401)
-                self.events.append(
-                    {"event": "glv-bootstrap", "mode": "configured",
-                     "base_url": self.base_url})
-            elif self.explicit_token is not None:
-                # a token but no URL: the server it belongs to must
-                # already exist — starting a fresh local one would mint
-                # against the wrong data dir
-                if not _probe_server(self.base_url):
-                    raise ToolError(
-                        f"GLV_API_TOKEN/--glv-token is set but nothing "
-                        f"answers at {self.base_url} — set GLV_BASE_URL to "
-                        f"the server that token belongs to (issue #47)",
-                        kind="io")
-                self.events.append(
-                    {"event": "glv-bootstrap", "mode": "configured",
-                     "base_url": self.base_url})
-            else:
-                status = _ensure_server(self.base_url)
-                self.token = _mint_token(self.base_url, name)
-                self.minted.append(name)
-                self._export_env()
-                self.events.append(
-                    {"event": "glv-bootstrap", "mode": "self",
-                     "base_url": self.base_url, "server": status,
-                     "token_name": name})
-            self._build_client()
+            self._bootstrap(name)
+        elif self.explicit_token is None and name not in self.minted:
+            # one named token per chain session — the `glv token list`
+            # audit trail
+            self._adopt_minted_token(
+                name, {"event": "glv-token-minted", "token_name": name})
+
+    def _bootstrap(self, name: str) -> None:
+        """The chain's first GLV act: honor a full explicit configuration
+        as-is, else ensure the server and mint this session's own
+        token."""
+        if self.explicit_token is None:
+            status = _ensure_server(self.base_url)
+            self._adopt_minted_token(name, {
+                "event": "glv-bootstrap", "mode": "self",
+                "base_url": self.base_url, "server": status,
+                "token_name": name})
             return
-        if self.explicit_token is None and name not in self.minted:
-            # every chain session mints its own named token — one
-            # run-<project>-s<n> per session in `glv token list`
-            self.token = _mint_token(self.base_url, name)
-            self.minted.append(name)
-            self._export_env()
-            self._build_client()
-            self.events.append({"event": "glv-token-minted",
-                                "token_name": name})
+        if not self.url_explicit and not _probe_server(self.base_url):
+            # a token but no URL: the server it belongs to must already
+            # exist — starting a fresh local one would mint against the
+            # wrong data dir
+            raise ToolError(
+                f"GLV_API_TOKEN/--glv-token is set but nothing answers at "
+                f"{self.base_url} — set GLV_BASE_URL to the server that "
+                f"token belongs to (issue #47)", kind="io")
+        self.events.append({"event": "glv-bootstrap", "mode": "configured",
+                            "base_url": self.base_url})
+        self._build_client()
+
+    def _adopt_minted_token(self, name: str, event: dict) -> None:
+        """Install a freshly minted token: adopt, export, rebuild the
+        client, journal the event."""
+        self.token = _mint_token(self.base_url, name)
+        self.minted.append(name)
+        self._export_env()
+        self._build_client()
+        self.events.append(event)
 
     # -- self-healing -------------------------------------------
 
@@ -454,11 +452,8 @@ class GlvTransport:
         """A 401 run (the 30-day expiry): a fresh token under the same
         session name, then retry — re-auth is never a stop."""
         name = self.current_name or f"run-{self.project}-s?"
-        self.token = _mint_token(self.base_url, name)
-        self.minted.append(name)
-        self._export_env()
-        self._build_client()
-        self.events.append({"event": "glv-reauth", "token_name": name})
+        self._adopt_minted_token(
+            name, {"event": "glv-reauth", "token_name": name})
 
     def _revive(self) -> None:
         """Connection loss: the harness owns the server lifecycle — bring
@@ -471,6 +466,10 @@ class GlvTransport:
                             "base_url": self.base_url})
 
     def _call(self, method: str, *args, **kwargs):
+        """Call a GlvClient method, healing the transport between
+        attempts (401 → re-mint, connection loss → revive); a transport
+        that still fails after HEAL_ATTEMPTS raises — the chain then ends
+        failed_safely."""
         if self.client is None:
             raise ToolError("GLV transport not bootstrapped — call "
                             "begin_session() first", kind="io")
@@ -1147,7 +1146,7 @@ def _start_session(state: dict, path: Path, transport: GlvTransport,
     state + session index."""
     index = len(_chain_block(state).get("sessions") or []) + 1
     name = f"run-{project}-s{index}"
-    transport.begin_session(index=index, name=name)
+    transport.begin_session(name=name)
     started = transport.start_session(name=name, prompt=brief,
                                       working_dir=working_dir, model=model)
     sid = started.get("id") or f"unknown-{index}"
@@ -1321,6 +1320,61 @@ def _apply_decision(decision: dict, state: dict, path: Path,
     return state, None
 
 
+def _drive_chain(path: Path, transport: GlvTransport, policy: dict, args,
+                 events: list, *, project: str, working_dir: str,
+                 ceilings: tuple[int | None, int | None, int]
+                 ) -> tuple[dict, str]:
+    """The session loop, one settled session per iteration, until a
+    chain-ending classification. Returns (final state, terminal reason).
+    Raises ToolError when the transport cannot be self-healed."""
+    max_tokens, max_minutes, max_depth = ceilings
+    while True:
+        state = _load_state(path)
+        sessions = _chain_block(state).get("sessions") or []
+
+        if not sessions:
+            state = _run_first_session(state, path, transport, policy,
+                                       args, events, project=project,
+                                       working_dir=working_dir,
+                                       max_depth=max_depth)
+            continue
+
+        last = sessions[-1] or {}
+        if not last.get("settled_at"):
+            # the harness itself died mid-session: adopt the live session
+            # (never abandon it), wait it out, then re-classify
+            transport.begin_session(
+                name=last.get("name")
+                or f"run-{project}-s{last.get('index') or 1}")
+            state = _settle(state, path, transport, last.get("index"),
+                            events)
+            continue
+
+        decision = _classify(state, max_tokens=max_tokens,
+                             max_minutes=max_minutes, max_depth=max_depth)
+        events.append({"event": "classified", "kind": decision["kind"],
+                       "reason": decision["reason"]})
+        state, ending = _apply_decision(decision, state, path, events)
+        if ending is not None:
+            return state, ending
+
+        # succeed: hygiene -> brief -> spawn -> stop-notice + reset -> settle
+        state, findings = resume_hygiene(state, path)
+        events += [{"event": "hygiene-repaired", **f}
+                   for f in findings if f.get("action") == "repaired"]
+        brief, index = _next_brief(state, path, policy=policy, args=args,
+                                   hygiene_findings=findings)
+        state, index = _start_session(
+            state, path, transport, brief, events, project=project,
+            working_dir=working_dir, model=args.model,
+            max_depth=max_depth, succession_reason=decision["reason"],
+            snapshot=_progress_snapshot(state))
+        _stop_predecessor_if_live(transport, last, events)
+        successor = _chain_session(state, index) or {}
+        state = _record_succession(state, path, last, successor, events)
+        state = _settle(state, path, transport, index, events)
+
+
 def cmd_chain(args) -> int:
     policy = pipeline_tool.load_policy(args.policy)
     path = Path(args.state)
@@ -1343,67 +1397,15 @@ def cmd_chain(args) -> int:
     working_dir = args.working_dir or \
         (((state.get("preflight") or {}).get("target") or {}).get("root")
          or str(path.parent))
-    max_tokens, max_minutes, max_depth = ceilings
-    # GLV is the unconditional transport and this harness bootstraps it
-    # itself (issue #47): probe GET /api/openapi.json, start `glv serve`
-    # when nothing answers, mint run-<project>-s<n> per chain session —
-    # no alternate mode, no human provisioning step, anywhere
+    _, _, max_depth = ceilings
     transport = GlvTransport(base_url=args.glv_url, token=args.glv_token,
                              project=project, events=events)
-    terminal_reason: str | None = None
 
     try:
-        while True:
-            state = _load_state(path)
-            sessions = _chain_block(state).get("sessions") or []
-
-            if not sessions:
-                state = _run_first_session(state, path, transport, policy,
-                                           args, events, project=project,
-                                           working_dir=working_dir,
-                                           max_depth=max_depth)
-                continue
-
-            last = sessions[-1] or {}
-            if not last.get("settled_at"):
-                # the harness itself died mid-session: adopt the live session
-                # (never abandon it), wait it out, then re-classify
-                transport.begin_session(
-                    index=last.get("index") or 1,
-                    name=last.get("name")
-                    or f"run-{project}-s{last.get('index') or 1}")
-                state = _settle(state, path, transport, last.get("index"),
-                                events)
-                continue
-
-            decision = _classify(state, max_tokens=max_tokens,
-                                 max_minutes=max_minutes, max_depth=max_depth)
-            events.append({"event": "classified", "kind": decision["kind"],
-                           "reason": decision["reason"]})
-            state, ending = _apply_decision(decision, state, path, events)
-            if ending is not None:
-                terminal_reason = ending
-                break
-
-            # succeed: hygiene -> brief -> spawn -> stop-notice + reset -> settle
-            state, findings = resume_hygiene(state, path)
-            events += [{"event": "hygiene-repaired", **f}
-                       for f in findings if f.get("action") == "repaired"]
-            brief, index = _next_brief(state, path, policy=policy, args=args,
-                                       hygiene_findings=findings)
-            state, index = _start_session(
-                state, path, transport, brief, events, project=project,
-                working_dir=working_dir, model=args.model,
-                max_depth=max_depth, succession_reason=decision["reason"],
-                snapshot=_progress_snapshot(state))
-            _stop_predecessor_if_live(transport, last, events)
-            successor = _chain_session(state, index) or {}
-            state = _record_succession(state, path, last, successor, events)
-            state = _settle(state, path, transport, index, events)
+        state, terminal_reason = _drive_chain(
+            path, transport, policy, args, events, project=project,
+            working_dir=working_dir, ceilings=ceilings)
     except ToolError as e:
-        # the transport could not be self-healed (server dead with no way
-        # to start it, a mint that cannot run): a genuine terminal with
-        # the dossier — never a park, never a hand-off to a human
         state = _load_state(path)
         state, terminal_reason = _park_transport_dead(state, path, e, events)
 
