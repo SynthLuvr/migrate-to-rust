@@ -22,7 +22,11 @@ the agent spends most of its budget. Loop spec: `MIGRATION_PROMPT.md`.
 7. On stall: record best candidate + exact failing diff → `status: escalated`.
 8. Reviewer subagent (`roles/reviewer.md`) re-runs the oracle on **fresh
    inputs** and checks FFI/attribution before any verdict is recorded —
-   over the GLV transport when in use (`tools/glv-subagents.md`).
+   over the GLV transport when in use (`tools/glv-subagents.md`). Fresh
+   inputs come from regenerating the scaffolded corpus with a *different*
+   seed: `python runs/corpora/gen_<unit>.py --seed <fresh> --out
+   corpus-fresh.jsonl` (issue #32) — never re-judge the translator's own
+   corpus.
 9. Update state after every unit; Python fallback stays live for unported units.
 
 ## Exit criteria

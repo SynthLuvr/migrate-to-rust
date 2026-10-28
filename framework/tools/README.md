@@ -30,6 +30,61 @@ eight scripts — it is the transport the framework's *role separation* runs
 on when a GLV server is reachable. Spec, API cheat sheet, and delegation
 loop: [`glv-subagents.md`](glv-subagents.md).
 
+## The Stage 2/4 scaffold — `scaffold.py` (issue #32)
+
+Also a composition layer, not a ninth gap-tool: it turns what
+`contract_extract.py` extracts (the type signature) into the four
+artifacts Stages 2/4 otherwise hand-write per unit — and hand-writing them
+is where the corpus-format trap (#29) and the degenerate-corpus hazard
+(#30) crept in:
+
+```console
+python framework/tools/scaffold.py scaffold state/migration-state.json \
+  --unit u-bars --out runs/ --seed 20261028
+# reviewer fresh inputs (Stage 4 step 8): same generator, different seed
+python runs/corpora/gen_u_bars.py --seed <fresh> --out corpus-fresh.jsonl
+# the emitted manifest is judge-ready verbatim (entries are .py file paths)
+python framework/tools/oracle.py judge --manifest runs/manifests/u-bars.json
+```
+
+Per unit, under `--out` (default `runs/`, gitignored — scaffolded files
+name the target project's private code):
+
+- `adapters/<unit>_ref.py` / `<unit>_cand.py` — **symmetric** adapters,
+  rendered from one template so they differ only inside a delimited
+  BACKEND section (the payload records the shared sha256 as evidence):
+  a corpus row is a `{param: value}` JSON object; the adapter rebuilds the
+  typed objects the signature requires (dataclasses via their real
+  constructors, sets/tuples/dicts rebuilt per annotation, int/float never
+  silently coerced), calls the function, and serializes back to JSON —
+  canonicalizing non-JSON shapes (set → sorted list, tuple → list,
+  dataclass → dict) so the verdict measures only the port.
+- `corpora/gen_<unit>.py` — seeded generator (`--seed/--rows/--out`);
+  same seed → byte-identical corpus; prints a row-status summary. Edge
+  rows (zero values, boundaries, defaults-exercising) come from the
+  signature, so the documented error paths (e.g. "empty input raises") are
+  covered by construction.
+- `corpora/corpus-<unit>.jsonl` — the corpus itself, in the documented
+  format (one raw JSON value per line), emitted by the generator so the
+  #29 trap cannot bite.
+- `manifests/<unit>.json` — ready for `oracle.py judge`; the candidate
+  entry points at the candidate adapter, whose wheel module is a
+  HAND-TUNE placeholder at Stage 2 (`--candidate-module` fills it in at
+  Stage 4; until then judging is an honest setup failure, never a hollow
+  verdict).
+
+The heuristic mapping is deliberately conservative: JSON scalars,
+containers, `Optional`/unions, `Literal`, and project `@dataclass`es
+(resolved through the unit's imports, nested ones recursed) are generated
+mechanically; **everything else is flagged for hand-completion, never
+guessed** — flags land in the payload's `hand_tune[]`, in a HAND-TUNE
+block in both adapters, and in the generator, and make the run exit 2.
+Before reporting success the scaffold also dry-runs its own fresh corpus
+against the reference adapter through `oracle.py`'s runner, so a corpus
+that would judge hollow or thin is a finding in seconds, not after a
+Stage-4 judge run. Existing output is never overwritten without `--force`
+(hand-tuned edits must not be lost).
+
 ## The deterministic driver — `pipeline.py` (issue #22)
 
 Not a ninth gap-tool: a **composition layer** over the eight (it writes the
@@ -128,6 +183,12 @@ python framework/tools/oracle.py self-test   # Stage 2 gate: must catch 5/5
 # per-row corpus dry-run before a judge run (issue #29)
 python framework/tools/oracle.py corpus --validate corpus.jsonl --entry impl:run
 
+# the Stage 2/4 scaffold (issue #32): symmetric ref/cand adapters + seeded
+# corpus generator + judge-ready manifest per unit, under runs/ (gitignored)
+python framework/tools/scaffold.py scaffold state.json --unit u-bars --seed 20261028
+python runs/corpora/gen_u_bars.py --seed <fresh> --out corpus-fresh.jsonl  # reviewer
+python framework/tools/oracle.py judge --manifest runs/manifests/u-bars.json
+
 # #4 the only writer of the state file
 python framework/tools/state.py init state/migration-state.json --name X --python-path src/x --autonomy-level L2
 python framework/tools/state.py set  state.json --field 'units[u1].status=ported'
@@ -180,7 +241,9 @@ you spend a judge run.
 Design decisions worth knowing before you extend:
 
 - **oracle.py** runs both sides as Python callables (`module:function`,
-  default fn `run`) — the Rust side ships as a PyO3 wheel with the API
+  default fn `run`, or a relative `*.py:function` path resolved against
+  the manifest's directory — issue #32's scaffolded adapters ship as
+  files) — the Rust side ships as a PyO3 wheel with the API
   frozen, so the wheel *is* the entry point. Outputs must be
   JSON-serializable or the run is honestly *Incomparable*
   (sets need a canonical adapter). The normalization rules (float

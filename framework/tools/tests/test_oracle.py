@@ -131,6 +131,82 @@ def test_judge_subprocess_end_to_end(monkeypatch, capsys, tmp_path):
     assert out["corpus"]["lines"] == 2
 
 
+# ---------------------------------------------------------- issue #32 ----
+# Entries may also be relative *.py file paths, resolved against the
+# manifest's directory (the child's cwd) — scaffold.py emits adapters that
+# live in their own directory next to the manifest, and the manifest must
+# stay judge-ready verbatim.
+
+def test_judge_accepts_file_path_entries(monkeypatch, capsys, tmp_path):
+    (tmp_path / "adapters").mkdir()
+    (tmp_path / "manifests").mkdir()
+    (tmp_path / "adapters" / "impl.py").write_text(
+        "def run(v):\n"
+        "    if v['bad']:\n"
+        "        raise ValueError('bad input')\n"
+        "    return {'n': len(v['xs'])}\n")
+    (tmp_path / "adapters" / "cand.py").write_text(
+        "def run(v):\n"
+        "    if v['bad']:\n"
+        "        return {'n': 0}   # swallowed error\n"
+        "    return {'n': len(v['xs'])}\n")
+    (tmp_path / "corpus.jsonl").write_text("\n".join([
+        json.dumps({"xs": [1, 2], "bad": False}),
+        json.dumps({"xs": [], "bad": True}),
+    ]) + "\n")
+    manifest = tmp_path / "manifests" / "m.json"
+    manifest.write_text(json.dumps({
+        "unit": "u-1",
+        "reference": {"entry": "../adapters/impl.py:run"},
+        "candidate": {"entry": "../adapters/cand.py:run"},
+        "corpus": "../corpus.jsonl",
+    }))
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["judge", "--manifest", str(manifest)])
+    assert code == 2
+    assert out["counts"] == {"equivalent": 1, "divergent": 1, "incomparable": 0}
+    assert out["runs"][1]["diffs"][0]["kind"] == "swallowed-error"
+
+
+def test_judge_file_path_entry_missing_is_setup_failure(monkeypatch, capsys, tmp_path):
+    (tmp_path / "impl.py").write_text("def run(v):\n    return v\n")
+    (tmp_path / "corpus.jsonl").write_text(json.dumps({"x": 1}) + "\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "unit": "u-1",
+        "reference": {"entry": "./impl.py:run"},
+        "candidate": {"entry": "./not_there.py:run"},
+        "corpus": "corpus.jsonl",
+    }))
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["judge", "--manifest", str(manifest)])
+    assert code == 3  # a side that cannot run at all: incomparable, detail names it
+    assert "not_there.py" in out["runs"][0]["detail"]
+    assert "entry file not found" in out["runs"][0]["detail"]
+
+
+def test_local_runner_resolves_file_path_entries(tmp_path):
+    entry_mod = tmp_path / "entry.py"
+    entry_mod.write_text("def double(v):\n    return v * 2\n")
+    fn = oracle._load_entry_callable(f"{entry_mod}:double")
+    assert fn(21) == 42
+    entry_mod.write_text("def run(v):\n    return v + 1\n")
+    fn = oracle._load_entry_callable(str(entry_mod))  # attr defaults to run
+    assert fn(1) == 2
+
+
+def test_corpus_validate_accepts_file_path_entry(monkeypatch, capsys, tmp_path):
+    (tmp_path / "adapters").mkdir()
+    (tmp_path / "adapters" / "impl.py").write_text("def run(v):\n    return v['x'] * 2\n")
+    (tmp_path / "corpus.jsonl").write_text("\n".join([
+        json.dumps({"x": 1}), json.dumps({"x": 2})]) + "\n")
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["corpus", "--validate", str(tmp_path / "corpus.jsonl"),
+                          "--entry", "adapters/impl.py:run"])
+    assert code == 0
+    assert out["ok"] == out["total"] == 2
+
+
 # ---------------------------------------------------------- issue #29 ----
 # The module docstring used to imply the corpus file itself was JSONL
 # {"i": ..., "input": ...}; following it double-wraps every input, both
