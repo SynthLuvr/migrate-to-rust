@@ -52,6 +52,8 @@
           "id": { "type": "string" },
           "python_path": { "type": "string" },
           "rust_path": { "type": ["string", "null"] },
+          "rust_module": { "type": "string", "$comment": "importable rust module when the wheel layout is NOT per-unit: the flat PyO3 extension module (e.g. wicksmith_core) exposing every unit's functions; state.py shim prefers this over deriving from rust_path (issue #53)" },
+          "rust_names": { "type": "array", "items": { "type": "string" }, "$comment": "the unit's exported public names in the rust module — one source of truth shared by the shim's re-export list and the reviewer's API-freeze check; presence (non-empty) selects flat-wheel shim mode (issue #53)" },
           "deps": { "type": "array", "items": { "type": "string" }, "$comment": "unit ids, leaf-first" },
           "order": { "type": "integer" },
           "contract": {

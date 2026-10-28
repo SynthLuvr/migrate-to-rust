@@ -17,7 +17,7 @@ acceptance-test suite in `tests/` wired into CI. Shared plumbing lives in
 | 1 | `oracle.py` — equivalence oracle | 2,4,5,6 | unit + input corpus → per-run verdicts `equivalent/divergent/incomparable` + structured diff | catches 5/5 injected bugs; normalization rules documented; no LLM in the judging path |
 | 2 | `port_plan.py` — profiling→plan generator | 0,1 | profiler hotspots JSON (bare list or `from-cprofile` envelope) + stdlib-ast/mypy scan → ranked, dependency-ordered, portability-scored backlog | I/O-bound units ranked last; cycles detected; risk flags attached; profiler-noise paths skipped with a warning; only files under `--project-root` become units — stdlib/site-packages hotspots outside it are summarized as `system_time` |
 | 3 | `contract_extract.py` | 2 | pytest collection + mypy JSON → per-unit `contract.json` (tests, types, invariants) | 100% of scoped units covered; dangling tests flagged |
-| 4 | `state.py` — dual-build state manager | 1–7 | validates/migrates `migration-state.json`; emits per-unit fallback switch shim | every state transition journaled (append to the state file's `journal[]`, per `../state/migration-state.schema.json`); Python fallback callable per unit |
+| 4 | `state.py` — dual-build state manager | 1–7 | validates/migrates `migration-state.json`; emits per-unit fallback switch shim (src-layout spellings + flat-wheel re-export, issue #53) | every state transition journaled (append to the state file's `journal[]`, per `../state/migration-state.schema.json`); Python fallback callable per unit |
 | 5 | `bench.py` — cross-language differential benchmark | 0,5 | matched corpus + both entry points → one verdict JSON + repro script + corpus commit | same inputs/coverage both sides; no number without repro |
 | 6 | `pyo3_review.py` — FFI linter | 4,5 | Rust diff → findings on refcounts, swallowed `PyErr`, `unwrap()` in exports, GIL `detach` misuse, free-threading hazards | complements miri/clippy (they don't cover these classes); reviewer checklist encoded |
 | 7 | `attribution.py` — attribution checker | 4,5 | original tree + port tree → header/NOTICE diff report, fail on loss | byte-exact NOTICE check; provenance comment required per generated file |
@@ -418,6 +418,12 @@ python framework/tools/state.py set  state.json --field 'project.workload=plain 
 python framework/tools/state.py mark state.json --unit u1 --status escalated --note "..."
 python framework/tools/state.py resolve-gate state.json --gate go_no_go --decision approved --by policy:GO-1
 python framework/tools/state.py shim state.json --unit u1 --write shims/u1.py
+# flat PyO3 wheel (issue #53): one extension module exposes every unit's
+# functions flat — the shim re-exports this unit's names from the live
+# side (names also live in the schema as units[u].rust_names/rust_module,
+# the API-freeze source of truth, which selects this mode on their own)
+python framework/tools/state.py shim state.json --unit u-bars \
+  --rust-import wicksmith_core --flat --names normalize_bars,pct_change
 python framework/tools/state.py validate|journal|show|migrate state.json
 
 # the deterministic driver (issue #22): L2+ unattended runs
@@ -527,6 +533,18 @@ Design decisions worth knowing before you extend:
   terminal-`run_status` coherence. The
   fallback shim is reversible per unit via one env var
   (`<PROJECT>_FALLBACK=all|<unit-ids>|none`) — no state anywhere else.
+  The shim fits the real target layouts (issue #53): the Python side
+  derives **both** spellings of a src//lib-layout unit (`bars` *and*
+  `src.bars` — the issue-#26 heritage the adapters match) and tries them
+  in order, and flat PyO3 wheels — one extension module (e.g.
+  `wicksmith_core`) exposing every unit's functions, with no per-unit
+  rust module to import — get a **re-export shim** (`--flat` with
+  `--names`, or the schema-recorded `units[].rust_module` +
+  `rust_names[]`, the same list the reviewer's API-freeze check audits):
+  `impl()` returns a namespace of the unit's public names from whichever
+  side is live, and module-level `__getattr__` dispatches per name so
+  `from <shim> import <name>` works unchanged; a name the wheel doesn't
+  expose is rust-side name drift — loud, never a silent fallback.
   Validation includes schema checking (an internal stdlib validator for
   the draft-2020-12 subset the schema uses; cross-checked against the
   `jsonschema` package by the tests) plus coherence invariants the schema
