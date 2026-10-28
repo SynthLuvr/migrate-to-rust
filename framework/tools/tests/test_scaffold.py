@@ -1,4 +1,4 @@
-"""scaffold.py acceptance tests (issues #32, #48).
+"""scaffold.py acceptance tests (issues #32, #48, #49, #50).
 
 Covers: the scaffolded artifacts (symmetric adapters, seeded generator,
 judge-ready manifest, corpus in the documented raw-value format), the
@@ -17,6 +17,16 @@ element lists, shapes the generator cannot inhabit realistically are
 hand-tune findings, and a dry-run reference-ok fraction below
 min_reference_ok_fraction gates the run (exit 2), never a warned-through
 exit 0.
+
+Derived inputs (issue #50): a parameter typed by a dataclass the unit
+module does not define (list[Bar] where Bar lives in the unit's u-bars
+dependency) is recorded (payload + manifest + adapter comments) and
+resolved on EACH side's own dependency modules — reference: the python
+dependency module; candidate: the wheel's own class, never the python
+project (pre-#50 adapters fed the wheel reference-built objects: an
+asymmetric adapter that surfaced only as oracle divergence). A wheel
+missing the class is an honest setup error at adapter import, never
+silent [] nor per-row noise masquerading as divergence.
 """
 
 from __future__ import annotations
@@ -483,6 +493,226 @@ def test_unrealistic_item_shapes_are_flagged_for_hand_completion(
     cand = (out / "adapters/u_frames_cand.py").read_text()
     assert "param items[item]" in ref and "param items[item]" in cand
     assert unit["adapters"]["symmetric"] is True
+
+
+# --------------------------------------------- derived inputs (#50) ------
+
+AVG_BARS_PY = ('"""bars — the u-bars dependency unit (the issue #50 fixture):\n'
+               "the Bar dataclass its consumers are typed against, plus the\n"
+               "constructor the real target builds inputs with.\n"
+               "\n"
+               'Invariant: normalize_bars raises on non-finite prices\n"""\n'
+               "from dataclasses import dataclass\n"
+               "\n"
+               "\n"
+               "@dataclass\n"
+               "class Bar:\n"
+               "    open: float\n"
+               "    high: float\n"
+               "    low: float\n"
+               "    close: float\n"
+               "    volume: int\n"
+               "\n"
+               "\n"
+               "def normalize_bars(rows):\n"
+               "    return [Bar(r[0], r[1], r[2], r[3], r[4]) for r in rows]\n")
+
+AVG_PY = ('"""average — a u-bars consumer (the issue #50 shape: Bar comes\n'
+          "from the dependency unit's module, not this one).\n"
+          "\n"
+          'Invariant: empty bars or non-positive length raises ValueError\n"""\n'
+          "from .bars import Bar\n"
+          "\n"
+          "\n"
+          "def simple_moving_average(bars: list[Bar], start: int, length: int) -> float:\n"
+          "    if not bars:\n"
+          '        raise ValueError("empty bars")\n'
+          "    if length <= 0:\n"
+          '        raise ValueError("length must be positive")\n'
+          "    start = max(0, min(start, len(bars) - 1))\n"
+          "    length = min(length, len(bars) - start)\n"
+          "    return round(sum(b.close for b in bars[start:start + length]) / length, 9)\n")
+
+# the flat-wheel stand-in: its OWN Bar (a different class object than
+# avg.bars.Bar — what a PyO3 #[pyclass] port is) re-exported in the wheel
+# module itself, and a function accepting ONLY it, the way pyo3's extracted
+# Vec<Bar> does — the pre-#50 candidate adapter fed it python-side Bar
+# objects and every non-empty row diverged with exactly this TypeError
+AVG_RUST_PY = ('"""the wheel stand-in: a flat wheel exposing its OWN Bar\n'
+               'pyclass and the ported function (issue #50)."""\n'
+               "from dataclasses import dataclass\n"
+               "\n"
+               "\n"
+               "@dataclass\n"
+               "class Bar:\n"
+               "    open: float\n"
+               "    high: float\n"
+               "    low: float\n"
+               "    close: float\n"
+               "    volume: int\n"
+               "\n"
+               "\n"
+               "def simple_moving_average(bars, start, length):\n"
+               "    if not bars:\n"
+               '        raise ValueError("empty bars")\n'
+               "    if length <= 0:\n"
+               '        raise ValueError("length must be positive")\n'
+               "    if not all(isinstance(b, Bar) for b in bars):\n"
+               '        raise TypeError("bars must be wheel Bar instances")\n'
+               "    start = max(0, min(start, len(bars) - 1))\n"
+               "    length = min(length, len(bars) - start)\n"
+               "    return round(sum(b.close for b in bars[start:start + length]) / length, 9)\n")
+
+# a wheel that exports the function but NOT the dependency class anywhere:
+# resolution must fail HONESTLY at adapter import (setup error naming it),
+# never per-row divergence noise
+AVG_NOBAR_PY = ('"""a wheel stand-in with no Bar anywhere (issue #50)."""\n'
+                "\n"
+                "\n"
+                "def simple_moving_average(bars, start, length):\n"
+                '    raise TypeError("port expects its own Bar; none is exported")\n')
+
+
+def _avg_project(tmp_path, declare_dep=True):
+    """The issue #50 project: unit u-avg whose signature is typed by Bar
+    from its u-bars dependency module (declared in deps[] by default)."""
+    proj = tmp_path / "avg"
+    (proj / "src" / "avg").mkdir(parents=True)
+    (proj / "src" / "avg" / "bars.py").write_text(AVG_BARS_PY)
+    (proj / "src" / "avg" / "average.py").write_text(AVG_PY)
+    (proj / "src" / "avg" / "average_rust.py").write_text(AVG_RUST_PY)
+    (proj / "src" / "avg" / "average_nobar.py").write_text(AVG_NOBAR_PY)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({
+        "project": {"name": "avg", "python_path": "src/avg"}, "stage": 2,
+        "units": [
+            {"id": "u-bars", "python_path": "src/avg/bars.py",
+             "rust_path": None, "deps": [], "order": 1, "status": "ported"},
+            {"id": "u-avg", "python_path": "src/avg/average.py",
+             "rust_path": None,
+             "deps": ["u-bars"] if declare_dep else [],
+             "order": 2, "status": "pending"}]}))
+    return proj, state
+
+
+def _backend_of(text: str) -> str:
+    """The delimited BACKEND section (the inverse of _strip_backend)."""
+    _, _, rest = text.partition("# ==== BACKEND")
+    mid, _, _ = rest.partition("# ==== END BACKEND")
+    return mid
+
+
+def test_dependency_typed_params_build_from_each_sides_own_types(
+        monkeypatch, capsys, tmp_path):
+    """The issue #50 acceptance case: simple_moving_average(bars:
+    list[Bar], ...) with Bar from the unit's u-bars dependency. The
+    reference adapter must build Bars through the PYTHON dependency
+    module, the candidate through the WHEEL'S OWN class — never the
+    python project (pre-#50 adapters resolved the python module on both
+    sides, fed the wheel reference-built objects, and every non-empty row
+    diverged with the port's TypeError). Same JSON rows, each side's own
+    types: verdict EQUIVALENT."""
+    proj, state = _avg_project(tmp_path)
+    out = tmp_path / "runs"
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, out,
+                              "--unit", "u-avg",
+                              "--candidate-module", "avg.average_rust")
+    assert code == 0, payload["summary"]["human"]
+    unit = payload["units"][0]
+
+    # the derived-input record: the class, its module, the declared dep,
+    # the parameter path that needs it
+    assert unit["derived_inputs"] == [{
+        "name": "Bar", "module": "avg.bars", "path": "src/avg/bars.py",
+        "dep": "u-bars", "params": ["bars[item]"]}]
+    manifest = json.loads((out / "manifests/u-avg.json").read_text())
+    assert manifest["scaffold"]["derived_inputs"] == unit["derived_inputs"]
+    assert any("derived-input dataclass" in w and "declared dep u-bars" in w
+               for w in payload["warnings"])
+
+    # the corpus exercises the dependency-typed parameter for real: rows
+    # carry OHLCV field dicts (Bar is open/high/low/close/volume-shaped),
+    # never silent []
+    rows = [json.loads(line)
+            for line in (out / "corpora/corpus-u-avg.jsonl").read_text().splitlines()]
+    real = [r["bars"] for r in rows if r.get("bars")]
+    assert real and all(isinstance(b, dict) and "close" in b
+                        for bars in real for b in bars)
+    assert unit["corpus_dry_run"]["functions"]["simple_moving_average"]["ok"] > 0
+
+    # per-side resolution inside the BACKEND section only: the reference
+    # resolves the python dependency module, the candidate the wheel's own
+    # class — and the shared remainder stays byte-identical
+    ref = (out / "adapters/u_avg_ref.py").read_text()
+    cand = (out / "adapters/u_avg_cand.py").read_text()
+    assert _strip_backend(ref) == _strip_backend(cand)
+    assert unit["adapters"]["symmetric"] is True
+    assert '_resolve_module(spec["path"], spec["module"])' in _backend_of(ref)
+    assert "_WHEEL_DEP_MODULES" in _backend_of(cand)
+    assert "_resolve_module" not in _backend_of(cand)
+    assert "Bar (avg.bars), declared dep u-bars" in cand  # the record comment
+
+    # judging through the production path: the wheel's isinstance guard
+    # (the pyo3 Vec<Bar> contract) accepts ONLY wheel-built Bars — the
+    # verdict proves each side built its own types from the same rows
+    code, out_json = run_tool(monkeypatch, capsys, "oracle.py", [
+        "judge", "--manifest", str(out / "manifests/u-avg.json")])
+    assert code == 0, out_json["summary"]["human"]
+    assert out_json["verdict"] == "equivalent"
+    assert out_json["counts"] == {"equivalent": out_json["total"],
+                                  "divergent": 0, "incomparable": 0}
+
+
+def test_wheel_missing_the_dependency_class_is_an_honest_setup_error(
+        monkeypatch, capsys, tmp_path):
+    """A candidate that exports the function but not the dependency class
+    (and no _WHEEL_DEP_MODULES spelling defines it) must fail at ADAPTER
+    IMPORT — an oracle setup error naming the class — never per-row error
+    noise that would masquerade as divergence (the pre-#50 failure mode
+    took an oracle divergence to notice)."""
+    proj, state = _avg_project(tmp_path)
+    out = tmp_path / "runs"
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, out,
+                              "--unit", "u-avg",
+                              "--candidate-module", "avg.average_nobar")
+    assert code == 0, payload["summary"]["human"]
+    code, out_json = run_tool(monkeypatch, capsys, "oracle.py", [
+        "judge", "--manifest", str(out / "manifests/u-avg.json")])
+    assert code == 3
+    assert out_json["verdict"] == "incomparable"
+    assert out_json["counts"]["equivalent"] == 0
+    assert out_json["counts"]["divergent"] == 0
+    detail = out_json["runs"][0]["detail"]
+    assert "ImportError" in detail and "'Bar'" in detail
+    assert "issue #50" in detail
+
+
+def test_undeclared_dependency_module_is_called_out(monkeypatch, capsys, tmp_path):
+    """A dependency dataclass from a module that is neither the unit's own
+    nor in its recorded deps[] is recorded with dep=None and called out in
+    the warnings — the Stage-1 record may be stale."""
+    proj, state = _avg_project(tmp_path, declare_dep=False)
+    out = tmp_path / "runs"
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, out,
+                              "--unit", "u-avg")
+    assert code == 0, payload["summary"]["human"]
+    unit = payload["units"][0]
+    assert unit["derived_inputs"][0]["dep"] is None
+    assert any("NOT a declared dep" in w for w in payload["warnings"])
+
+
+def test_stale_deps_entry_is_a_warning(monkeypatch, capsys, tmp_path):
+    """deps[] naming a unit the state file does not carry is stale, not
+    silent: the scaffold says so."""
+    proj, state = _avg_project(tmp_path)
+    data = json.loads(state.read_text())
+    data["units"][1]["deps"] = ["u-ghost"]
+    state.write_text(json.dumps(data))
+    code, payload = _scaffold(monkeypatch, capsys, state, proj,
+                              tmp_path / "runs", "--unit", "u-avg")
+    assert code == 0, payload["summary"]["human"]
+    assert any("u-ghost" in w and "stale" in w for w in payload["warnings"])
+    assert payload["units"][0]["derived_inputs"][0]["dep"] is None
 
 
 # --------------------------------------------- module conformance (#48) ---
