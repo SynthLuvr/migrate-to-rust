@@ -7,9 +7,9 @@ checklist demands: nothing enters the plan without profiler evidence (hard
 rule 1: profile before porting; I/O-bound code is a NO-GO signal).
 
 Input format (canonical "hotspots JSON" — see from-cprofile for generating
-it from a cProfile dump): either the bare canonical list or, for direct
-composition, ``from-cprofile``'s tool envelope (its ``hotspots`` member is
-unwrapped automatically — issue #28):
+it from a cProfile dump): the bare canonical list, or ``from-cprofile``'s
+tool envelope, whose ``hotspots`` member is unwrapped so the subcommands
+compose with no manual extraction step (issue #28):
 
     [{"path": "src/pkg/parse.py", "self_cpu_s": 12.4, "io_wait_s": 3.1,
       "alloc_mb": 210, "calls": 54000}, ...]
@@ -20,15 +20,14 @@ independently testable top-level classes can be split later by hand.
 
 Hotspot paths that resolve to no file (profiler noise: console-script
 launchers recorded as ``~``, unexpanded ``~/`` paths, deleted files) are
-SKIPPED with a warning — a measurement of a file that isn't a project
-module is not a port unit. The run only refuses when nothing resolves.
+skipped with a warning — a measurement of a file that isn't a project
+module is not a port unit; the run refuses only when nothing resolves.
 
-Files that fail to parse under the *tool's* interpreter are NOT given a
-parse-error risk flag: hotspots come from code that already ran under the
-target interpreter, so a parse failure here is a tooling artifact (tool
-Python older than the target's syntax), not a portability risk. The scan
-falls back to regex (imports + risk patterns) and the unit carries a
-``parse_note`` instead of a scored flag (issue #28).
+A file that fails to parse under the *tool's* interpreter (e.g. syntax
+newer than the tool's Python) gets a regex-fallback scan and a
+``parse_note`` instead of a `parse-error` risk flag: the profiled code ran
+under the target interpreter, so the parse failure is a tooling artifact,
+not a portability risk (issue #28).
 
 Scoring (deterministic, documented):
   io_share      = io_wait_s / (io_wait_s + self_cpu_s + epsilon)
@@ -102,41 +101,50 @@ def unit_id_of(python_path: str, taken: set[str]) -> str:
 # ------------------------------------------------------------ AST scan -----
 
 _IMPORT_RE = re.compile(r"^[ \t]*(?:from[ \t]+([\w.]+)|import[ \t]+([\w.]+))",
-                         re.MULTILINE)
+                        re.MULTILINE)
 
 
 def _regex_imports(source: str) -> set[str]:
-    """Best-effort import extraction for the no-AST fallback path (parse
-    error under the tool's interpreter): line-leading ``from x.y ...`` /
-    ``import z`` statements. Enough to keep dep edges for ordering."""
-    imports = set()
-    for m in _IMPORT_RE.finditer(source):
-        imports.add(m.group(1) or m.group(2))
-    return imports
+    """Line-leading ``from x.y ...`` / ``import z`` statements — best-effort
+    dep edges when no AST is available."""
+    return {m.group(1) or m.group(2) for m in _IMPORT_RE.finditer(source)}
+
+
+def _risk_flags(source: str) -> list[str]:
+    """Risk flags whose text patterns match anywhere in the source."""
+    return [flag for flag, pats in RISK_PATTERNS.items()
+            if any(re.search(p, source) for p in pats)]
+
+
+def _unparsed_scan(source: str, parse_error: str) -> dict:
+    """Fallback for a file the tool's interpreter cannot parse — the
+    profiled code ran under the target interpreter, so the parse error is a
+    tooling artifact, not a portability risk: raw-text imports and risk
+    patterns still feed dep edges and flags; def/class counts are
+    unknowable without an AST, and the failure is recorded as a
+    ``parse_note`` instead of a risk flag."""
+    return {
+        "imports": _regex_imports(source),
+        "risk_flags": _risk_flags(source),
+        "functions": 0,
+        "classes": 0,
+        "parse_note": (
+            f"parse-error under tool Python {python_version_string()} "
+            f"({parse_error}) — likely newer-than-tool syntax; "
+            f"regex-fallback scan used, not counted as a portability risk"),
+    }
 
 
 def scan_module(path: Path) -> dict:
     """Deterministic single-pass scan: imports (dep edges), risk flags,
-    def/class counts. On a parse error (tool Python older than the target
-    syntax — the file ran under the target interpreter) records the detail
-    in ``parse_error`` and regex-scans instead of flagging a risk."""
-    out = {"imports": set(), "risk_flags": [], "functions": 0, "classes": 0}
+    def/class counts. Files the tool's interpreter cannot parse are
+    regex-scanned with a ``parse_note`` instead of a risk flag."""
     source = path.read_text(encoding="utf-8", errors="replace")
     try:
         tree = ast.parse(source)
     except SyntaxError as e:
-        # NOT a risk flag (issue #28): hotspot files already ran under the
-        # target interpreter (that's where the measurements came from), so
-        # a parse failure here means the *tool's* Python is older than the
-        # target's syntax — a tooling artifact, not a portability risk.
-        # Keep the detail for the unit's parse_note and fall back to a
-        # regex scan (imports for dep edges + risk patterns).
-        out["parse_error"] = str(e)
-        out["imports"] = _regex_imports(source)
-        for flag, pats in RISK_PATTERNS.items():
-            if any(re.search(p, source) for p in pats):
-                out["risk_flags"].append(flag)
-        return out
+        return _unparsed_scan(source, str(e))
+    out = {"imports": set(), "risk_flags": [], "functions": 0, "classes": 0}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -148,9 +156,7 @@ def scan_module(path: Path) -> dict:
             out["functions"] += 1
         elif isinstance(node, ast.ClassDef):
             out["classes"] += 1
-    for flag, pats in RISK_PATTERNS.items():
-        if any(re.search(p, source) for p in pats):
-            out["risk_flags"].append(flag)
+    out["risk_flags"] = _risk_flags(source)
     return out
 
 
@@ -257,13 +263,17 @@ def cmd_from_cprofile(args) -> int:
     return EXIT_OK
 
 
+def _unwrap_hotspots(payload: object) -> object:
+    """Bare canonical list, or a tool envelope (from-cprofile output) whose
+    ``hotspots`` member is used — so the subcommands compose with no manual
+    extraction step (issue #28)."""
+    if isinstance(payload, dict):
+        return payload.get("hotspots")
+    return payload
+
+
 def cmd_plan(args) -> int:
-    hotspots = read_json(args.hotspots)
-    # accept the bare canonical list OR the standard tool envelope emitted
-    # by `from-cprofile` ({"tool": ..., "hotspots": [...]}) so the two
-    # subcommands compose without a manual extract step (issue #28)
-    if isinstance(hotspots, dict):
-        hotspots = hotspots.get("hotspots")
+    hotspots = _unwrap_hotspots(read_json(args.hotspots))
     if not isinstance(hotspots, list) or not hotspots:
         raise ToolError(
             "hotspots JSON must be a non-empty list of per-module measurements "
@@ -272,11 +282,9 @@ def cmd_plan(args) -> int:
             kind="usage")
     project_root = Path(args.project_root or ".").resolve()
 
-    # resolve each hotspot path against the project root; keep the original
-    # hotspot dict around for metrics lookup. Paths that resolve to no file
-    # are profiler noise (console-script launchers recorded as "~", stale
-    # files, out-of-tree entries), not port units: skip them with a warning
-    # instead of refusing the whole plan (issue #28).
+    # keep the original hotspot dict around for metrics lookup; hotspot
+    # paths that resolve to no file are profiler noise, not port units —
+    # skip them, and refuse only when nothing resolves (issue #28)
     resolved: dict[str, Path] = {}
     hotspot_of: dict[str, dict] = {}
     skipped: list[str] = []
@@ -352,13 +360,8 @@ def cmd_plan(args) -> int:
             "priority": round(priority, 6),
             "no_go": h["io_bound"],
         }
-        if scan.get("parse_error"):
-            # tooling artifact, deliberately NOT a risk flag (issue #28):
-            # the file already ran under the target interpreter
-            unit["parse_note"] = (
-                f"parse-error under tool Python {python_version_string()} "
-                f"({scan['parse_error']}) — likely newer-than-tool syntax; "
-                f"regex-fallback scan used, not counted as a portability risk")
+        if "parse_note" in scan:
+            unit["parse_note"] = scan["parse_note"]
         units.append(unit)
 
     # convert dep paths to unit ids
