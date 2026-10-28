@@ -195,9 +195,10 @@ def _policy_structure_errors(policy: dict) -> list[str]:
     if (not isinstance(budget, dict)
             or "max_tokens" not in budget or "max_wall_clock_minutes" not in budget):
         errors.append("budget: max_tokens and max_wall_clock_minutes required")
-    mcd = budget.get("max_chain_depth") if isinstance(budget, dict) else None
-    if mcd is not None and (not isinstance(mcd, int) or isinstance(mcd, bool)
-                            or mcd < 1):
+    max_chain_depth = budget.get("max_chain_depth") if isinstance(budget, dict) else None
+    if max_chain_depth is not None and (not isinstance(max_chain_depth, int)
+                                        or isinstance(max_chain_depth, bool)
+                                        or max_chain_depth < 1):
         errors.append("budget.max_chain_depth: integer >= 1 required "
                       "(the successor-chain depth cap, issue #25)")
     return errors
@@ -1162,6 +1163,29 @@ def tokens_spent(state: dict) -> int:
     return ledger + per_unit
 
 
+def _chain_report_lines(chain: dict, tokens: int, ceiling: int | None) -> list[str]:
+    """The Session chain section of the run report (issue #25): depth,
+    wall clock and budget summed over every session in the chain, one
+    line per session and notice. Empty when the run never chained."""
+    if not chain.get("sessions"):
+        return []
+    lines = ["", "## Session chain (issue #25)", "",
+             f"- depth: {chain.get('depth', 0)} of max "
+             f"{chain.get('max_depth', '—')} successions · wall clock "
+             f"across the chain: {chain.get('wall_clock_minutes', 0)} min",
+             f"- budget across the chain: {tokens} tokens recorded"
+             + (f" / ceiling {ceiling}" if ceiling else "")
+             + " (sum over every session — successors get a fresh "
+               "session budget, never a fresh run budget)"]
+    for s in chain["sessions"]:
+        lines.append(f"- s{s.get('index')} **{s.get('name')}** "
+                     f"({s.get('id')}): {s.get('outcome') or 'in flight'}"
+                     + (f" — {s.get('succession_reason')}"
+                        if s.get("succession_reason") else ""))
+    lines += [f"- notice: {n}" for n in chain.get("notices") or []]
+    return lines
+
+
 def build_report(state: dict, policy: dict) -> str:
     level = state_tool.autonomy_level(state)
     tokens = tokens_spent(state)
@@ -1203,23 +1227,8 @@ def build_report(state: dict, policy: dict) -> str:
     for g in deferred:
         lines.append(f"- gate **{g.get('gate')}** [{g.get('state')}]: "
                      f"{g.get('note') or 'see state file'}")
-    chain = state.get("session_chain") or {}
-    if chain.get("sessions"):
-        lines += ["", "## Session chain (issue #25)", "",
-                  f"- depth: {chain.get('depth', 0)} of max "
-                  f"{chain.get('max_depth', '—')} successions · wall clock "
-                  f"across the chain: {chain.get('wall_clock_minutes', 0)} min",
-                  f"- budget across the chain: {tokens} tokens recorded"
-                  + (f" / ceiling {ceiling}" if ceiling else "")
-                  + " (sum over every session — successors get a fresh "
-                    "session budget, never a fresh run budget)"]
-        for s in chain["sessions"]:
-            lines.append(f"- s{s.get('index')} **{s.get('name')}** "
-                         f"({s.get('id')}): {s.get('outcome') or 'in flight'}"
-                         + (f" — {s.get('succession_reason')}"
-                            if s.get("succession_reason") else ""))
-        for n in chain.get("notices") or []:
-            lines.append(f"- notice: {n}")
+    lines += _chain_report_lines(state.get("session_chain") or {},
+                                 tokens, ceiling)
     lines.append("")
     return "\n".join(lines)
 

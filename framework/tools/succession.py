@@ -12,29 +12,26 @@ so this tool makes succession a *scheduling event in code*:
         --state runs/<project>/migration-state.json \
         --prompt-file runs/<project>/first-prompt.md
 
-wraps the whole run in a **chain of GLV orchestrator sessions** (the HTTP
-transport ``tools/glv-subagents.md`` already defines for role
+It wraps the whole run in a **chain of GLV orchestrator sessions** (the
+HTTP transport ``tools/glv-subagents.md`` already defines for role
 delegation): it starts session 1 with the operator's single prompt, parks
 on ``GET /api/sessions/:id/wait`` until each session settles, classifies
 the outcome from the state file (the single source of truth — sessions
 write it only through ``state.py``), and on session-level exhaustion
-spawns the successor itself:
+spawns the successor itself.
 
   1. **Auto-succession.** ``run_status=budget_exhausted`` (or a session
      that settled without recording any terminal state) under the
-     run-level ceilings → compose the full resume brief (state file path,
-     position, escalation dossier, journal tail, run-budget remaining,
-     chain history, hygiene findings), spawn the successor via
-     ``POST /api/sessions``, stop the predecessor if still live, journal
-     a **stop-notice** (operator informed, not involved), and reset
-     ``run_status`` to ``running`` — all through ``state.py``'s validated
-     writer. No human act anywhere.
+     run-level ceilings → compose the full resume brief, spawn the
+     successor via ``POST /api/sessions``, stop the predecessor if still
+     live, journal a **stop-notice** (operator informed, not involved),
+     and reset ``run_status`` to ``running`` — all through ``state.py``'s
+     validated writer. No human act anywhere.
   2. **Fresh session budget, shared run budget.** Every successor starts
      with a fresh session/context budget; the RUN-level ceilings
-     (``autonomy.budget``: 5M tokens / 720 min by default) bind across
-     the whole chain — token spend is summed through the one state file
-     every session writes, wall clock accumulates per session — so
-     runaway stays impossible.
+     (``autonomy.budget``) bind across the whole chain — token spend sums
+     through the one state file every session writes, wall clock
+     accumulates per session — so runaway stays impossible.
   3. **Guardrails.** A depth cap (``--max-depth``, or
      ``autonomy.budget.max_chain_depth``, policy default 10) and a
      monotonic-progress guard (each successor must advance the stage or
@@ -43,16 +40,14 @@ spawns the successor itself:
      resume loop.
   4. **Only genuine terminals end the chain:** ``complete`` /
      ``no_go_measured`` / ``failed_safely``, or the run-level ceilings
-     themselves (the pre-authorized bound — the one case where
-     ``budget_exhausted`` is the honest human-facing result: the operator
-     must raise the ceiling). Session-level ``budget_exhausted`` never
-     survives a chain while GLV is reachable.
-  5. **Degraded mode.** GLV unreachable (env unset, server down) at
-     chain start → refusal (exit 2) with the documented fallback: the
-     pre-#25 behavior — ``pipeline.py run`` ends in ``budget_exhausted``,
-     a human resumes after raising the ceiling. Unreachable MID-chain →
-     the exhausted state stands, a notice says so, exit 0: a terminal
-     state, never a hang.
+     themselves (the one case where ``budget_exhausted`` is the honest
+     human-facing result: the operator must raise the ceiling).
+  5. **Degraded mode.** GLV unreachable at chain start → refusal
+     (exit 2) with the documented fallback: the pre-#25 behavior —
+     ``pipeline.py run`` ends in ``budget_exhausted``, a human resumes
+     after raising the ceiling. Unreachable MID-chain → the exhausted
+     state stands, a notice says so, exit 0: a terminal state, never a
+     hang.
   6. **Resume hygiene at every succession** (the 20261028_4 lesson: the
      state recorded ``rust_path: crates/wicksmith-core/src/u_bars.rs``
      while the file lived at ``src/u_bars.rs``): every unit's recorded
@@ -117,8 +112,19 @@ DECIDED_UNIT_STATUSES = state_tool.RUST_LIVE_STATUSES | {"escalated", "fallback_
 # terminal-state discipline); budget_exhausted is NOT among them — it is a
 # scheduling event while run-level budget remains
 GENUINE_TERMINALS = ("complete", "no_go_measured", "failed_safely")
+# run_status values that warrant an auto-succession: the session's own
+# budget guard fired (budget_exhausted) or it settled without recording
+# any terminal state (None/pending/running — the context window killed it
+# first); in all of them the RUN-level bound decides what happens next
+SUCCEED_ELIGIBLE = (None, "pending", "running", "budget_exhausted")
+# finished runs a fresh chain must refuse to resume — failed_safely is
+# deliberately absent: a chain may take a failed_safely run over
+FINISHED_RUN_STATUSES = ("complete", "no_go_measured")
 GLV_LIVE_STATUSES = ("queued", "running")
 JOURNAL_TAIL_ENTRIES = 20
+DEFAULT_SESSION_ONE_PROMPT = (
+    "Run the Python->Rust migration per the framework's "
+    "MIGRATION_PROMPT.md; the state file path is recorded above.")
 
 
 # ------------------------------------------------------------ transport ----
@@ -261,9 +267,8 @@ def _progress_snapshot(state: dict) -> dict:
 
 
 def _progressed_since(state: dict, snapshot: dict) -> bool:
-    """Monotonic-progress guard: stage advance, or ≥1 unit newly decided
-    (ported/divergent_explained/escalated/fallback_python/retired —
-    anything but pending). Guards against infinite resume loops of a
+    """Monotonic-progress guard: the stage advanced, or ≥1 unit newly
+    decided vs. the spawn snapshot. Kills infinite resume loops of a
     successor that keeps exhausting without moving the run."""
     if state.get("stage", 0) > (snapshot.get("stage") or 0):
         return True
@@ -275,13 +280,13 @@ def _progressed_since(state: dict, snapshot: dict) -> bool:
 
 
 def _journal_write(state: dict, path: Path, changes: list, events: list,
-                   note_field: str) -> dict:
+                   field: str) -> dict:
     """Write through state.py (the ONLY writer); a rejection keeps the
     file as-is and records the failure (the chain still reports)."""
     try:
         state_tool.save_validated(state, path, actor=TOOL, changes=changes)
     except ValueError as e:
-        events.append({"event": "journal-write-rejected", "field": note_field,
+        events.append({"event": "journal-write-rejected", "field": field,
                        "detail": str(e)})
     return _load_state(path)
 
@@ -307,7 +312,8 @@ def _chain_session(state: dict, index: int) -> dict | None:
     return None
 
 
-def _append_session(state: dict, path: Path, entry: dict, events: list) -> dict:
+def _append_session(state: dict, path: Path, entry: dict, events: list,
+                    max_depth: int) -> dict:
     """Append one orchestrator session record (spawn time) and keep
     depth/max_depth coherent — one validated write."""
     chain = json.loads(json.dumps(state.get("session_chain") or {}))
@@ -317,8 +323,8 @@ def _append_session(state: dict, path: Path, entry: dict, events: list) -> dict:
     chain["depth"] = max(0, len(chain["sessions"]) - 1)
     # the cap in force when this session was appended; appends only happen
     # while len(sessions) <= cap, so depth <= max_depth holds by construction
-    chain["max_depth"] = (int(entry.pop("_max_depth", 0))
-                          or chain.get("max_depth") or DEFAULT_MAX_CHAIN_DEPTH)
+    chain["max_depth"] = (max_depth or chain.get("max_depth")
+                          or DEFAULT_MAX_CHAIN_DEPTH)
     state["session_chain"] = chain
     events.append({"event": "session-started", "index": entry["index"],
                    "id": entry["id"], "name": entry["name"],
@@ -334,8 +340,8 @@ def _append_session(state: dict, path: Path, entry: dict, events: list) -> dict:
 
 def _update_session(state: dict, path: Path, index: int, updates: dict,
                     events: list) -> dict:
-    session = _chain_session(state, index) or {}
-    label = f"session_chain.sessions[{session.get('id', index)}]"
+    label = (f"session_chain.sessions["
+             f"{(_chain_session(state, index) or {}).get('id', index)}]")
     for i, s in enumerate(state.get("session_chain", {}).get("sessions", [])):
         if isinstance(s, dict) and s.get("index") == index:
             state["session_chain"]["sessions"][i] = {**s, **updates}
@@ -380,28 +386,48 @@ def _accumulate_wall_clock(state: dict, path: Path, index: int,
 
 # -------------------------------------------------------- resume hygiene --
 
-def _roots_for(state: dict, state_path: Path, extra: str | None = None) -> list[Path]:
+def _existing_dirs(values) -> list[Path]:
+    """Normalize candidate values to existing absolute directories,
+    deduped, first-seen order kept."""
+    out: list[Path] = []
+    for value in values:
+        if not value:
+            continue
+        p = Path(str(value)).expanduser()
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        if p.is_dir() and p not in out:
+            out.append(p)
+    return out
+
+
+def _roots_for(state: dict, state_path: Path,
+               extra: str | None = None) -> list[Path]:
     """Candidate roots a recorded relative path may resolve against, most
     specific first: an explicit root, the preflight-recorded target root,
     then the state file's neighborhood (runs/<project>/ inside the target
     repo is the documented layout)."""
-    roots: list[Path] = []
+    return _existing_dirs([
+        extra,
+        ((state.get("preflight") or {}).get("target") or {}).get("root"),
+        state_path.parent,
+        state_path.parent.parent,
+        Path.cwd(),
+    ])
 
-    def add(value) -> None:
-        if not value:
-            return
-        p = Path(str(value)).expanduser()
-        if not p.is_absolute():
-            p = Path.cwd() / p
-        if p.is_dir() and p not in roots:
-            roots.append(p)
 
-    add(extra)
-    add(((state.get("preflight") or {}).get("target") or {}).get("root"))
-    add(state_path.parent)
-    add(state_path.parent.parent)
-    add(Path.cwd())
-    return roots
+def _search_roots_for(state: dict, state_path: Path,
+                      root_override: str | None) -> list[Path]:
+    """Roots for the same-basename candidate search: TARGET repo(s) only
+    — an explicit --root or the preflight-recorded root, at most the
+    state file's own directory (the runs/<project>/ layout) — never the
+    cwd or loose parent directories: a bare basename matches far too
+    widely outside the project to stay unambiguous."""
+    return _existing_dirs([
+        root_override,
+        ((state.get("preflight") or {}).get("target") or {}).get("root"),
+        str(state_path.parent),
+    ])
 
 
 def _exists_under(rel: str, roots: list[Path]) -> Path | None:
@@ -423,127 +449,134 @@ def _rust_path_alternatives(rust_path: str) -> list[str]:
     return []
 
 
+def _finding(check: str, unit, recorded, found, action: str,
+             detail: str) -> dict:
+    return {"check": check, "unit": unit, "recorded": recorded,
+            "found": found, "action": action, "detail": detail}
+
+
+def _path_finding(check: str, unit, rel, roots: list[Path]) -> dict:
+    """Verify one recorded relative path: ok / skipped (not recorded) /
+    unresolved (missing under every candidate root)."""
+    if not rel:
+        return _finding(check, unit, rel, None, "skipped", "not recorded")
+    found = _exists_under(str(rel), roots)
+    if found is None:
+        return _finding(check, unit, rel, None, "unresolved",
+                        "not found under any candidate root")
+    return _finding(check, unit, rel, str(found), "ok", "")
+
+
+def _basename_matches_under(root: Path, base: str) -> dict[Path, str]:
+    """Same-basename files under one root as {absolute: root-relative}; an
+    unreadable tree contributes nothing (OSError can fire mid-walk)."""
+    matches: dict[Path, str] = {}
+    try:
+        matches = {hit.resolve(): str(hit.relative_to(root))
+                   for hit in root.rglob(base) if hit.is_file()}
+    except OSError:
+        pass
+    return matches
+
+
+def _rust_replacement_candidates(rust: str, roots: list[Path],
+                                 search_roots: list[Path]) -> list[str]:
+    """Replacement candidates for a missing rust_path: the mechanical
+    re-spellings that exist on disk, plus same-basename files under the
+    search roots — deduped by ABSOLUTE path so one file found under two
+    roots (the target root and the state dir inside it) stays one
+    candidate."""
+    candidates = {alt for alt in _rust_path_alternatives(rust)
+                  if _exists_under(alt, roots) is not None}
+    hits: dict[Path, str] = {}
+    for root in search_roots:
+        for abs_path, rel in _basename_matches_under(
+                root, Path(rust).name).items():
+            hits.setdefault(abs_path, rel)
+    for alt in _rust_path_alternatives(rust):
+        for root in search_roots:
+            if (root / alt).is_file():
+                hits.setdefault((root / alt).resolve(), alt)
+    return sorted(candidates | set(hits.values()))
+
+
+def _repair_rust_path(state: dict, state_path: Path, unit: dict,
+                      replacement: str) -> None:
+    """Rewrite one rust_path through state.py's validated writer
+    (journaled); on rejection the in-memory unit is rolled back so state
+    and file stay in step."""
+    uid = unit.get("id")
+    old = unit.get("rust_path")
+    unit["rust_path"] = replacement
+    try:
+        state_tool.save_validated(
+            state, state_path, actor=TOOL,
+            changes=[(uid, f"units[{uid}].rust_path", old, replacement)])
+    except ValueError:
+        unit["rust_path"] = old
+        raise
+
+
+def _unit_path_findings(state: dict, state_path: Path, unit: dict, *,
+                        roots: list[Path], search_roots: list[Path],
+                        apply: bool) -> tuple[list[dict], dict]:
+    """Hygiene findings for one unit. python_path is the target's own
+    layout — reported, never rewritten; a rust_path repair fires only
+    when exactly ONE candidate exists on disk (ambiguity is reported,
+    never guessed). Returns (findings, state) — state is reloaded after a
+    journaled repair."""
+    uid = unit.get("id")
+    findings = [_path_finding(f"units[{uid}].python_path", uid,
+                              unit.get("python_path"), roots)]
+    rust = unit.get("rust_path")
+    if rust is None:
+        return findings, state
+    if _exists_under(str(rust), roots) is not None:
+        return findings + [_finding(f"units[{uid}].rust_path", uid,
+                                    rust, rust, "ok", "")], state
+    candidates = _rust_replacement_candidates(str(rust), roots, search_roots)
+    if len(candidates) != 1:
+        detail = (f"{len(candidates)} candidate(s) on disk "
+                  f"({', '.join(candidates[:3])})" if candidates
+                  else "no candidate found under any candidate root")
+        return findings + [_finding(f"units[{uid}].rust_path", uid, rust,
+                                    None, "unresolved", detail)], state
+    if not apply:
+        return findings + [_finding(
+            f"units[{uid}].rust_path", uid, rust, candidates[0],
+            "would-repair", "exactly one candidate exists on disk")], state
+    try:
+        _repair_rust_path(state, state_path, unit, candidates[0])
+    except ValueError as e:
+        detail = f"repair rejected by state validation: {e}"
+        return findings + [_finding(f"units[{uid}].rust_path", uid, rust,
+                                    None, "unresolved", detail)], state
+    return findings + [_finding(
+        f"units[{uid}].rust_path", uid, rust, candidates[0], "repaired",
+        "exactly one candidate exists on disk; repaired through state.py "
+        "(journaled)")], _load_state(state_path)
+
+
 def resume_hygiene(state: dict, state_path: Path, *, apply: bool = True,
                    root_override: str | None = None) -> tuple[dict, list[dict]]:
     """Verify every recorded path at succession time (issue #25
     resume-hygiene). Returns (state, findings); each finding carries
-    action ∈ ok | repaired | would-repair | unresolved | skipped.
-    Repairs go through state.py's validated writer (journaled) and only
-    fire when exactly ONE candidate exists on disk — ambiguity is
-    reported, never guessed. Python paths are the target's own layout:
-    reported, never rewritten."""
-    findings: list[dict] = []
+    action ∈ ok | repaired | would-repair | unresolved | skipped."""
     roots = _roots_for(state, state_path, root_override)
     if not roots:
-        findings.append({"check": "roots", "unit": None, "recorded": None,
-                         "found": None, "action": "unresolved",
-                         "detail": "no candidate root exists on disk"})
-        return state, findings
-
-    # the basename search only ever runs inside the TARGET repo(s) — an
-    # explicit --root or the preflight-recorded root (at most the state
-    # file's own directory, the runs/<project>/ layout) — never the cwd or
-    # loose parent directories: a basename like u_bars.rs matches far too
-    # widely outside the project to stay unambiguous
-    search_roots: list[Path] = []
-    for cand in (root_override,
-                 ((state.get("preflight") or {}).get("target") or {}).get("root"),
-                 str(state_path.parent)):
-        if not cand:
-            continue
-        p = Path(str(cand)).expanduser()
-        if not p.is_absolute():
-            p = Path.cwd() / p
-        if p.is_dir() and p not in search_roots:
-            search_roots.append(p)
-
-    def check_path(rel, unit: str | None, field: str) -> dict:
-        if not rel:
-            return {"check": field, "unit": unit, "recorded": rel,
-                    "found": None, "action": "skipped",
-                    "detail": "not recorded"}
-        found = _exists_under(str(rel), roots)
-        if found is not None:
-            return {"check": field, "unit": unit, "recorded": rel,
-                    "found": str(found), "action": "ok", "detail": ""}
-        return {"check": field, "unit": unit, "recorded": rel, "found": None,
-                "action": "unresolved",
-                "detail": "not found under any candidate root"}
-
-    findings.append(check_path(
-        (state.get("project") or {}).get("python_path"), None,
-        "project.python_path"))
-
-    for u in state.get("units") or []:
-        uid = u.get("id")
-        # python paths: verify + report only (the target's own layout)
-        findings.append(check_path(u.get("python_path"), uid,
-                                   f"units[{uid}].python_path"))
-        rust = u.get("rust_path")
-        if rust is None:
-            continue
-        if _exists_under(str(rust), roots) is not None:
-            findings.append({"check": f"units[{uid}].rust_path", "unit": uid,
-                             "recorded": rust, "found": rust,
-                             "action": "ok", "detail": ""})
-            continue
-        # mechanical re-spellings, then a bounded same-basename search —
-        # deduped by ABSOLUTE path so one file found under two roots (the
-        # target root and the state dir inside it) stays one candidate
-        candidates: list[str] = [a for a in _rust_path_alternatives(str(rust))
-                                 if _exists_under(a, roots) is not None]
-        hits: dict[Path, str] = {}
-        base = Path(str(rust)).name
-        for root in search_roots:
-            try:
-                for hit in root.rglob(base):
-                    if hit.is_file():
-                        hits.setdefault(hit.resolve(), str(hit.relative_to(root)))
-            except OSError:
-                continue
-        for rel in _rust_path_alternatives(str(rust)):
-            for root in search_roots:
-                abs_hit = root / rel
-                if abs_hit.is_file():
-                    hits.setdefault(abs_hit.resolve(), rel)
-        candidates.extend(hits.values())
-        uniq = sorted(set(candidates))
-        if len(uniq) == 1:
-            if not apply:
-                findings.append({
-                    "check": f"units[{uid}].rust_path", "unit": uid,
-                    "recorded": rust, "found": uniq[0],
-                    "action": "would-repair",
-                    "detail": "exactly one candidate exists on disk"})
-                continue
-            old_rust = u.get("rust_path")
-            u["rust_path"] = uniq[0]
-            try:
-                state_tool.save_validated(
-                    state, state_path, actor=TOOL,
-                    changes=[(uid, f"units[{uid}].rust_path", old_rust,
-                              uniq[0])])
-                findings.append({
-                    "check": f"units[{uid}].rust_path", "unit": uid,
-                    "recorded": old_rust, "found": uniq[0],
-                    "action": "repaired",
-                    "detail": "exactly one candidate exists on disk; "
-                              "repaired through state.py (journaled)"})
-                state = _load_state(state_path)
-            except ValueError as e:
-                u["rust_path"] = old_rust
-                findings.append({
-                    "check": f"units[{uid}].rust_path", "unit": uid,
-                    "recorded": old_rust, "found": None,
-                    "action": "unresolved",
-                    "detail": f"repair rejected by state validation: {e}"})
-        else:
-            findings.append({
-                "check": f"units[{uid}].rust_path", "unit": uid,
-                "recorded": rust, "found": None, "action": "unresolved",
-                "detail": (f"{len(uniq)} candidate(s) on disk "
-                           f"({', '.join(uniq[:3])})" if uniq
-                           else "no candidate found under any candidate root")})
+        return state, [_finding("roots", None, None, None, "unresolved",
+                                "no candidate root exists on disk")]
+    search_roots = _search_roots_for(state, state_path, root_override)
+    project_path = (state.get("project") or {}).get("python_path")
+    findings = [_path_finding("project.python_path", None, project_path,
+                              roots)]
+    # iterated exactly once over the loaded units: a mid-loop reload (a
+    # journaled repair) must not restart or duplicate the walk
+    for unit in state.get("units") or []:
+        unit_findings, state = _unit_path_findings(
+            state, state_path, unit, roots=roots, search_roots=search_roots,
+            apply=apply)
+        findings += unit_findings
     return state, findings
 
 
@@ -569,6 +602,13 @@ def _dossier_lines(state: dict) -> list[str]:
         lines.append(f"- gate **{g.get('gate')}** [{g.get('state')}]: "
                      f"{g.get('note') or 'see state file'}")
     return lines
+
+
+def _session_line(s: dict) -> str:
+    return (f"- s{s.get('index')} **{s.get('name')}** ({s.get('id')}): "
+            f"{s.get('outcome') or 'in flight'}"
+            + (f" — {s.get('succession_reason')}" if s.get("succession_reason")
+               else ""))
 
 
 def compose_resume_brief(*, state: dict, state_path: Path, successor_index: int,
@@ -627,10 +667,8 @@ def compose_resume_brief(*, state: dict, state_path: Path, successor_index: int,
         f"- autonomy: {state_tool.autonomy_level(state)}",
         f"- units: {len(state.get('units', []))} — "
         + (", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "none"),
-    ]
-    lines.append(f"- pending units (leaf-first order): {', '.join(pending)}"
-                 if pending else "- no pending units")
-    lines += [
+        f"- pending units (leaf-first order): {', '.join(pending)}"
+        if pending else "- no pending units",
         "",
         "## Run-level budget (across the whole chain — the sum of all sessions)",
         "",
@@ -649,11 +687,7 @@ def compose_resume_brief(*, state: dict, state_path: Path, successor_index: int,
         "",
         "## Session chain so far",
         "",
-        *[f"- s{s.get('index')} **{s.get('name')}** ({s.get('id')}): "
-          f"{s.get('outcome') or 'in flight'}"
-          + (f" — {s.get('succession_reason')}" if s.get("succession_reason")
-             else "")
-          for s in sessions],
+        *[_session_line(s) for s in sessions],
         "",
         "## Resume hygiene (verified at succession time)",
         "",
@@ -704,6 +738,13 @@ def compose_start_brief(*, prompt_text: str, state: dict, state_path: Path,
     return header + prompt_text
 
 
+def _session_one_prompt(args) -> str:
+    prompt_file = getattr(args, "prompt_file", None)
+    if not prompt_file:
+        return DEFAULT_SESSION_ONE_PROMPT
+    return Path(prompt_file).read_text(encoding="utf-8")
+
+
 def _next_brief(state: dict, state_path: Path, *, policy: dict, args,
                 hygiene_findings: list[dict] | None = None) -> tuple[str, int]:
     """The brief for the NEXT session: fresh start (the operator's single
@@ -711,14 +752,9 @@ def _next_brief(state: dict, state_path: Path, *, policy: dict, args,
     max_tokens, max_minutes, max_depth = _ceilings(state, policy, args)
     index = len(_chain_block(state).get("sessions") or []) + 1
     if index == 1:
-        prompt_text = (Path(args.prompt_file).read_text(encoding="utf-8")
-                       if getattr(args, "prompt_file", None) else
-                       "Run the Python->Rust migration per the framework's "
-                       "MIGRATION_PROMPT.md; the state file path is recorded "
-                       "above.")
-        return compose_start_brief(prompt_text=prompt_text, state=state,
-                                   state_path=state_path,
-                                   max_depth=max_depth), index
+        return compose_start_brief(
+            prompt_text=_session_one_prompt(args), state=state,
+            state_path=state_path, max_depth=max_depth), index
     return compose_resume_brief(
         state=state, state_path=state_path, successor_index=index,
         max_depth=max_depth, max_tokens=max_tokens, max_minutes=max_minutes,
@@ -741,45 +777,41 @@ def _classify(state: dict, *, max_tokens: int | None, max_minutes: int | None,
         return {"kind": "terminal", "run_status": run_status,
                 "reason": f"session settled in the genuine terminal state "
                           f"{run_status!r} — chain ends"}
+    if run_status not in SUCCEED_ELIGIBLE:
+        return {"kind": "terminal", "run_status": run_status,
+                "reason": f"unexpected run_status {run_status!r} — treated as "
+                          f"terminal; inspect the state file"}
     tokens = pipeline_tool.tokens_spent(state)
     wall = _chain_block(state).get("wall_clock_minutes") or 0.0
     sessions = _chain_block(state).get("sessions") or []
-    if run_status == "budget_exhausted" or run_status in (None, "pending",
-                                                          "running"):
-        # the session believed it exhausted (its guard fired) or settled
-        # without recording any terminal state (the context window killed
-        # it first) — either way, first ask whether the RUN-level bound hit
-        if max_tokens is not None and tokens > max_tokens:
-            return {"kind": "run_level_exhausted",
-                    "reason": f"run-level token ceiling reached across the "
-                              f"chain: {tokens} > {max_tokens} over "
-                              f"{len(sessions)} session(s) — the "
-                              f"pre-authorized budget is spent"}
-        if max_minutes is not None and wall > max_minutes:
-            return {"kind": "run_level_exhausted",
-                    "reason": f"run-level wall-clock ceiling reached across "
-                              f"the chain: {wall:.1f} > {max_minutes} min "
-                              f"over {len(sessions)} session(s)"}
-        if len(sessions) >= 2:
-            snapshot = (sessions[-1] or {}).get("progress_snapshot") or {}
-            if not _progressed_since(state, snapshot):
-                return {"kind": "no_progress",
-                        "reason": "successor session settled "
-                                  f"({run_status!r}) after advancing no "
-                                  "observable state (stage or ≥1 unit "
-                                  "decided) — chain terminated to prevent "
-                                  "an infinite resume loop"}
-        if len(sessions) + 1 > max_depth:
-            return {"kind": "depth_cap",
-                    "reason": f"chain depth cap {max_depth} reached with the "
-                              f"run unfinished ({run_status!r})"}
-        return {"kind": "succeed",
-                "reason": f"session-level exhaustion ({run_status!r}) under "
-                          f"the run-level ceilings — successor spawns "
-                          f"automatically"}
-    return {"kind": "terminal", "run_status": run_status,
-            "reason": f"unexpected run_status {run_status!r} — treated as "
-                      f"terminal; inspect the state file"}
+    if max_tokens is not None and tokens > max_tokens:
+        return {"kind": "run_level_exhausted",
+                "reason": f"run-level token ceiling reached across the "
+                          f"chain: {tokens} > {max_tokens} over "
+                          f"{len(sessions)} session(s) — the "
+                          f"pre-authorized budget is spent"}
+    if max_minutes is not None and wall > max_minutes:
+        return {"kind": "run_level_exhausted",
+                "reason": f"run-level wall-clock ceiling reached across "
+                          f"the chain: {wall:.1f} > {max_minutes} min "
+                          f"over {len(sessions)} session(s)"}
+    if len(sessions) >= 2:
+        snapshot = (sessions[-1] or {}).get("progress_snapshot") or {}
+        if not _progressed_since(state, snapshot):
+            return {"kind": "no_progress",
+                    "reason": "successor session settled "
+                              f"({run_status!r}) after advancing no "
+                              "observable state (stage or ≥1 unit "
+                              "decided) — chain terminated to prevent "
+                              "an infinite resume loop"}
+    if len(sessions) + 1 > max_depth:
+        return {"kind": "depth_cap",
+                "reason": f"chain depth cap {max_depth} reached with the "
+                          f"run unfinished ({run_status!r})"}
+    return {"kind": "succeed",
+            "reason": f"session-level exhaustion ({run_status!r}) under "
+                      f"the run-level ceilings — successor spawns "
+                      f"automatically"}
 
 
 # ---------------------------------------------------------------- chain ---
@@ -801,9 +833,8 @@ def _start_session(state: dict, path: Path, client: GlvClient, brief: str,
     entry = {"index": index, "id": sid, "name": name,
              "started_at": now_iso(),
              "succession_reason": succession_reason,
-             "progress_snapshot": snapshot,
-             "_max_depth": max_depth}
-    return _append_session(state, path, entry, events), index
+             "progress_snapshot": snapshot}
+    return _append_session(state, path, entry, events, max_depth), index
 
 
 def _settle(state: dict, path: Path, client: GlvClient, index: int,
@@ -817,12 +848,11 @@ def _settle(state: dict, path: Path, client: GlvClient, index: int,
                             {"settled_at": now_iso(),
                              "glv_status": settled.get("status")}, events)
     state = _accumulate_wall_clock(state, path, index, events)
-    run_status = _load_state(path).get("run_status")
-    state = _update_session(state, path, index, {"outcome": run_status},
-                            events)
+    state = _update_session(state, path, index,
+                            {"outcome": state.get("run_status")}, events)
     events.append({"event": "session-settled", "index": index,
                    "glv_status": settled.get("status"),
-                   "outcome": run_status})
+                   "outcome": state.get("run_status")})
     return state
 
 
@@ -843,99 +873,217 @@ def _public_chain(state: dict) -> dict:
             "notices": chain.get("notices") or []}
 
 
+def _unreachable_at_start_detail(e: GlvError) -> str:
+    return (f"GLV unreachable, the chain cannot start ({e}). "
+            f"Degraded mode (pre-#25 behavior): run pipeline.py run "
+            f"directly — it ends in budget_exhausted and a human "
+            f"resumes after raising the ceiling; or start `glv "
+            f"serve` and re-run this command.")
+
+
+def _unreachable_mid_session_detail(e: GlvError, session_id) -> str:
+    return (f"chain interrupted mid-session and GLV is unreachable "
+            f"({e}); check `glv sessions` / `glv view "
+            f"{session_id}` on the server host, then re-run this "
+            f"command — it adopts the live session")
+
+
+def _dry_run_chain(args, state: dict, path: Path, policy: dict,
+                   ceilings: tuple[int | None, int | None, int]) -> int:
+    """Compose the next session's brief + the guardrail plan without
+    contacting GLV or writing anything."""
+    max_tokens, max_minutes, max_depth = ceilings
+    state, findings = resume_hygiene(state, path, apply=False)
+    settled = [s for s in _chain_block(state).get("sessions") or []
+               if isinstance(s, dict) and s.get("settled_at")]
+    decision = None
+    if settled:
+        decision = _classify(state, max_tokens=max_tokens,
+                             max_minutes=max_minutes, max_depth=max_depth)
+        if decision["kind"] == "terminal":
+            human = (f"dry-run: the chain is already finished — "
+                     f"{decision['reason']}")
+            emit({"tool": TOOL, "version": VERSION, "file": str(path),
+                  "dry_run": True, "finished": True,
+                  "classification": decision, "hygiene": findings,
+                  "summary": {"exit_code": EXIT_OK, "human": human}},
+                 human_flag=args.human)
+            return EXIT_OK
+    brief, index = _next_brief(state, path, policy=policy, args=args,
+                               hygiene_findings=findings)
+    human = (f"dry-run: next is session s{index} of max {max_depth}; "
+             f"ceilings tokens={max_tokens or '∞'} "
+             f"wall={max_minutes or '∞'} min; "
+             f"{len(_unresolved(findings))} unresolved hygiene finding(s)")
+    emit({"tool": TOOL, "version": VERSION, "file": str(path),
+          "dry_run": True, "next_session": index, "max_depth": max_depth,
+          "ceilings": {"max_tokens": max_tokens,
+                       "max_wall_clock_minutes": max_minutes},
+          "classification": decision,
+          "hygiene": findings, "brief": brief,
+          "summary": {"exit_code": EXIT_OK, "human": human}},
+         human_flag=args.human)
+    return EXIT_OK
+
+
+def _run_first_session(state: dict, path: Path, client: GlvClient,
+                       policy: dict, args, events: list, *, project: str,
+                       working_dir: str, max_depth: int) -> dict:
+    """Session 1: the operator's single prompt, not a succession.
+    Resumable statuses flip to running first (the same rule as
+    pipeline.run), journaled through state.py."""
+    if state.get("run_status") in (None, "pending", "budget_exhausted",
+                                   "failed_safely"):
+        state = _set_run_status(state, path, "running", events,
+                                "chain session 1 starting")
+    brief, _ = _next_brief(state, path, policy=policy, args=args)
+    state, _ = _start_session(state, path, client, brief, events,
+                              project=project, working_dir=working_dir,
+                              model=args.model, max_depth=max_depth,
+                              succession_reason=None,
+                              snapshot=_progress_snapshot(state))
+    return _settle(state, path, client,
+                   len(_chain_block(state)["sessions"]), events)
+
+
+def _stop_predecessor_if_live(client: GlvClient, predecessor: dict,
+                              events: list) -> None:
+    if predecessor.get("glv_status") not in GLV_LIVE_STATUSES:
+        return
+    try:
+        client.stop(predecessor.get("id"))
+        events.append({"event": "predecessor-stopped",
+                       "id": predecessor.get("id")})
+    except GlvError as e:
+        events.append({"event": "predecessor-stop-failed",
+                       "id": predecessor.get("id"), "detail": str(e)})
+
+
+def _record_succession(state: dict, path: Path, predecessor: dict,
+                       successor: dict, events: list) -> dict:
+    """The stop-notice (operator informed, not involved) plus the
+    run_status reset that lets the successor record into the same run."""
+    state = _append_notice(
+        state, path,
+        f"stop-notice: s{predecessor.get('index')} "
+        f"{predecessor.get('name')} ({predecessor.get('id')}) settled "
+        f"{predecessor.get('outcome')!r} at stage {state.get('stage')} — "
+        f"successor s{successor.get('index')} {successor.get('name')} "
+        f"({successor.get('id')}) spawned automatically with full resume "
+        f"context; run_status reset to running; operator informed, not "
+        f"involved", events)
+    state = _set_run_status(state, path, "running", events,
+                            "successor session spawned by the chain")
+    events.append({"event": "succession", "to_session": successor.get("index"),
+                   "depth": _chain_block(state).get("depth")})
+    return state
+
+
+def _park_degraded_at_spawn(state: dict, path: Path, sessions: list,
+                            error: GlvError,
+                            events: list) -> tuple[dict, str, str]:
+    """GLV died at the succession moment: degraded mode — the exhausted
+    state stands (the pre-#25 behavior) with a notice."""
+    if state.get("run_status") != "budget_exhausted":
+        state = _set_run_status(
+            state, path, "budget_exhausted", events,
+            f"session ended non-terminal and GLV is unreachable "
+            f"({error}) — degraded mode")
+    state = _append_notice(
+        state, path,
+        f"succession FAILED at depth {len(sessions)}: GLV unreachable "
+        f"({error}); degraded mode — budget_exhausted stands, resume per "
+        f"tools/glv-subagents.md once the server is back", events)
+    return state, str(error), (
+        f"GLV unreachable at succession: {error} — degraded mode; the run "
+        f"parks in budget_exhausted (the pre-#25 behavior)")
+
+
+def _park_degraded_at_settle(state: dict, path: Path, index: int,
+                             error: GlvError,
+                             events: list) -> tuple[dict, str, str]:
+    """The successor was in flight when GLV died: degraded mode — the
+    operator checks the session server-side; the run parks, never hangs."""
+    sid = (_chain_session(state, index) or {}).get("id")
+    state = _append_notice(
+        state, path,
+        f"successor s{index} was in flight when GLV became "
+        f"unreachable ({error}); degraded mode — check `glv view "
+        f"{sid}` on the server host, then re-run the chain (it adopts "
+        f"the session)", events)
+    state = _set_run_status(
+        state, path, "budget_exhausted", events,
+        "successor in flight when GLV became unreachable — degraded mode")
+    return state, str(error), (
+        f"GLV unreachable while successor s{index} was in flight: {error} — "
+        f"degraded mode; the run parks in budget_exhausted (the pre-#25 "
+        f"behavior)")
+
+
+def _apply_decision(decision: dict, state: dict, path: Path,
+                    events: list) -> tuple[dict, str | None]:
+    """Apply a chain-ending classification; None means 'succeed' — the
+    caller spawns the successor."""
+    kind, reason = decision["kind"], decision["reason"]
+    if kind == "terminal":
+        return state, reason
+    if kind == "run_level_exhausted":
+        if state.get("run_status") != "budget_exhausted":
+            state = _set_run_status(state, path, "budget_exhausted", events,
+                                    reason)
+        return state, reason
+    if kind in ("no_progress", "depth_cap"):
+        return _set_run_status(state, path, "failed_safely", events,
+                               reason), reason
+    return state, None
+
+
 def cmd_chain(args) -> int:
     policy = pipeline_tool.load_policy(args.policy)
     path = Path(args.state)
     state = _load_state(path)
     sessions = _chain_block(state).get("sessions") or []
 
-    if not sessions and state.get("run_status") in ("complete", "no_go_measured"):
+    if not sessions and state.get("run_status") in FINISHED_RUN_STATUSES:
         return _refusal(
             f"run_status={state['run_status']} is a finished run — start a "
             f"fresh run (state.py init) to migrate again; a chain resumes "
             f"budget_exhausted/failed_safely/interrupted runs, not finished "
             f"ones", args.human, file=str(path))
 
-    max_tokens, max_minutes, max_depth = _ceilings(state, policy, args)
-    events: list[dict] = []
-    project = (state.get("project") or {}).get("name") or "project"
-    working_dir = args.working_dir or \
-        (((state.get("preflight") or {}).get("target") or {}).get("root")
-         or str(path.parent))
-
+    ceilings = _ceilings(state, policy, args)
     if args.dry_run:
-        state, findings = resume_hygiene(state, path, apply=False)
-        settled = [s for s in _chain_block(state).get("sessions") or []
-                   if isinstance(s, dict) and s.get("settled_at")]
-        decision = None
-        if settled:
-            decision = _classify(state, max_tokens=max_tokens,
-                                 max_minutes=max_minutes,
-                                 max_depth=max_depth)
-            if decision["kind"] == "terminal":
-                human = (f"dry-run: the chain is already finished — "
-                         f"{decision['reason']}")
-                emit({"tool": TOOL, "version": VERSION, "file": str(path),
-                      "dry_run": True, "finished": True,
-                      "classification": decision, "hygiene": findings,
-                      "summary": {"exit_code": EXIT_OK, "human": human}},
-                     human_flag=args.human)
-                return EXIT_OK
-        brief, index = _next_brief(state, path, policy=policy, args=args,
-                                   hygiene_findings=findings)
-        human = (f"dry-run: next is session s{index} of max {max_depth}; "
-                 f"ceilings tokens={max_tokens or '∞'} "
-                 f"wall={max_minutes or '∞'} min; "
-                 f"{len(_unresolved(findings))} unresolved hygiene finding(s)")
-        emit({"tool": TOOL, "version": VERSION, "file": str(path),
-              "dry_run": True, "next_session": index, "max_depth": max_depth,
-              "ceilings": {"max_tokens": max_tokens,
-                           "max_wall_clock_minutes": max_minutes},
-              "classification": decision,
-              "hygiene": findings, "brief": brief,
-              "summary": {"exit_code": EXIT_OK, "human": human}},
-             human_flag=args.human)
-        return EXIT_OK
+        return _dry_run_chain(args, state, path, policy, ceilings)
 
     try:
         client = _client_from(args)  # refusal (exit 2) when GLV is unconfigured
     except ToolError as e:
         return _refusal(str(e), args.human, file=str(path))
 
+    events: list[dict] = []
+    project = (state.get("project") or {}).get("name") or "project"
+    working_dir = args.working_dir or \
+        (((state.get("preflight") or {}).get("target") or {}).get("root")
+         or str(path.parent))
+    max_tokens, max_minutes, max_depth = ceilings
     terminal_reason: str | None = None
     degraded_reason: str | None = None
 
     while True:
         state = _load_state(path)
         sessions = _chain_block(state).get("sessions") or []
+
         if not sessions:
-            # session 1: the operator's single prompt — not a succession.
-            # Resumable statuses flip to running first (same rule as
-            # pipeline.run), journaled through state.py.
-            if state.get("run_status") in (None, "pending", "budget_exhausted",
-                                           "failed_safely"):
-                state = _set_run_status(state, path, "running", events,
-                                        "chain session 1 starting")
-            brief, _ = _next_brief(state, path, policy=policy, args=args)
             try:
-                state, _ = _start_session(state, path, client, brief, events,
-                                          project=project,
-                                          working_dir=working_dir,
-                                          model=args.model,
-                                          max_depth=max_depth,
-                                          succession_reason=None,
-                                          snapshot=_progress_snapshot(state))
-                state = _settle(state, path, client,
-                                len(_chain_block(state)["sessions"]), events)
+                state = _run_first_session(state, path, client, policy,
+                                           args, events, project=project,
+                                           working_dir=working_dir,
+                                           max_depth=max_depth)
             except GlvError as e:
-                return _refusal(
-                    f"GLV unreachable, the chain cannot start ({e}). "
-                    f"Degraded mode (pre-#25 behavior): run pipeline.py run "
-                    f"directly — it ends in budget_exhausted and a human "
-                    f"resumes after raising the ceiling; or start `glv "
-                    f"serve` and re-run this command.", args.human,
-                    file=str(path))
+                return _refusal(_unreachable_at_start_detail(e),
+                                args.human, file=str(path))
             continue
+
         last = sessions[-1] or {}
         if not last.get("settled_at"):
             # the harness itself died mid-session: adopt the live session
@@ -945,108 +1093,43 @@ def cmd_chain(args) -> int:
                                 events)
             except GlvError as e:
                 return _refusal(
-                    f"chain interrupted mid-session and GLV is unreachable "
-                    f"({e}); check `glv sessions` / `glv view "
-                    f"{last.get('id')}` on the server host, then re-run this "
-                    f"command — it adopts the live session", args.human,
-                    file=str(path))
+                    _unreachable_mid_session_detail(e, last.get("id")),
+                    args.human, file=str(path))
             continue
 
         decision = _classify(state, max_tokens=max_tokens,
                              max_minutes=max_minutes, max_depth=max_depth)
         events.append({"event": "classified", "kind": decision["kind"],
                        "reason": decision["reason"]})
-
-        if decision["kind"] == "terminal":
-            terminal_reason = decision["reason"]
-            break
-        if decision["kind"] == "run_level_exhausted":
-            if state.get("run_status") != "budget_exhausted":
-                state = _set_run_status(state, path, "budget_exhausted",
-                                        events, decision["reason"])
-            terminal_reason = decision["reason"]
-            break
-        if decision["kind"] in ("no_progress", "depth_cap"):
-            state = _set_run_status(state, path, "failed_safely", events,
-                                    decision["reason"])
-            terminal_reason = decision["reason"]
+        state, ending = _apply_decision(decision, state, path, events)
+        if ending is not None:
+            terminal_reason = ending
             break
 
-        # succeed: hygiene -> brief -> spawn -> stop-notice + reset
+        # succeed: hygiene -> brief -> spawn -> stop-notice + reset -> settle
         state, findings = resume_hygiene(state, path)
-        for f in findings:
-            if f.get("action") == "repaired":
-                events.append({"event": "hygiene-repaired", **f})
+        events += [{"event": "hygiene-repaired", **f}
+                   for f in findings if f.get("action") == "repaired"]
         brief, index = _next_brief(state, path, policy=policy, args=args,
                                    hygiene_findings=findings)
         try:
-            state, _ = _start_session(state, path, client, brief, events,
-                                      project=project, working_dir=working_dir,
-                                      model=args.model, max_depth=max_depth,
-                                      succession_reason=decision["reason"],
-                                      snapshot=_progress_snapshot(state))
+            state, index = _start_session(
+                state, path, client, brief, events, project=project,
+                working_dir=working_dir, model=args.model,
+                max_depth=max_depth, succession_reason=decision["reason"],
+                snapshot=_progress_snapshot(state))
         except GlvError as e:
-            # GLV died mid-chain: degraded mode — the exhausted state stands
-            degraded_reason = str(e)
-            if state.get("run_status") != "budget_exhausted":
-                state = _set_run_status(
-                    state, path, "budget_exhausted", events,
-                    f"session ended non-terminal and GLV is unreachable "
-                    f"({e}) — degraded mode")
-            state = _append_notice(
-                state, path,
-                f"succession FAILED at depth {len(sessions)}: GLV unreachable "
-                f"({e}); degraded mode — budget_exhausted stands, resume per "
-                f"tools/glv-subagents.md once the server is back", events)
-            terminal_reason = (f"GLV unreachable at succession: {e} — "
-                               f"degraded mode; the run parks in "
-                               f"budget_exhausted (the pre-#25 behavior)")
+            state, degraded_reason, terminal_reason = \
+                _park_degraded_at_spawn(state, path, sessions, e, events)
             break
-        predecessor = sessions[-1] or {}
-        if predecessor.get("glv_status") in GLV_LIVE_STATUSES:
-            try:
-                client.stop(predecessor.get("id"))
-                events.append({"event": "predecessor-stopped",
-                               "id": predecessor.get("id")})
-            except GlvError as e:
-                events.append({"event": "predecessor-stop-failed",
-                               "id": predecessor.get("id"),
-                               "detail": str(e)})
+        _stop_predecessor_if_live(client, last, events)
         successor = _chain_session(state, index) or {}
-        state = _append_notice(
-            state, path,
-            f"stop-notice: s{predecessor.get('index')} "
-            f"{predecessor.get('name')} ({predecessor.get('id')}) settled "
-            f"{predecessor.get('outcome')!r} at stage {state.get('stage')} — "
-            f"successor s{index} {successor.get('name')} "
-            f"({successor.get('id')}) spawned automatically with full resume "
-            f"context; run_status reset to running; operator informed, not "
-            f"involved", events)
-        state = _set_run_status(state, path, "running", events,
-                                "successor session spawned by the chain")
-        events.append({"event": "succession", "to_session": index,
-                       "depth": _chain_block(state).get("depth")})
+        state = _record_succession(state, path, last, successor, events)
         try:
             state = _settle(state, path, client, index, events)
         except GlvError as e:
-            # the successor is in flight and GLV died mid-wait: degraded
-            # mode — the operator checks the session server-side
-            degraded_reason = str(e)
-            state = _append_notice(
-                state, path,
-                f"successor s{index} was in flight when GLV became "
-                f"unreachable ({e}); degraded mode — check `glv view "
-                f"{(_chain_session(state, index) or {}).get('id')}` on the "
-                f"server host, then re-run the chain (it adopts the session)",
-                events)
-            state = _set_run_status(
-                state, path, "budget_exhausted", events,
-                "successor in flight when GLV became unreachable — "
-                "degraded mode")
-            terminal_reason = (f"GLV unreachable while successor s{index} "
-                               f"was in flight: {e} — degraded mode; the run "
-                               f"parks in budget_exhausted (the pre-#25 "
-                               f"behavior)")
+            state, degraded_reason, terminal_reason = \
+                _park_degraded_at_settle(state, path, index, e, events)
             break
 
     report = pipeline_tool.build_report(state, policy)

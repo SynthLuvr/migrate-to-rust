@@ -119,70 +119,49 @@ def _set(field, unit, old, new):
     return unit, field, old, new
 
 
-def _session_exhausts(*, stage=None, ledger=None, unit_status=None,
-                      parity_for=()):
-    """A session that does real work (stage/units/ledger) then hits its
-    session budget and records budget_exhausted — the 20261028_4 shape."""
+def _session_run(final_status, *, stage=None, ledger=None, unit_status=None,
+                 parity_for=()):
+    """A scripted session: real work (stage/units/ledger) journaled through
+    state.py, then run_status left at final_status — the budget_exhausted
+    shape is the motivating 20261028_4 stall."""
     def mutate(state):
         changes = []
         if stage is not None and state.get("stage") != stage:
             changes.append(_set("stage", None, state.get("stage"), stage))
             state["stage"] = stage
         for uid, status in (unit_status or {}).items():
-            for u in state.get("units", []):
-                if u["id"] == uid and u.get("status") != status:
-                    changes.append(_set(f"units[{uid}].status", uid,
-                                        u.get("status"), status))
-                    u["status"] = status
-                    if status in state_tool.RUST_LIVE_STATUSES \
-                            and uid in parity_for:
-                        u["parity"] = {"runs": 30, "equivalent": 30,
-                                       "divergent": 0, "incomparable": 0,
-                                       "last_verdict": "equivalent"}
-                        changes.append(_set(f"units[{uid}].parity", uid, None,
-                                            u["parity"]))
+            unit = next((u for u in state.get("units", [])
+                         if u["id"] == uid), None)
+            if unit is None or unit.get("status") == status:
+                continue
+            changes.append(_set(f"units[{uid}].status", uid,
+                                unit.get("status"), status))
+            unit["status"] = status
+            if status in state_tool.RUST_LIVE_STATUSES and uid in parity_for:
+                unit["parity"] = {"runs": 30, "equivalent": 30,
+                                  "divergent": 0, "incomparable": 0,
+                                  "last_verdict": "equivalent"}
+                changes.append(_set(f"units[{uid}].parity", uid, None,
+                                    unit["parity"]))
         if ledger is not None:
             old = (state.get("budget_ledger") or {}).get("tokens_total", 0)
             state.setdefault("budget_ledger", {})["tokens_total"] = ledger
             changes.append(_set("budget_ledger.tokens_total", None, old,
                                 ledger))
         changes.append(_set("run_status", None, state.get("run_status"),
-                            "budget_exhausted"))
-        state["run_status"] = "budget_exhausted"
+                            final_status))
+        state["run_status"] = final_status
         return changes
     return mutate
 
 
-def _session_completes(*, unit_status=None, stage=7, ledger=None,
-                       parity_for=()):
-    def mutate(state):
-        changes = []
-        if state.get("stage") != stage:
-            changes.append(_set("stage", None, state.get("stage"), stage))
-            state["stage"] = stage
-        for uid, status in (unit_status or {}).items():
-            for u in state.get("units", []):
-                if u["id"] == uid and u.get("status") != status:
-                    changes.append(_set(f"units[{uid}].status", uid,
-                                        u.get("status"), status))
-                    u["status"] = status
-                    if status in state_tool.RUST_LIVE_STATUSES \
-                            and uid in parity_for:
-                        u["parity"] = {"runs": 30, "equivalent": 30,
-                                       "divergent": 0, "incomparable": 0,
-                                       "last_verdict": "equivalent"}
-                        changes.append(_set(f"units[{uid}].parity", uid, None,
-                                            u["parity"]))
-        if ledger is not None:
-            old = (state.get("budget_ledger") or {}).get("tokens_total", 0)
-            state.setdefault("budget_ledger", {})["tokens_total"] = ledger
-            changes.append(_set("budget_ledger.tokens_total", None, old,
-                                ledger))
-        changes.append(_set("run_status", None, state.get("run_status"),
-                            "complete"))
-        state["run_status"] = "complete"
-        return changes
-    return mutate
+def _session_exhausts(**kwargs):
+    return _session_run("budget_exhausted", **kwargs)
+
+
+def _session_completes(**kwargs):
+    kwargs.setdefault("stage", 7)
+    return _session_run("complete", **kwargs)
 
 
 def _session_noop_exhausts():

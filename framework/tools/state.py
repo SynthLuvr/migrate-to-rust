@@ -286,23 +286,13 @@ def _resumed_after_terminal_warning(state: dict) -> str | None:
     return None
 
 
-def _session_chain_errors(state: dict) -> list[str]:
-    """Coherence of the successor-session chain record (issue #25):
-    sessions are contiguous from index 1, depth counts the successions
-    (sessions - 1) and never exceeds the cap. The chain harness
-    (succession.py) writes this block through save_validated, so every
-    intermediate shape must satisfy these too."""
-    chain = state.get("session_chain")
-    if chain is None:
-        return []
-    if not isinstance(chain, dict):
-        return ["session_chain: must be an object"]
+def _is_int(value) -> bool:
+    """JSON booleans are ints in Python — exclude them."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _session_entry_errors(sessions: list) -> list[str]:
     errors: list[str] = []
-    sessions = chain.get("sessions")
-    if sessions is None:
-        sessions = []
-    if not isinstance(sessions, list):
-        return ["session_chain.sessions: must be an array"]
     for i, s in enumerate(sessions):
         if not isinstance(s, dict):
             errors.append(f"session_chain.sessions[{i}]: must be an object")
@@ -314,19 +304,37 @@ def _session_chain_errors(state: dict) -> list[str]:
             errors.append(
                 f"session_chain.sessions[{i}]: index {s.get('index')!r} must "
                 f"be {i + 1} (sessions are contiguous from 1, oldest first)")
+    return errors
+
+
+def _session_chain_errors(state: dict) -> list[str]:
+    """Coherence of the successor-session chain record (issue #25):
+    sessions are contiguous from index 1, depth counts the successions
+    (sessions - 1) and never exceeds the cap. The chain harness
+    (succession.py) writes this block through save_validated, so every
+    intermediate shape must satisfy these too."""
+    chain = state.get("session_chain")
+    if chain is None:
+        return []
+    if not isinstance(chain, dict):
+        return ["session_chain: must be an object"]
+    sessions = chain.get("sessions")
+    if sessions is None:
+        sessions = []
+    if not isinstance(sessions, list):
+        return ["session_chain.sessions: must be an array"]
+    errors = _session_entry_errors(sessions)
     depth = chain.get("depth")
-    if not isinstance(depth, int) or isinstance(depth, bool):
+    if not _is_int(depth):
         errors.append("session_chain.depth: integer required")
     elif depth != max(0, len(sessions) - 1):
         errors.append(
             f"session_chain.depth: {depth} but {len(sessions)} session(s) "
             f"recorded — depth must equal sessions - 1 (one per succession)")
     max_depth = chain.get("max_depth")
-    if not isinstance(max_depth, int) or isinstance(max_depth, bool) \
-            or max_depth < 1:
+    if not _is_int(max_depth) or max_depth < 1:
         errors.append("session_chain.max_depth: integer >= 1 required")
-    elif isinstance(depth, int) and not isinstance(depth, bool) \
-            and depth > max_depth:
+    elif _is_int(depth) and depth > max_depth:
         errors.append(f"session_chain.depth: {depth} > max_depth {max_depth}")
     return errors
 
