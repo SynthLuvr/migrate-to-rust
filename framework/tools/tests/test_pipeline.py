@@ -258,7 +258,40 @@ def test_resolve_gates_refuses_supervised_levels(monkeypatch, capsys, tmp_path):
                          ["resolve-gates", str(p)])
     assert code == 2 and "L2" in out["error"]
     assert "nothing asks mid-run" in out["error"]
+    # issue #27: the refusal names the concrete fresh-run remediation
+    assert "state.py init --autonomy-level L2" in out["error"]
     assert _load(p)["human_gates"] == []  # nothing self-approved
+
+
+def test_resolve_gates_refusal_explains_schema_only_state(monkeypatch, capsys,
+                                                          tmp_path):
+    """issue #27: a state file hand-written from the schema alone (autonomy
+    is not schema-required) reads as L0 — the refusal must say so and name
+    the same init remediation instead of leaving the operator guessing."""
+    p = tmp_path / "state.json"
+    p.write_text(json.dumps({"project": {"name": "demo",
+                                         "python_path": "src/demo"},
+                             "stage": 0, "units": [], "human_gates": [],
+                             "journal": []}))
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["resolve-gates", str(p)])
+    assert code == 2 and out["error"].startswith("autonomy=L0:")
+    assert "state.py init --autonomy-level L2" in out["error"]
+    assert "autonomy block reads as L0" in out["error"]
+
+
+def test_recipe_prompt_inits_state_via_state_py():
+    """issue #27: the recipe used to tell the orchestrator to hand-write the
+    state file 'from the schema' — autonomy is not schema-required, so that
+    file read as L0 and the run's first resolve-gates failed. The prompt
+    must initialize through state.py init (autonomy journaled, default L2)."""
+    import yaml
+    from conftest import REPO_ROOT
+    recipe = yaml.safe_load((REPO_ROOT / "framework" / "recipe.yaml").read_text())
+    prompt = recipe["prompt"]
+    assert "state.py init framework/state/migration-state.json" in prompt
+    # the hand-init phrasing that produced autonomy-less (L0) state is gone
+    assert "from\n  framework/state/migration-state.schema.json" not in prompt
 
 
 def test_resolve_gates_dry_run_writes_nothing(monkeypatch, capsys, tmp_path):

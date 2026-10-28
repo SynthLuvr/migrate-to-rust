@@ -27,6 +27,10 @@ not in the repo being migrated.
    ```console
    python framework/tools/state.py init framework/state/migration-state.json \
      --name myproject --python-path src/myproject --autonomy-level L2
+   # --autonomy-level defaults to L2 (the never-ask level: all gates
+   # policy-resolved, publish disabled) — shown for clarity. A state file
+   # lacking an autonomy block (e.g. hand-written from the schema alone)
+   # reads as the supervised L0 (issue #27), so init with state.py.
    python framework/tools/pipeline.py run framework/state/migration-state.json \
      --agent-cmd 'goose run --recipe {framework}/recipe.yaml'
    ```
