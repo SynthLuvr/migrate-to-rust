@@ -165,3 +165,97 @@ def test_contract_files_written(monkeypatch, capsys, tmp_path):
         "--out", str(out_dir)])
     assert (out_dir / "u-parse.contract.json").exists()
     assert (out_dir / "u-rank.contract.json").exists()
+
+
+# ------------------------------------------- src-as-package layout (#26) ---
+# These projects' import root IS the top-level src/ directory, so tests
+# import ``src.<module>`` — the spelling module_name_of() strips away.
+
+def _srcpkg(tmp_path):
+    proj = tmp_path / "srcproj"
+    (proj / "src").mkdir(parents=True)
+    (proj / "tests").mkdir(parents=True)
+    (proj / "src" / "parse.py").write_text(
+        '"""Tokens.\n\nInvariant: no empty tokens\n"""\n\n\n'
+        "def tokenize(text: str, sep: str = ',') -> list:\n"
+        "    return [t for t in text.split(sep) if t]\n")
+    (proj / "src" / "rank.py").write_text("def rank(items):\n    return sorted(items)\n")
+    state = tmp_path / "srcstate.json"
+    state.write_text(json.dumps({
+        "project": {"name": "srcproj", "python_path": "src"}, "stage": 2,
+        "units": [
+            {"id": "u-parse", "python_path": "src/parse.py", "rust_path": None,
+             "deps": [], "order": 1, "status": "pending"},
+            {"id": "u-rank", "python_path": "src/rank.py", "rust_path": None,
+             "deps": [], "order": 2, "status": "pending"},
+        ]}))
+    return proj, state
+
+
+def test_src_layout_imports_cover_units(monkeypatch, capsys, tmp_path):
+    """tests/test_<module>.py importing ``src.<module>`` must cover the unit
+    whose python_path is ``src/<module>.py`` — the issue #26 regression."""
+    proj, state = _srcpkg(tmp_path)
+    (proj / "tests" / "test_parse.py").write_text(
+        "from src.parse import tokenize\n\n\ndef test_roundtrip():\n"
+        "    assert tokenize('a,b') == ['a', 'b']\n")
+    (proj / "tests" / "test_rank.py").write_text(
+        "from src.rank import rank\n\n\ndef test_sorted():\n"
+        "    assert rank([2, 1]) == [1, 2]\n")
+    collect = tmp_path / "srccollect.txt"
+    collect.write_text("tests/test_parse.py::test_roundtrip\n"
+                       "tests/test_rank.py::test_sorted\n\n2 tests collected\n")
+    code, out = run_tool(monkeypatch, capsys, "contract_extract.py", [
+        "extract", "--state", str(state), "--root", str(proj),
+        "--pytest-collect", str(collect)])
+    assert code == 0, out["summary"]["human"]
+    assert out["coverage_pct"] == 100.0
+    assert out["uncovered_units"] == []
+    assert out["dangling_tests"] == []
+    by_unit = {c["unit"]: c for c in out["contracts"]}
+    assert by_unit["u-parse"]["covering_tests"] == ["tests/test_parse.py::test_roundtrip"]
+    assert by_unit["u-rank"]["covering_tests"] == ["tests/test_rank.py::test_sorted"]
+    assert out["layout_mismatch_suspected"] is False
+
+
+def test_src_layout_still_flags_true_uncovered_and_dangling(monkeypatch, capsys, tmp_path):
+    """The fix must not over-match: a genuinely untested unit stays uncovered
+    and an out-of-scope engine test stays dangling."""
+    proj, state = _srcpkg(tmp_path)
+    (proj / "tests" / "test_parse.py").write_text(
+        "from src.parse import tokenize\n\n\ndef test_roundtrip():\n"
+        "    assert tokenize('a,b') == ['a', 'b']\n")
+    (proj / "tests" / "test_engine.py").write_text(
+        "import zlib\n\n\ndef test_engine():\n    assert zlib.compress(b'x')\n")
+    collect = tmp_path / "srccollect.txt"
+    collect.write_text("tests/test_parse.py::test_roundtrip\n"
+                       "tests/test_engine.py::test_engine\n\n2 tests collected\n")
+    code, out = run_tool(monkeypatch, capsys, "contract_extract.py", [
+        "extract", "--state", str(state), "--root", str(proj),
+        "--pytest-collect", str(collect)])
+    assert code == 2
+    assert out["uncovered_units"] == ["u-rank"]  # no test imports src.rank
+    assert out["coverage_pct"] == 50.0
+    assert [d["nodeid"] for d in out["dangling_tests"]] == ["tests/test_engine.py::test_engine"]
+    by_unit = {c["unit"]: c for c in out["contracts"]}
+    assert by_unit["u-parse"]["covering_tests"] == ["tests/test_parse.py::test_roundtrip"]
+    assert out["layout_mismatch_suspected"] is False  # partial coverage: not a mismatch
+
+
+def test_all_uncovered_plus_import_mismatch_hints_layout(monkeypatch, capsys, tmp_path):
+    """When EVERY unit is uncovered while the dangling tests did import
+    something (matching no unit), the failure must say 'likely layout
+    mismatch' instead of reading like a weak suite (issue #26)."""
+    proj, state = _srcpkg(tmp_path)
+    (proj / "tests" / "test_parse.py").write_text(
+        "from appmod.parse import tokenize\n\n\ndef test_roundtrip():\n"
+        "    assert True\n")
+    collect = tmp_path / "srccollect.txt"
+    collect.write_text("tests/test_parse.py::test_roundtrip\n\n1 test collected\n")
+    code, out = run_tool(monkeypatch, capsys, "contract_extract.py", [
+        "extract", "--state", str(state), "--root", str(proj),
+        "--pytest-collect", str(collect)])
+    assert code == 2
+    assert out["coverage_pct"] == 0.0
+    assert out["layout_mismatch_suspected"] is True
+    assert "likely layout mismatch" in out["summary"]["human"]

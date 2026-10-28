@@ -9,7 +9,9 @@ already exist (an LLM may enrich them later; that is an edit, not a check).
 
 Test → unit mapping (deterministic, in priority order):
   1. the test file imports the unit's module (``from pkg.parse import x`` /
-     ``import pkg.parse`` / aliased attribute use) — authoritative;
+     ``import pkg.parse`` / aliased attribute use), matched under both the
+     layout-stripped name and the un-stripped ``src.``-prefixed one
+     (issue #26) — authoritative;
   2. filename convention ``test_<module>.py`` / ``<module>_test.py`` when the
      test file has no scoped imports at all.
 Tests matching no scoped unit are DANGLING and reported (never dropped
@@ -38,14 +40,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_FINDINGS, EXIT_OK, ToolError, emit, module_name_of, read_json,
-    run_child, run_cli, write_json_atomic,
+    EXIT_FINDINGS, EXIT_OK, ToolError, emit, import_candidates_of,
+    module_name_of, read_json, run_child, run_cli, write_json_atomic,
 )
 
 TOOL = "contract_extract.py"
 VERSION = 1
 INVARIANT_TAGS = ("Invariant:", "Postcondition:", "Property:")
 NODEID_RE = re.compile(r"^(\S+\.py)::(\S+)$")
+NO_UNIT_MATCH = "imports no scoped unit and matches no unit module name"
 
 
 # ---------------------------------------------------------------- pytest ---
@@ -90,6 +93,13 @@ def imports_of(tree: ast.Module) -> set[str]:
             if node.module and node.level == 0:
                 mods.add(node.module)
     return mods
+
+
+def imports_any_of(imported: set[str], candidates: list[str]) -> bool:
+    """True when a candidate is among ``imported``, exactly or as a parent
+    package (import ``pkg.parse`` covers the unit module ``pkg``)."""
+    return any(c in imported or any(m.startswith(c + ".") for m in imported)
+               for c in candidates)
 
 
 def docstring_invariants(node) -> list[str]:
@@ -180,6 +190,8 @@ def cmd_extract(args) -> int:
     # module names come from the DECLARED python_path (project-relative),
     # matching how test files import them — never from the resolved location
     module_of_unit = {u["id"]: module_name_of(u["python_path"]) for u in units}
+    candidates_of_unit = {u["id"]: import_candidates_of(u["python_path"])
+                          for u in units}
 
     covering: dict[str, list[str]] = {uid: [] for uid in unit_files}
     dangling: list[dict] = []
@@ -190,10 +202,8 @@ def cmd_extract(args) -> int:
             dangling.append({"nodeid": nodeid, "reason": "test file not found in project"})
             continue
         tmods = imports_of(tree)
-        matched = []
-        for uid, umod in module_of_unit.items():
-            if umod in tmods or any(m.startswith(umod + ".") for m in tmods):
-                matched.append(uid)
+        matched = [uid for uid, cands in candidates_of_unit.items()
+                   if imports_any_of(tmods, cands)]
         if not matched and not tmods:
             # filename convention fallback: tests/test_parse.py -> *.parse
             stem = Path(tf).stem
@@ -203,8 +213,7 @@ def cmd_extract(args) -> int:
                 matched = [uid for uid, umod in module_of_unit.items()
                            if umod.split(".")[-1] == tail]
         if not matched:
-            dangling.append({"nodeid": nodeid,
-                             "reason": "imports no scoped unit and matches no unit module name"})
+            dangling.append({"nodeid": nodeid, "reason": NO_UNIT_MATCH})
         for uid in matched:
             covering[uid].append(nodeid)
 
@@ -259,15 +268,25 @@ def cmd_extract(args) -> int:
     # uncovered units fail unless explicitly tolerated (still reported)
     hard = dangling + ([] if args.allow_uncovered else uncovered)
     code = EXIT_FINDINGS if hard else EXIT_OK
+    # every unit uncovered while dangling tests match no unit module name is
+    # far more likely a layout/import-root mismatch than a useless suite —
+    # hint at it instead of printing a bare wall of nodeids (issue #26)
+    all_uncovered = bool(unit_files) and len(uncovered) == len(unit_files)
+    layout_mismatch_suspected = all_uncovered and any(
+        d["reason"] == NO_UNIT_MATCH for d in dangling)
+    mismatch_hint = (" — likely layout mismatch: no test import matched any "
+                     "unit module name; check the units' python_path import "
+                     "root" if layout_mismatch_suspected else "")
     human = (f"contracts: {len(contracts)} unit(s), coverage {coverage_pct}% "
              f"({len(uncovered)} uncovered), {len(dangling)} dangling test(s)"
-             + ("; FAIL" if code == EXIT_FINDINGS else ""))
+             + ("; FAIL" if code == EXIT_FINDINGS else "") + mismatch_hint)
     payload = {
         "tool": TOOL, "version": VERSION,
         "contracts": contracts,
         "coverage_pct": coverage_pct,
         "uncovered_units": uncovered,
         "dangling_tests": dangling,
+        "layout_mismatch_suspected": layout_mismatch_suspected,
         "findings": findings,
         "written_to": str(out_dir) if out_dir else None,
         "summary": {"exit_code": code, "human": human},
