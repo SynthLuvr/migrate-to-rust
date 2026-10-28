@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import state as state_tool
 from conftest import REPO_ROOT, run_tool
 
@@ -372,9 +374,9 @@ def test_shim_emits_reversible_per_unit_switch(monkeypatch, capsys, mini_state):
 
 
 def test_shim_derives_both_src_layout_spellings(monkeypatch, capsys, mini_state):
-    """Issue #53: src-layout targets import under BOTH spellings — the
-    shim's python import must try each in turn like the adapters do
-    (issue #26), not commit to the bare module name."""
+    """Issue #53: src-layout units import under BOTH spellings, so the shim
+    must try each in turn like the adapters (issue #26), not commit to the
+    bare module name; an explicit --python-import replaces the set."""
     code, out = run_tool(monkeypatch, capsys, "state.py",
                          ["shim", str(mini_state), "--unit", "u1"])
     assert code == 0
@@ -384,7 +386,6 @@ def test_shim_derives_both_src_layout_spellings(monkeypatch, capsys, mini_state)
     for spelling in ("demo.a", "src.demo.a"):
         assert spelling in out["code"]
     compile(out["code"], "shim.py", "exec")
-    # an explicit override replaces the derivation wholesale (issue #53)
     code, out = run_tool(monkeypatch, capsys, "state.py", [
         "shim", str(mini_state), "--unit", "u1",
         "--python-import", "demo.a,other.demo.a"])
@@ -392,85 +393,67 @@ def test_shim_derives_both_src_layout_spellings(monkeypatch, capsys, mini_state)
     assert out["python_imports"] == ["demo.a", "other.demo.a"]
 
 
-def _write_flat_target(tmp_path):
-    """A fake src-layout target importable ONLY under the src. spelling,
-    plus a flat wheel module exposing the unit's function — the two real
-    layouts that broke the shim (issue #53)."""
+def _flat_wheel_env(tmp_path):
+    """A ported unit plus a fake src-layout target importable ONLY under
+    the src. spelling and a flat wheel module exposing its function — the
+    two real layouts that broke the shim (issue #53). Returns
+    (syspath_dir, state_file)."""
     pkg = tmp_path / "target"
     demo = pkg / "src" / "demo"
     demo.mkdir(parents=True)
     (demo / "__init__.py").write_text("")
     (demo / "a.py").write_text("def f():\n    return 'py'\n")
     (pkg / "wicksmith_core.py").write_text("def f():\n    return 'rust'\n")
-    return pkg
-
-
-def test_shim_flat_wheel_reexports_and_switches_sides(
-        monkeypatch, capsys, tmp_path):
-    """Issue #53 flat PyO3 wheels: no per-unit rust module exists — the shim
-    must re-export the unit's names from the flat wheel, keeping the env-var
-    switching semantics, and fall back across python import spellings."""
-    pkg = _write_flat_target(tmp_path)
-    monkeypatch.syspath_prepend(str(pkg))
-    st = tmp_path / "state.json"
-    st.write_text(json.dumps({
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({
         "project": {"name": "demo", "python_path": "src/demo"},
         "stage": 6, "units": [{
             "id": "u1", "python_path": "src/demo/a.py",
             "rust_path": "crates/demo/src/u1.rs", "deps": [], "order": 1,
             "status": "ported",
         }], "human_gates": [], "journal": []}))
+    return pkg, state
+
+
+def test_shim_flat_wheel_reexports_and_switches_sides(
+        monkeypatch, capsys, tmp_path):
+    """Issue #53 flat wheels have no per-unit rust module: the shim
+    re-exports the unit's names from the flat wheel, keeps the env-var
+    switching semantics, and falls back across python import spellings."""
+    pkg, state = _flat_wheel_env(tmp_path)
+    monkeypatch.syspath_prepend(str(pkg))
     code, out = run_tool(monkeypatch, capsys, "state.py", [
-        "shim", str(st), "--unit", "u1", "--flat",
+        "shim", str(state), "--unit", "u1", "--flat",
         "--rust-import", "wicksmith_core", "--names", "f"])
     assert code == 0 and out["flat"] is True and out["names"] == ["f"]
     assert out["default_side"] == "rust"
     ns = {}
     exec(compile(out["code"], "shim.py", "exec"), ns)
     monkeypatch.delenv("DEMO_FALLBACK", raising=False)
-    # ported + none -> flat rust wheel; PEP 562 dispatch serves `from shim import f`
-    assert ns["impl"]().f() == "rust"
-    assert ns["__getattr__"]("f")() == "rust"
-    # per-unit and global flips stay reversible with no extra state
+    assert ns["impl"]().f() == "rust"           # ported + none -> flat wheel
+    assert ns["__getattr__"]("f")() == "rust"   # PEP 562: from shim import f
     monkeypatch.setenv("DEMO_FALLBACK", "u1")
     assert ns["impl"]().f() == "py"   # only src.demo.a exists -> 2nd spelling
     monkeypatch.setenv("DEMO_FALLBACK", "all")
     assert ns["impl"]().f() == "py"
-    # unknown names do not silently resolve
-    try:
+    with pytest.raises(AttributeError):
         ns["__getattr__"]("nope")
-    except AttributeError:
-        pass
-    else:
-        raise AssertionError("unknown name must raise AttributeError")
 
 
 def test_shim_flat_wheel_flags_name_drift(monkeypatch, capsys, tmp_path):
     """A name the wheel does not expose is rust-side drift vs the recorded
-    rust_names — loud, not a silent fallback (issue #53)."""
-    pkg = _write_flat_target(tmp_path)
+    rust_names — loud, never a silent fallback (issue #53)."""
+    pkg, state = _flat_wheel_env(tmp_path)
     monkeypatch.syspath_prepend(str(pkg))
-    st = tmp_path / "state.json"
-    st.write_text(json.dumps({
-        "project": {"name": "demo", "python_path": "src/demo"},
-        "stage": 6, "units": [{
-            "id": "u1", "python_path": "src/demo/a.py",
-            "rust_path": "crates/demo/src/u1.rs", "deps": [], "order": 1,
-            "status": "ported",
-        }], "human_gates": [], "journal": []}))
     code, out = run_tool(monkeypatch, capsys, "state.py", [
-        "shim", str(st), "--unit", "u1", "--flat",
+        "shim", str(state), "--unit", "u1", "--flat",
         "--rust-import", "wicksmith_core", "--names", "f,g"])
     assert code == 0
     ns = {}
     exec(compile(out["code"], "shim.py", "exec"), ns)
     monkeypatch.delenv("DEMO_FALLBACK", raising=False)
-    try:
+    with pytest.raises(AttributeError, match=r"wicksmith_core.*does not expose g"):
         ns["impl"]()
-    except AttributeError as e:
-        assert "g" in str(e) and "wicksmith_core" in str(e)
-    else:
-        raise AssertionError("missing wheel name must raise, not fall back")
 
 
 def test_shim_flat_refuses_without_names_or_module(
@@ -486,7 +469,7 @@ def test_shim_flat_refuses_without_names_or_module(
 def test_shim_flat_from_schema_recorded_names(monkeypatch, capsys, mini_state):
     """The schema-recorded rust_module + rust_names drive the flat shim
     with zero extra flags — one source of truth for shim + API-freeze
-    check (issue #53)."""
+    check (issue #53); CLI flags still win as ad-hoc overrides."""
     code, _ = run_tool(monkeypatch, capsys, "state.py", [
         "set", str(mini_state),
         "--field", "units[u1].rust_module=wicksmith_core",
@@ -499,7 +482,6 @@ def test_shim_flat_from_schema_recorded_names(monkeypatch, capsys, mini_state):
     assert out["rust_import"] == "wicksmith_core"
     assert out["names"] == ["f", "g"]
     compile(out["code"], "shim.py", "exec")
-    # --names / --rust-import still win over the schema (ad-hoc overrides)
     code, out = run_tool(monkeypatch, capsys, "state.py", [
         "shim", str(mini_state), "--unit", "u1",
         "--names", "h", "--rust-import", "other_core"])
