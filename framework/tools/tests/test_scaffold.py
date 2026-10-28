@@ -1,10 +1,15 @@
-"""scaffold.py acceptance tests (issue #32).
+"""scaffold.py acceptance tests (issues #32, #48).
 
 Covers: the scaffolded artifacts (symmetric adapters, seeded generator,
 judge-ready manifest, corpus in the documented raw-value format), the
 determinism contract (same seed -> byte-identical corpus; different seed ->
 reviewer fresh inputs), hand-tune flagging of types the heuristic refuses
 to guess, overwrite protection, and the degenerate-corpus self-check.
+
+Module conformance (issue #48) is the default: one manifest judges the
+unit's WHOLE public API through a {fn: result | __error__} envelope —
+a first-public-only verdict must not green-light a unit whose other
+functions diverge.
 """
 
 from __future__ import annotations
@@ -99,29 +104,36 @@ def test_scaffold_end_to_end_and_judge_ready(monkeypatch, capsys, tmp_path):
         out / "manifests/u-bars.json"}
     assert all(f.is_file() for f in files)
 
+    # module conformance is the DEFAULT (issue #48): every public function
+    # is judged, not just the module-stem pick
+    assert unit["mode"] == "module"
+    assert unit["functions"] == ["bars", "unused_helper"]
+    assert unit["function_source"] == "all-public"
+
     # signature -> spec mapping: dataclass param resolved through the
-    # sibling-module import, optional/defaults carried
-    assert unit["function"] == "bars"  # module-stem heuristic
-    items = unit["parameters"]["items"]["spec"]
+    # sibling-module import, optional/defaults carried (per function)
+    bars = unit["functions_detail"]["bars"]
+    items = bars["params"]["items"]
     assert items["kind"] == "list"
     assert items["item"]["kind"] == "dataclass"
     assert items["item"]["name"] == "Bar"
     assert items["item"]["module"] == "pkg.bars"
-    assert unit["parameters"]["span"]["spec"]["kind"] == "optional"
-    assert unit["parameters"]["span"]["spec"]["item"]["name"] == "Span"
-    assert unit["parameters"]["limit"]["has_default"] is True
+    assert bars["params"]["span"]["kind"] == "optional"
+    assert bars["params"]["span"]["item"]["name"] == "Span"
     assert unit["hand_tune"] == []
 
-    # corpus: one raw JSON value per line, a kwargs object, NEVER the
-    # {"i", "input"} stdin framing (issue #29)
+    # corpus: one raw JSON value per line, a kwargs object over the UNION
+    # of the judged functions' parameters — NEVER the {"i", "input"} stdin
+    # framing (issue #29)
+    union = {"items", "limit", "span", "x"}
     lines = (out / "corpora/corpus-u-bars.jsonl").read_text().splitlines()
     assert lines and all(line.strip() for line in lines)
     rows = [json.loads(line) for line in lines]
     assert all(isinstance(r, dict) for r in rows)
-    assert all(set(r) <= {"items", "limit", "span"} for r in rows)
+    assert all(set(r) <= union for r in rows)
     assert not any(set(r) == {"i", "input"} for r in rows)
     zero = rows[0]  # the all-zero edge row: the documented error path
-    assert zero == {"items": [], "limit": 0, "span": None}
+    assert zero == {"items": [], "limit": 0, "span": None, "x": 0}
     assert any(r["items"] and json.dumps(r, sort_keys=True) for r in rows)
 
     # adapters symmetric by construction: identical outside the BACKEND
@@ -131,9 +143,12 @@ def test_scaffold_end_to_end_and_judge_ready(monkeypatch, capsys, tmp_path):
     assert unit["adapters"]["symmetric"] is True
     assert "CANDIDATE_MODULE = None" in cand  # Stage-2 placeholder, not a guess
 
-    # manifest is judge-ready as-is (entries are relative .py paths)
+    # manifest is judge-ready as-is (entries are relative .py paths) and
+    # judges the whole public API (issue #48)
     manifest = json.loads((out / "manifests/u-bars.json").read_text())
     assert manifest["unit"] == "u-bars"
+    assert manifest["mode"] == "module"
+    assert manifest["functions"] == ["bars", "unused_helper"]
     assert manifest["corpus"] == "../corpora/corpus-u-bars.jsonl"
     for side in ("reference", "candidate"):
         entry = manifest[side]["entry"]
@@ -222,7 +237,7 @@ def test_generator_different_seed_is_fresh_inputs(monkeypatch, capsys, tmp_path)
     assert fresh_text != original, "a different seed must yield fresh inputs"
     for line in fresh_text.splitlines():  # format guard, issue #29
         row = json.loads(line)
-        assert isinstance(row, dict) and set(row) <= {"items", "limit", "span"}
+        assert isinstance(row, dict) and set(row) <= {"items", "limit", "span", "x"}
 
 
 # --------------------------------------------- flagged, not guessed -------
@@ -240,7 +255,8 @@ def test_unknown_types_are_flagged_for_hand_completion(monkeypatch, capsys, tmp_
             "    return len(frame) + n\n")
     proj, state = _project(tmp_path, name="q", unit="u-score", module="score", body=body)
     out = tmp_path / "runs"
-    code, payload = _scaffold(monkeypatch, capsys, state, proj, out)
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, out,
+                              "--mode", "function")
     assert code == 2, "hand-tune flags must be findings, not silence"
     unit = payload["units"][0]
     assert any(f["where"] == "param frame" for f in unit["hand_tune"])
@@ -331,7 +347,238 @@ def test_set_return_value_is_canonicalized_not_unserializable(monkeypatch, capsy
     assert out_json["verdict"] == "equivalent"
 
 
-def test_int_float_distinction_survives_the_adapter(monkeypatch, capsys, tmp_path):
+# --------------------------------------------- module conformance (#48) ---
+
+IND_PY = ('"""indicators — several public series functions sharing a domain\n'
+          "vocabulary (the issue #48 shape: first-public judged only 1 of N).\n"
+          "\n"
+          'Invariant: empty values raises ValueError; period must be 1..64\n"""\n'
+          "\n"
+          "\n"
+          "def sma_series(values: list[float], period: int = 3) -> list[float]:\n"
+          "    if not values:\n"
+          '        raise ValueError("empty values")\n'
+          "    if not 1 <= period <= 64:\n"
+          '        raise ValueError("period out of range")\n'
+          "    return [sum(values[i:i + period]) / period\n"
+          "            for i in range(len(values) - period + 1)]\n"
+          "\n"
+          "\n"
+          "def rsi_series(values: list[float], period: int = 14) -> list[float]:\n"
+          "    if not values:\n"
+          '        raise ValueError("empty values")\n'
+          "    if not 1 <= period <= 64:\n"
+          '        raise ValueError("period out of range")\n'
+          "    gains = [max(values[i] - values[i - 1], 0.0)\n"
+          "             for i in range(1, len(values))]\n"
+          "    return [round(sum(gains[:i + 1]) / (i + 1), 9)\n"
+          "            for i in range(min(period, len(gains)))]\n"
+          "\n"
+          "\n"
+          "def floor_div(n: int, d: int = 2) -> int:\n"
+          "    return n // d\n")
+
+# the wheel-side twin: identical EXCEPT rsi_series averages over i + 2 —
+# exactly the kind of sibling-function divergence first-public never sees
+IND_RUST_BUG = ('def sma_series(values: list[float], period: int = 3) -> list[float]:\n'
+                "    if not values:\n"
+                '        raise ValueError("empty values")\n'
+                "    if not 1 <= period <= 64:\n"
+                '        raise ValueError("period out of range")\n'
+                "    return [sum(values[i:i + period]) / period\n"
+                "            for i in range(len(values) - period + 1)]\n"
+                "\n"
+                "\n"
+                "def rsi_series(values: list[float], period: int = 14) -> list[float]:\n"
+                "    if not values:\n"
+                '        raise ValueError("empty values")\n'
+                "    if not 1 <= period <= 64:\n"
+                '        raise ValueError("period out of range")\n'
+                "    gains = [max(values[i] - values[i - 1], 0.0)\n"
+                "             for i in range(1, len(values))]\n"
+                "    return [round(sum(gains[:i + 1]) / (i + 2), 9)\n"  # the bug
+                "            for i in range(min(period, len(gains)))]\n"
+                "\n"
+                "\n"
+                "def floor_div(n: int, d: int = 2) -> int:\n"
+                "    return n // d\n")
+
+
+def _ind_project(tmp_path):
+    """A unit module with THREE public functions (none named after the
+    module, so the legacy pick was first-public) plus a buggy wheel twin."""
+    proj, state = _project(tmp_path, name="ind", unit="u-ind",
+                           module="indicators", body=IND_PY)
+    (proj / "src" / "ind" / "indicators_rust.py").write_text(IND_RUST_BUG)
+    return proj, state
+
+
+def test_module_mode_catches_sibling_divergence_first_public_misses(
+        monkeypatch, capsys, tmp_path):
+    """The issue #48 acceptance case: a candidate whose FIRST function is
+    faithful but a sibling diverges. The default (module) scaffold must
+    verdict DIVERGENT with the diff naming the diverging function — while
+    the legacy --mode function scaffold over the same unit and the same
+    buggy candidate verdicts EQUIVALENT (the green light the issue
+    describes)."""
+    proj, state = _ind_project(tmp_path)
+    out = tmp_path / "runs"
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, out,
+                              "--candidate-module", "ind.indicators_rust")
+    assert code == 0, payload["summary"]["human"]
+    unit = payload["units"][0]
+    assert unit["mode"] == "module"
+    assert unit["functions"] == ["sma_series", "rsi_series", "floor_div"]
+    assert sorted(unit["union_parameters"]) == ["d", "n", "period", "values"]
+
+    code, out_json = run_tool(monkeypatch, capsys, "oracle.py", [
+        "judge", "--manifest", str(out / "manifests/u-ind.json")])
+    assert code == 2 and out_json["verdict"] == "divergent"
+    divergent = [r for r in out_json["runs"] if r["verdict"] == "divergent"]
+    assert divergent, "the sibling divergence must surface"
+    assert all(d["diffs"][0]["path"].startswith("$.rsi_series")
+               for d in divergent), "the diff must name the function"
+    # the error-path rows compare equivalent through the envelope: both
+    # sides raise the same ValueError per function
+    equiv = [r for r in out_json["runs"] if r["verdict"] == "equivalent"]
+    assert equiv and out_json["counts"]["incomparable"] == 0
+
+    # the legacy single-entry scaffold over the SAME unit + candidate:
+    # sma_series is first-public, it is faithful, so it verdicts EQUIVALENT
+    # — the exact green light module mode exists to prevent
+    out2 = tmp_path / "runs-fn"
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, out2,
+                              "--mode", "function",
+                              "--candidate-module", "ind.indicators_rust")
+    assert code == 0
+    assert payload["units"][0]["function"] == "sma_series"
+    assert payload["units"][0]["function_source"] == "first-public"
+    code, legacy = run_tool(monkeypatch, capsys, "oracle.py", [
+        "judge", "--manifest", str(out2 / "manifests/u-ind.json")])
+    assert code == 0 and legacy["verdict"] == "equivalent"
+
+
+def test_module_mode_envelope_shape_and_row_validation(
+        monkeypatch, capsys, tmp_path):
+    """run() returns {fn: value | {"__error__": ...}} for every judged
+    function; a row key no function declares, or a missing required union
+    parameter, is a corpus bug and raises — never silently judged."""
+    proj, state = _ind_project(tmp_path)
+    out = tmp_path / "runs"
+    _, payload = _scaffold(monkeypatch, capsys, state, proj, out)
+    adapter = _load_module(Path(payload["units"][0]["files"]["ref_adapter"]))
+    row = {"values": [1.0, 2.0, 3.0, 4.0], "period": 2, "n": 7}
+    envelope = adapter.run(row)
+    assert set(envelope) == {"sma_series", "rsi_series", "floor_div"}
+    assert envelope["sma_series"] == [1.5, 2.5, 3.5]
+    assert envelope["floor_div"] == 3
+    # the documented error path is per-function evidence, not a failed row
+    err = adapter.run({"values": [], "n": 0})
+    assert err["sma_series"] == {"__error__": {"type": "ValueError",
+                                               "message": "empty values"}}
+    assert err["rsi_series"] == {"__error__": {"type": "ValueError",
+                                               "message": "empty values"}}
+    assert err["floor_div"] == 0
+    # corpus-format guards raise row-level
+    with pytest.raises(TypeError, match="not parameters of any judged function"):
+        adapter.run({"values": [1.0], "bogus": 1})
+    with pytest.raises(TypeError, match="missing required parameter"):
+        adapter.run({"period": 3})  # values is required (sma/rsi take it)
+    with pytest.raises(TypeError, match=r"\$\.period: expected int"):
+        adapter.run({"values": [1.0], "period": 1.5, "n": 0})  # union spec guard
+
+
+def test_module_mode_function_subset(monkeypatch, capsys, tmp_path):
+    proj, state = _ind_project(tmp_path)
+    out = tmp_path / "runs"
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, out,
+                              "--function", "rsi_series,floor_div")
+    assert code == 0, payload["summary"]["human"]
+    unit = payload["units"][0]
+    assert unit["functions"] == ["rsi_series", "floor_div"]
+    assert unit["function_source"] == "flag"
+    assert sorted(unit["union_parameters"]) == ["d", "n", "period", "values"]
+    manifest = json.loads((out / "manifests/u-ind.json").read_text())
+    assert manifest["functions"] == ["rsi_series", "floor_div"]
+
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, out,
+                              "--function", "nope", "--force")
+    assert code == 1 and payload["error"]["kind"] == "usage"
+    assert "nope" in payload["error"]["detail"]
+    assert "rsi_series" in payload["error"]["detail"]  # lists what exists
+
+
+def test_function_mode_rejects_multiple_functions(monkeypatch, capsys, tmp_path):
+    proj, state = _ind_project(tmp_path)
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, tmp_path / "runs",
+                              "--mode", "function",
+                              "--function", "sma_series", "--function", "rsi_series")
+    assert code == 1 and payload["error"]["kind"] == "usage"
+    assert "--mode module" in payload["error"]["detail"]
+
+
+def test_module_mode_conflicting_param_annotations_are_flagged(
+        monkeypatch, capsys, tmp_path):
+    """A name annotated differently across functions cannot be fed by one
+    JSON row mechanically — flagged for hand-completion, never guessed."""
+    body = ("def take(x: int) -> int:\n"
+            "    return x\n"
+            "\n"
+            "\n"
+            "def give(x: str) -> str:\n"
+            "    return x\n")
+    proj, state = _project(tmp_path, name="c", unit="u-conf", module="conf", body=body)
+    out = tmp_path / "runs"
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, out)
+    assert code == 2, "a param conflict is a finding, not a guess"
+    unit = payload["units"][0]
+    flag = next(f for f in unit["hand_tune"] if f["where"] == "union param x")
+    assert "take: int" in flag["reason"] and "give: str" in flag["reason"]
+    assert unit["union_parameters"]["x"]["spec"]["kind"] == "unknown"
+    gen = _load_module(Path(unit["files"]["generator"]))
+    assert gen.flagged_params() == ["x"]
+    ref = (out / "adapters/u_conf_ref.py").read_text()
+    assert "conflicting" in ref or "union param x" in ref  # HAND-TUNE block
+
+
+def test_module_mode_all_error_functions_is_a_degenerate_finding(
+        monkeypatch, capsys, tmp_path):
+    """Envelopes make rows 'ok' even when every function raised — so the
+    module-mode dry-run must tally per-function errors and refuse a corpus
+    on which NO function ever succeeds (the module face of issue #30)."""
+    body = ("def a(x: int) -> int:\n"
+            "    raise RuntimeError('always a')\n"
+            "\n"
+            "\n"
+            "def b(y: int) -> int:\n"
+            "    raise RuntimeError('always b')\n")
+    proj, state = _project(tmp_path, name="z", unit="u-zall", module="zall", body=body)
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, tmp_path / "runs")
+    assert code == 2
+    unit = payload["units"][0]
+    assert unit["corpus_dry_run"]["degenerate"] is True
+    finding = next(f for f in payload["findings"] if f["kind"] == "degenerate_corpus")
+    assert "every judged function" in finding["detail"]
+
+
+def test_module_mode_single_all_error_function_warns(monkeypatch, capsys, tmp_path):
+    """One always-raising sibling next to healthy functions: the verdict
+    for that function rests on nothing — a warning naming it, exit 0 (the
+    corpus still judges the rest)."""
+    body = ("def ok_fn(x: int) -> int:\n"
+            "    return x + 1\n"
+            "\n"
+            "\n"
+            "def boom_fn(x: int) -> int:\n"
+            "    raise RuntimeError('nope')\n")
+    proj, state = _project(tmp_path, name="y", unit="u-y", module="ymod", body=body)
+    code, payload = _scaffold(monkeypatch, capsys, state, proj, tmp_path / "runs")
+    assert code == 0, payload["summary"]["human"]
+    assert any("module-mode function 'boom_fn' errored on every reference dry-run row"
+               in w for w in payload["warnings"])
+    stats = payload["units"][0]["corpus_dry_run"]["functions"]
+    assert stats["boom_fn"]["ok"] == 0 and stats["ok_fn"]["ok"] > 0
+
     """The adapter must not silently widen types (int_float_distinct is a
     divergence rule, not a normalization): a float row for an int param is
     a corpus bug and must raise, not coerce."""
@@ -343,4 +590,5 @@ def test_int_float_distinction_survives_the_adapter(monkeypatch, capsys, tmp_pat
     adapter = _load_module(Path(payload["units"][0]["files"]["ref_adapter"]))
     with pytest.raises(TypeError, match=r"\$\.n: expected int"):  # never silently coerce
         adapter.run({"n": 1.0})
-    assert adapter.run({"n": 21}) == 42
+    # module envelope: the judged function's result under its own key
+    assert adapter.run({"n": 21}) == {"twice": 42}

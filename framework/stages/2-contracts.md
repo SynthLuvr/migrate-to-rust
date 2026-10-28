@@ -15,7 +15,12 @@ is the spec; the judge is what makes "correct" decidable.
      documented raw-value format, *symmetric* reference/candidate
      adapters (JSON → typed objects → call → canonical JSON), and a
      judge-ready manifest; types the heuristic can't express are flagged
-     for hand-completion, never guessed
+     for hand-completion, never guessed. Module conformance is the
+     default (issue #48): one manifest judges the unit's WHOLE public API
+     — the adapter calls every public function per row and returns a
+     `{fn: result | __error__}` envelope, so per-function errors compare
+     instead of failing the row; `--mode function` keeps the legacy
+     single-entry scaffold
    - run the Python reference; capture structured output + hash
    - classify every run **Equivalent / Divergent / Incomparable**
    - document normalization rules — `python framework/tools/oracle.py rules`

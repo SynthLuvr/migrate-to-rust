@@ -18,6 +18,23 @@ Usage (mirrors the issue sketch; ``--state`` or a positional state path):
     python framework/tools/scaffold.py scaffold <state.json> --unit u-bars \\
         --out runs/ --seed 20261028
 
+Mode — module conformance by default (issue #48)
+--------------------------------------------------
+A unit's contract is its *whole public API* (hard rule 2; Stage-4 exit
+criteria are per unit), so the default ``--mode module`` scaffold emits ONE
+adapter pair + corpus + manifest that judges every public function in the
+unit: the adapter calls each judged function per corpus row and returns a
+``{function: result | {"__error__": {"type", "message"}}}`` envelope — a
+function's own raised exception is per-function evidence compared by the
+oracle's value rules, not a failed row; a first-public-only verdict can no
+longer green-light a unit whose other functions diverge. Rows are JSON
+objects over the UNION of the judged functions' parameters (each function
+takes the row's values for its own parameters, rebuilt through its own
+spec); ``--function`` (repeatable / comma-separated) narrows the judged
+subset. A parameter name annotated differently across functions is flagged
+for hand-completion — never guessed. ``--mode function`` keeps the legacy
+single-entry scaffold (one function, raw result, no envelope).
+
 Per unit it writes under --out (default ``runs/``, which is gitignored —
 scaffolded files name the target project's private code and must not reach
 the repo):
@@ -37,7 +54,9 @@ the repo):
                               pre-wrapped in {"i", "input"} framing
     manifests/<unit>.json     judge-ready for oracle.py (entries are
                               relative .py file paths, a form oracle.py
-                              accepts since issue #32)
+                              accepts since issue #32); in the default
+                              module mode it judges the unit's WHOLE
+                              public API via the envelope (issue #48)
 
 ``<stem>`` is the unit id with ``-``/``.`` sanitized to ``_`` so file-path
 entries and importlib behave.
@@ -63,7 +82,10 @@ the sha256 of the shared remainder as evidence (identical on both sides).
 Self-check before reporting success: the freshly generated corpus is
 dry-run against the reference adapter through oracle.py's own subprocess
 runner, so a corpus that would judge hollow (all-error reference — issue
-#30) or a malformed format (issue #29) is a finding here, in seconds.
+#30) or a malformed format (issue #29) is a finding here, in seconds. In
+module mode the dry-run also tallies per-function envelope errors: every
+judged function erroring on every row is a degenerate-corpus finding, and
+a single all-error function is a warning (its parity is unjudged).
 
 Exit codes follow tools/README.md: 0 scaffolded clean · 2 findings
 (hand-tune flags, degenerate/thin corpus) · 1 usage/IO · 4 setup.
@@ -88,7 +110,7 @@ from _common import (  # noqa: E402
 from contract_extract import _find_source  # noqa: E402  — same-dir composition
 
 TOOL = "scaffold.py"
-VERSION = 1
+VERSION = 2
 DEFAULT_SEED = 20261028
 DEFAULT_RANDOM_ROWS = 96
 DRY_RUN_TIMEOUT = 120.0
@@ -426,6 +448,61 @@ def _pick_function(tree: ast.Module, module_stem: str, override: str | None):
                     "(classes and private helpers are not oracle entries)", kind="usage")
 
 
+def _select_module_functions(tree: ast.Module, overrides: list[str]):
+    """The public functions a module-conformance scaffold judges (issue
+    #48): all of them, or the --function subset (repeatable /
+    comma-separated). Unknown names are a usage error listing what exists,
+    not silence. Returns (functions, how) with how ∈ all-public | flag."""
+    fns = _public_functions(tree)
+    known = sorted(f.name for f in fns)
+    if overrides:
+        unknown = [o for o in overrides if o not in known]
+        if unknown:
+            raise ToolError(f"--function {unknown} is not a public function in "
+                            f"the unit module; public functions: {known}",
+                            kind="usage")
+        return [f for f in fns if f.name in set(overrides)], "flag"
+    if not fns:
+        raise ToolError("unit module has no public module-level function to scaffold "
+                        "(classes and private helpers are not oracle entries)", kind="usage")
+    return fns, "all-public"
+
+
+def _spec_text(spec: dict) -> str:
+    return spec.get("text") or spec["kind"]
+
+
+def _union_of(fn_specs: dict[str, dict], hand_tune: list[dict]) -> dict:
+    """{function: {param: {"spec", "has_default"}}} -> the corpus-level
+    union {param: {"spec", "required"}}. ``required`` = at least one
+    declaring function requires it, so corpus rows must always carry it
+    (omitting the rest exercises defaults). A name annotated differently
+    across functions becomes kind unknown + a hand-tune flag — one JSON
+    row cannot mechanically feed conflicting annotations; never guessed."""
+    decls: dict[str, list] = {}
+    for fn, specs in fn_specs.items():
+        for name, info in specs.items():
+            decls.setdefault(name, []).append((fn, info))
+    union: dict[str, dict] = {}
+    for name, entries in decls.items():
+        spec = entries[0][1]["spec"]
+        differing = [(fn, info) for fn, info in entries[1:]
+                     if info["spec"] != spec]
+        if differing:
+            spellings = ", ".join(f"{fn}: {_spec_text(info['spec'])}"
+                                  for fn, info in entries)
+            spec = _spec("unknown", text=name,
+                         reason=f"annotated differently across functions ({spellings})")
+            hand_tune.append({
+                "where": f"union param {name}",
+                "reason": f"one JSON row cannot feed conflicting annotations "
+                          f"({spellings}) — hand-complete",
+            })
+        union[name] = {"spec": spec,
+                       "required": any(not info["has_default"] for _, info in entries)}
+    return union
+
+
 def _signature_params(fn) -> tuple[dict[str, dict], list[str]]:
     """{param name: {"annotation": node or None, "has_default": bool}} for
     positional and keyword-only params, plus hand-tune notes for *args /
@@ -546,12 +623,7 @@ SYMMETRY: the sibling adapter is rendered from the same template and
 differs ONLY inside the delimited BACKEND section, so an oracle.py verdict
 over both measures the port, not the adapter.
 
-Protocol: the oracle entry is "<this file>:run". A corpus row is one JSON
-object mapping @@FUNCTION@@'s parameter names to JSON values (exactly what
-corpora/gen_@@STEM@@.py emits); run() rebuilds the typed Python objects
-the signature requires (specs below), calls the function, and serializes
-the result back to JSON — canonicalizing non-JSON shapes (set -> sorted
-list, tuple -> list, dataclass -> dict) so the oracle can compare them.
+@@PROTOCOL@@
 
 HAND-TUNE@@HANDTUNE_MARK@@ — the heuristic could not express these;
 complete them in BOTH adapters and in the generator:
@@ -573,11 +645,7 @@ from decimal import Decimal
 from enum import Enum
 
 UNIT = @@UNIT_REPR@@
-FUNCTION = @@FUNCTION_REPR@@
-# parameter -> generation/rebuild spec (from the contract's type signature)
-PARAM_SPECS = @@PARAM_SPECS@@
-# return-annotation spec; None = unannotated (honest _jsonify fallback)
-RESULT_SPEC = @@RESULT_SPEC@@
+@@ENTRY_DECLS@@
 
 # ==== BACKEND — the ONLY section that differs between ================
 # ==== _ref.py and _cand.py ================================================
@@ -780,7 +848,50 @@ def serialize(value, spec):
     return _jsonify(value)
 
 
-def run(row):
+@@RUN_DEF@@
+
+@@LOAD_CALL@@
+'''
+
+# ---- mode-specific fragments rendered into ADAPTER_TEMPLATE (issue #48) --
+
+PROTOCOL_FUNCTION = '''Protocol: the oracle entry is "<this file>:run". A corpus row is one JSON
+object mapping @@FUNCTION@@'s parameter names to JSON values (exactly what
+corpora/gen_@@STEM@@.py emits); run() rebuilds the typed Python objects
+the signature requires (specs below), calls the function, and serializes
+the result back to JSON — canonicalizing non-JSON shapes (set -> sorted
+list, tuple -> list, dataclass -> dict) so the oracle can compare them.'''
+
+PROTOCOL_MODULE = '''Protocol: the oracle entry is "<this file>:run" — MODULE CONFORMANCE
+(issue #48): a unit's contract is its whole public API, so run() judges
+EVERY function below per corpus row, not just a first-public pick. A row
+is one JSON object over the UNION of the judged functions' parameter
+names; each function is called with the row's values for its own
+parameters (rebuilt through its own spec) and the row's result is the
+envelope {function: result | {"__error__": {"type", "message"}}}: a
+function's own raised exception is per-function evidence compared by the
+oracle's value rules, not a failed row. A row key no judged function
+declares, a union parameter missing where some function requires it, or a
+value outside the union spec is a corpus bug and RAISES from run() (as
+does an output serialize() cannot express — the honest incomparable,
+never a per-function error).'''
+
+ENTRY_DECLS_FUNCTION = '''FUNCTION = @@FUNCTION_REPR@@
+# parameter -> generation/rebuild spec (from the contract's type signature)
+PARAM_SPECS = @@PARAM_SPECS@@
+# return-annotation spec; None = unannotated (honest _jsonify fallback)
+RESULT_SPEC = @@RESULT_SPEC@@'''
+
+ENTRY_DECLS_MODULE = '''# judged public function -> {"params": {param: spec}, "result": spec|None};
+# one manifest judges the unit's WHOLE public API (issue #48)
+FUNCTIONS = @@FUNCTIONS@@
+# union of parameter names across FUNCTIONS; required = at least one
+# function requires it, so corpus rows must always carry it (the rest may
+# be omitted to exercise a default). A name annotated differently across
+# functions is flagged unknown — never guessed.
+UNION_SPECS = @@UNION_SPECS@@'''
+
+RUN_DEF_FUNCTION = '''def run(row):
     """One corpus row ({param: value} JSON object) -> JSON-serializable
     output of @@FUNCTION@@. This is the oracle entry point."""
     if not isinstance(row, dict):
@@ -795,13 +906,51 @@ def run(row):
     result = FN(**kwargs)
     if inspect.iscoroutine(result):  # async entries, mechanically symmetric
         result = asyncio.run(result)
-    return serialize(result, RESULT_SPEC)
+    return serialize(result, RESULT_SPEC)'''
 
+RUN_DEF_MODULE = '''def run(row):
+    """One corpus row ({param: value} over the UNION of the judged
+    functions' parameters) -> the module-conformance envelope
+    {function: result | {"__error__": ...}}. Oracle entry point (issue
+    #48: judge the unit's whole public API, not one function)."""
+    if not isinstance(row, dict):
+        raise TypeError("corpus row must be a JSON object of {param: value}, got "
+                        + type(row).__name__)
+    unknown = sorted(set(row) - set(UNION_SPECS))
+    if unknown:
+        raise TypeError(f"corpus row key(s) {unknown} are not parameters of any "
+                        f"judged function ({', '.join(UNION_SPECS)})")
+    missing = sorted(n for n, s in UNION_SPECS.items()
+                     if s["required"] and n not in row)
+    if missing:
+        raise TypeError(f"corpus row is missing required parameter(s) {missing} — "
+                        "a function cannot be called without them")
+    for name in sorted(row):  # union-spec validation: a corpus-format bug
+        rebuild(row[name], UNION_SPECS[name]["spec"], f"$.{name}")  # raises
+    envelope = {}
+    for name, info in FUNCTIONS.items():
+        try:
+            kwargs = {p: rebuild(row[p], spec, f"$.{name}.{p}")
+                      for p, spec in info["params"].items() if p in row}
+            result = FNS[name](**kwargs)
+            if inspect.iscoroutine(result):  # async entries, symmetric
+                result = asyncio.run(result)
+        except Exception as e:  # the function's own error path is evidence
+            envelope[name] = {"__error__": {"type": type(e).__name__,
+                                            "message": str(e)}}
+            continue
+        # serialize outside the except: an output the adapter cannot express
+        # is incomparable, never the unit's error
+        envelope[name] = serialize(result, info["result"])
+    return envelope'''
 
-FN = _load_function()  # a failure here is a setup error for this side —
+LOAD_CALL_FUNCTION = '''FN = _load_function()  # a failure here is a setup error for this side —
                        # oracle.py reports it honestly (exit 4) instead of
-                       # judging half an adapter
-'''
+                       # judging half an adapter'''
+
+LOAD_CALL_MODULE = '''FNS = _load_functions()  # a failure here is a setup error for this side —
+                         # oracle.py reports it honestly (exit 4) instead of
+                         # judging half an adapter'''
 
 REF_BACKEND = '''# Reference side: import the ORIGINAL python unit. PROJECT_ROOT is where
 # scaffold.py ran; override with MIGRATE_PROJECT_ROOT to relocate the run.
@@ -855,6 +1004,68 @@ def _load_function():
         return getattr(importlib.import_module(CANDIDATE_MODULE), _CANDIDATE_FUNCTION)
 '''
 
+REF_MODULE_BACKEND = '''# Reference side (module conformance, issue #48): import the ORIGINAL
+# python unit. PROJECT_ROOT is where scaffold.py ran; override with
+# MIGRATE_PROJECT_ROOT to relocate the run.
+PROJECT_ROOT = os.environ.get("MIGRATE_PROJECT_ROOT", @@ROOT_REPR@@)
+_MODULE_CANDIDATES = @@MODULE_CANDIDATES@@  # layout-stripped + src-prefixed (issue #26)
+_UNIT_PATH = @@UNIT_PATH_REPR@@             # project-relative, for the file fallback
+
+
+def _load_functions():
+    for r in (PROJECT_ROOT, os.path.join(PROJECT_ROOT, "src")):
+        if os.path.isdir(r) and r not in sys.path:
+            sys.path.insert(0, r)
+    mod = None
+    for name in _MODULE_CANDIDATES:
+        try:
+            mod = importlib.import_module(name)
+            break
+        except ImportError:
+            continue
+    if mod is None:
+        mod = _resolve_module(_UNIT_PATH, _MODULE_CANDIDATES[0])
+    missing = [n for n in FUNCTIONS if not hasattr(mod, n)]
+    if missing:
+        raise ImportError(f"reference module {_MODULE_CANDIDATES[0]} exposes no "
+                          f"{missing} — the unit's whole public API is the "
+                          "contract (issue #48)")
+    return {n: getattr(mod, n) for n in FUNCTIONS}
+'''
+
+CAND_MODULE_BACKEND = '''# Candidate side (module conformance, issue #48): import the PyO3 wheel.
+# The wheel's module name is NOT knowable at Stage 2 scaffold time — set
+# CANDIDATE_MODULE below (or re-run scaffold.py with --candidate-module
+# <module> --force at Stage 4) before judging. Until then importing this
+# adapter is a setup error, which oracle.py reports honestly instead of
+# judging half an adapter. The wheel must export EVERY judged function
+# name — a missing export is a setup error naming it, never a silent gap
+# in the verdict.
+CANDIDATE_MODULE = @@CANDIDATE_MODULE@@  # e.g. "mycrate.units.u_bars"
+PROJECT_ROOT = os.environ.get("MIGRATE_PROJECT_ROOT", @@ROOT_REPR@@)
+
+
+def _load_functions():
+    if not CANDIDATE_MODULE:
+        raise NotImplementedError(
+            "scaffold.py: candidate module not set — the PyO3 wheel is unknown "
+            "at Stage 2. Set CANDIDATE_MODULE (or re-run scaffold.py "
+            "--candidate-module <wheel-module> --force), then re-judge (issue #32).")
+    try:
+        mod = importlib.import_module(CANDIDATE_MODULE)
+    except ImportError:
+        for r in (PROJECT_ROOT, os.path.join(PROJECT_ROOT, "src")):
+            if os.path.isdir(r) and r not in sys.path:
+                sys.path.insert(0, r)
+        mod = importlib.import_module(CANDIDATE_MODULE)
+    missing = [n for n in FUNCTIONS if not hasattr(mod, n)]
+    if missing:
+        raise ImportError(f"candidate module {CANDIDATE_MODULE} exposes no "
+                          f"{missing} — the port must export the unit's whole "
+                          "public API (issue #48)")
+    return {n: getattr(mod, n) for n in FUNCTIONS}
+'''
+
 GENERATOR_TEMPLATE = '''#!/usr/bin/env python3
 """gen_@@STEM@@.py — seeded corpus generator for unit @@UNIT@@ (issue #32).
 
@@ -865,7 +1076,7 @@ re-judgment (Stage 4 step 8) regenerates with a DIFFERENT seed:
     python gen_@@STEM@@.py --seed <fresh> --out corpus-fresh.jsonl
 
 Rows are the documented corpus format: one raw JSON value per line = one
-input, a JSON object of {param: value} for @@FUNCTION@@ — NEVER pre-wrapped
+input, a JSON object of {param: value} for @@SURFACE@@ — NEVER pre-wrapped
 in {"i", "input"} framing; oracle.py adds that envelope itself (issue #29).
 Edge rows cover zero-values and signature boundaries (often the documented
 error path); random rows follow the baked-in specs.
@@ -884,11 +1095,13 @@ import sys
 from pathlib import Path
 
 UNIT = @@UNIT_REPR@@
-FUNCTION = @@FUNCTION_REPR@@
+@@ENTRY_CONST@@
 DEFAULT_SEED = @@SEED@@
 DEFAULT_ROWS = @@ROWS@@
 # {param: {"spec": <generation spec>, "has_default": bool}} — from the
-# contract's type signature via scaffold.py
+# contract's type signature via scaffold.py (module mode: the UNION of the
+# judged functions' parameters; has_default = defaulted in every function
+# declaring it, so omitting it is always safe — issue #48)
 SPECS = @@SPECS@@
 # deterministic surface/boundary rows (all-zero row, per-param boundaries,
 # defaults-exercising row) derived from the signature at scaffold time
@@ -1099,34 +1312,65 @@ def _hand_tune_block(items: list[dict]) -> str:
     return "\n" + "\n".join(f"  - {it['where']}: {it['reason']}" for it in items)
 
 
-def _render_adapter(*, side: str, unit: str, function: str, param_specs: dict,
-                    result_spec: dict | None, hand_tune: list[dict],
+def _render_adapter(*, side: str, mode: str, unit: str, hand_tune: list[dict],
                     project_root: Path, module_candidates: list[str],
-                    unit_path: str, candidate_module: str | None) -> str:
-    """param_specs here is the RAW {name: spec} mapping (the generator gets
-    the has_default wrapper instead)."""
+                    unit_path: str, candidate_module: str | None,
+                    function: str | None = None, param_specs: dict | None = None,
+                    result_spec: dict | None = None,
+                    functions: dict | None = None,
+                    union_specs: dict | None = None) -> str:
+    """One side of the symmetric pair, function or module mode (issue #48).
+    Function-mode param_specs is the RAW {name: spec} mapping (the
+    generator gets the has_default wrapper instead); module mode carries
+    the per-function table + the union specs instead."""
     stem = _sanitize_stem(unit)
+    if mode == "module":
+        backends = (REF_MODULE_BACKEND, CAND_MODULE_BACKEND)
+        mode_tokens = {
+            "@@PROTOCOL@@": PROTOCOL_MODULE,
+            "@@ENTRY_DECLS@@": ENTRY_DECLS_MODULE,
+            "@@RUN_DEF@@": RUN_DEF_MODULE,
+            "@@LOAD_CALL@@": LOAD_CALL_MODULE,
+            "@@FUNCTIONS@@": pformat(functions, sort_dicts=False, width=88),
+            "@@UNION_SPECS@@": pformat(union_specs, sort_dicts=False, width=88),
+        }
+    else:
+        backends = (REF_BACKEND, CAND_BACKEND)
+        scalar = {"@@FUNCTION@@": function,
+                  "@@FUNCTION_REPR@@": repr(function), "@@STEM@@": stem}
+
+        def _frag(text: str) -> str:  # resolve fragment-local tokens up front
+            for k, v in scalar.items():
+                text = text.replace(k, v)
+            return text
+        mode_tokens = {
+            "@@PROTOCOL@@": _frag(PROTOCOL_FUNCTION),
+            "@@ENTRY_DECLS@@": _frag(ENTRY_DECLS_FUNCTION),
+            "@@RUN_DEF@@": _frag(RUN_DEF_FUNCTION),
+            "@@LOAD_CALL@@": LOAD_CALL_FUNCTION,
+            "@@PARAM_SPECS@@": pformat(param_specs, sort_dicts=False, width=88),
+            "@@RESULT_SPEC@@": pformat(result_spec, sort_dicts=False, width=88),
+        }
+    ref_text, cand_text = backends
     if side == "ref":
-        backend = (REF_BACKEND
+        backend = (ref_text
                    .replace("@@ROOT_REPR@@", repr(str(project_root)))
                    .replace("@@MODULE_CANDIDATES@@", repr(module_candidates))
                    .replace("@@UNIT_PATH_REPR@@", repr(unit_path)))
     else:
-        backend = (CAND_BACKEND
+        backend = (cand_text
                    .replace("@@CANDIDATE_MODULE@@", repr(candidate_module))
                    .replace("@@ROOT_REPR@@", repr(str(project_root))))
-    backend = backend.replace("@@FUNCTION_REPR@@", repr(function)).rstrip("\n")
+    if mode == "function":
+        backend = backend.replace("@@FUNCTION_REPR@@", repr(function))
     return _fill_template(ADAPTER_TEMPLATE, {
         "@@UNIT@@": unit,
         "@@UNIT_REPR@@": repr(unit),
-        "@@FUNCTION@@": function,
-        "@@FUNCTION_REPR@@": repr(function),
         "@@STEM@@": stem,
-        "@@PARAM_SPECS@@": pformat(param_specs, sort_dicts=False, width=88),
-        "@@RESULT_SPEC@@": pformat(result_spec, sort_dicts=False, width=88),
         "@@HANDTUNE_MARK@@": f" ({len(hand_tune)} item(s))" if hand_tune else "",
         "@@HANDTUNE_LIST@@": _hand_tune_block(hand_tune),
-        "@@BACKEND@@": backend,
+        "@@BACKEND@@": backend.rstrip("\n"),
+        **mode_tokens,
     }, f"{side} adapter for {unit}")
 
 
@@ -1141,8 +1385,12 @@ def _shared_adapter_sha256(ref_text: str, cand_text: str):
         hashlib.sha256(shared(cand_text)).hexdigest()
 
 
-def _render_generator(*, unit: str, function: str, specs: dict, edge_rows: list,
-                      seed: int, rows: int, invariants: list[str]) -> str:
+def _render_generator(*, unit: str, mode: str, functions: list[str] | None,
+                      specs: dict, edge_rows: list, seed: int, rows: int,
+                      invariants: list[str]) -> str:
+    """specs is {param: {"spec", "has_default"}} — the function's own
+    parameters (function mode) or the union across the judged functions
+    (module mode, has_default = defaulted in every declaring function)."""
     stem = _sanitize_stem(unit)
     flagged = sorted(n for n, info in specs.items()
                      if info["spec"]["kind"] == "unknown")
@@ -1150,12 +1398,21 @@ def _render_generator(*, unit: str, function: str, specs: dict, edge_rows: list,
     invariants_block = (f"Contract invariants (from the unit's contract.json —\n"
                         f"the edge rows should exercise them, especially the "
                         f"error paths):\n{inv_lines}\n\n" if inv_lines else "")
+    if mode == "module":
+        surface = (f"every judged function ({', '.join(functions)}); a row "
+                   "carries the UNION of their parameters — each function "
+                   "takes the row's values for its own (issue #48)")
+        entry_const = (f"FUNCTIONS = {functions!r}  # judged public API "
+                       "(module conformance, issue #48)")
+    else:
+        surface = functions[0]
+        entry_const = f"FUNCTION = {functions[0]!r}"
     return _fill_template(GENERATOR_TEMPLATE, {
         "@@STEM@@": stem,
         "@@UNIT@@": unit,
         "@@UNIT_REPR@@": repr(unit),
-        "@@FUNCTION@@": function,
-        "@@FUNCTION_REPR@@": repr(function),
+        "@@SURFACE@@": surface,
+        "@@ENTRY_CONST@@": entry_const,
         "@@SEED@@": str(seed),
         "@@ROWS@@": str(rows),
         "@@SPECS@@": pformat(specs, sort_dicts=False, width=88),
@@ -1203,6 +1460,76 @@ def _param_specs(params: dict[str, dict], ctx: FileCtx) -> tuple[dict, list[dict
     return specs, hand_tune
 
 
+def _analyze_function_mode(tree: ast.Module, ctx: FileCtx, src_stem: str,
+                           args, uid: str, warnings: list[str]) -> dict:
+    """Legacy single-entry plan (issue #32): one function, one adapter pair
+    judging only it (--mode function)."""
+    fn, how = _pick_function(tree, src_stem, args.functions[0] if args.functions else None)
+    params, notes = _signature_params(fn)
+    param_specs, hand_tune = _param_specs(params, ctx)
+    hand_tune += [{"where": "signature", "reason": n} for n in notes]
+    result_spec = _parse_ann(fn.returns, ctx) if fn.returns else None
+    if result_spec is not None and result_spec["kind"] == "unknown":
+        warnings.append(f"unit {uid}: return annotation {result_spec.get('text')!r} "
+                        "is not JSON-expressible — the adapters fall back to an honest "
+                        "_jsonify walk (unserializable outputs judge incomparable)")
+    if set(param_specs) == {"i", "input"}:
+        warnings.append(f"unit {uid}: {fn.name}() takes exactly params 'i' and 'input' — "
+                        "its rows are indistinguishable from pre-wrapped framing and "
+                        "oracle.py will refuse the corpus (issue #29); rename or hand-tune")
+    return {
+        "mode": "function", "function": fn.name, "function_source": how,
+        "functions_detail": None, "union_specs": None,
+        "param_specs": param_specs, "result_spec": result_spec,
+        "hand_tune": hand_tune, "checked_functions": [fn.name],
+    }
+
+
+def _analyze_module_mode(tree: ast.Module, ctx: FileCtx, args, uid: str,
+                         warnings: list[str]) -> dict:
+    """Module-conformance plan (issue #48): judge the unit's WHOLE public
+    API (or the --function subset) through one envelope adapter — the
+    corpus is the UNION of the judged functions' parameters."""
+    fns, how = _select_module_functions(tree, args.functions)
+    functions_detail: dict[str, dict] = {}
+    fn_param_specs: dict[str, dict] = {}
+    hand_tune: list[dict] = []
+    for fn in fns:
+        params, notes = _signature_params(fn)
+        specs, flags = _param_specs(params, ctx)
+        hand_tune += [{**flag, "where": f"{fn.name}: {flag['where']}"} for flag in flags]
+        hand_tune += [{"where": f"{fn.name}: signature", "reason": n} for n in notes]
+        rs = _parse_ann(fn.returns, ctx) if fn.returns else None
+        if rs is not None and rs["kind"] == "unknown":
+            warnings.append(f"unit {uid}: {fn.name}() return annotation "
+                            f"{rs.get('text')!r} is not JSON-expressible — the "
+                            "adapters fall back to an honest _jsonify walk "
+                            "(unserializable outputs judge incomparable)")
+        fn_param_specs[fn.name] = specs
+        functions_detail[fn.name] = {
+            "params": {n: info["spec"] for n, info in specs.items()},
+            "result": rs,
+        }
+    union = _union_of(fn_param_specs, hand_tune)
+    if set(union) == {"i", "input"}:
+        warnings.append(f"unit {uid}: the judged functions take exactly params "
+                        "'i' and 'input' — rows are indistinguishable from "
+                        "pre-wrapped framing and oracle.py will refuse the "
+                        "corpus (issue #29); rename or hand-tune")
+    # corpus specs: the union; has_default = defaulted in EVERY declaring
+    # function, so a row may omit it without breaking any caller
+    gen_specs = {n: {"spec": info["spec"],
+                     "has_default": not info["required"]}
+                 for n, info in union.items()}
+    return {
+        "mode": "module", "function": None, "function_source": how,
+        "functions_detail": functions_detail, "union_specs": union,
+        "param_specs": gen_specs, "result_spec": None,
+        "hand_tune": hand_tune,
+        "checked_functions": [f.name for f in fns],
+    }
+
+
 def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
                    args, targets: set, warnings: list[str]) -> dict:
     uid = u["id"]
@@ -1215,48 +1542,45 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
                         kind="usage")
     tree = ast.parse(src.read_text(encoding="utf-8", errors="replace"))
     ctx = FileCtx(src.resolve(), root if root.is_dir() else src.parent, {})
-    fn, how = _pick_function(tree, src.stem, args.function)
-    params, notes = _signature_params(fn)
-    param_specs, hand_tune = _param_specs(params, ctx)
-    hand_tune += [{"where": "signature", "reason": n} for n in notes]
+    if args.mode == "module":
+        plan = _analyze_module_mode(tree, ctx, args, uid, warnings)
+    else:
+        plan = _analyze_function_mode(tree, ctx, src.stem, args, uid, warnings)
 
     contract = _load_contract(args.contract, uid, warnings) if args.contract else None
-    result_spec = _parse_ann(fn.returns, ctx) if fn.returns else None
-    if result_spec is not None and result_spec["kind"] == "unknown":
-        warnings.append(f"unit {uid}: return annotation {result_spec.get('text')!r} "
-                        "is not JSON-expressible — the adapters fall back to an honest "
-                        "_jsonify walk (unserializable outputs judge incomparable)")
-
-    if set(param_specs) == {"i", "input"}:
-        warnings.append(f"unit {uid}: {fn.name}() takes exactly params 'i' and 'input' — "
-                        "its rows are indistinguishable from pre-wrapped framing and "
-                        "oracle.py will refuse the corpus (issue #29); rename or hand-tune")
-
     invariants = sorted(set((contract or {}).get("invariants") or []))
-    if contract is not None and not any(fn.name in s for s in contract.get("type_signatures", [])):
-        warnings.append(f"unit {uid}: chosen function {fn.name!r} does not appear in "
-                        f"{args.contract} type_signatures — contract and source disagree")
+    if contract is not None:
+        sigs = contract.get("type_signatures", [])
+        missing = [name for name in plan["checked_functions"]
+                   if not any(name in s for s in sigs)]
+        if missing:
+            warnings.append(f"unit {uid}: judged function(s) {missing} do not appear "
+                            f"in {args.contract} type_signatures — contract and "
+                            "source disagree")
 
     stem = _sanitize_stem(uid)
     module_candidates = import_candidates_of(u["python_path"])
     resolved = src.resolve()
     rel = resolved.relative_to(root) if resolved.is_relative_to(root) else resolved
-    raw_specs = {n: info["spec"] for n, info in param_specs.items()}
-    ref_text = _render_adapter(side="ref", unit=uid, function=fn.name,
-                               param_specs=raw_specs, result_spec=result_spec,
-                               hand_tune=hand_tune, project_root=root,
-                               module_candidates=module_candidates,
-                               unit_path=rel.as_posix(),
-                               candidate_module=args.candidate_module)
-    cand_text = _render_adapter(side="cand", unit=uid, function=fn.name,
-                                param_specs=raw_specs, result_spec=result_spec,
-                                hand_tune=hand_tune, project_root=root,
-                                module_candidates=module_candidates,
-                                unit_path=rel.as_posix(),
-                                candidate_module=args.candidate_module)
+    adapter_kw = dict(unit=uid, hand_tune=plan["hand_tune"], project_root=root,
+                      module_candidates=module_candidates,
+                      unit_path=rel.as_posix(),
+                      candidate_module=args.candidate_module)
+    if plan["mode"] == "module":
+        adapter_kw.update(functions=plan["functions_detail"],
+                          union_specs=plan["union_specs"])
+    else:
+        adapter_kw.update(function=plan["function"],
+                          param_specs={n: info["spec"] for n, info
+                                       in plan["param_specs"].items()},
+                          result_spec=plan["result_spec"])
+    ref_text = _render_adapter(side="ref", mode=plan["mode"], **adapter_kw)
+    cand_text = _render_adapter(side="cand", mode=plan["mode"], **adapter_kw)
     ref_sha, cand_sha = _shared_adapter_sha256(ref_text, cand_text)
-    edge_rows = _edge_rows(param_specs)
-    gen_text = _render_generator(unit=uid, function=fn.name, specs=param_specs,
+    edge_rows = _edge_rows(plan["param_specs"])
+    gen_text = _render_generator(unit=uid, mode=plan["mode"],
+                                 functions=plan["checked_functions"],
+                                 specs=plan["param_specs"],
                                  edge_rows=edge_rows, seed=args.seed,
                                  rows=args.rows, invariants=invariants)
 
@@ -1271,30 +1595,45 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
              "generator": gen_text}
     targets.update(files.values())
 
+    scaffold_block = {"tool": TOOL, "version": VERSION, "seed": args.seed,
+                      "mode": plan["mode"], "function_source": plan["function_source"],
+                      "candidate_module": args.candidate_module,
+                      "adapters_shared_sha256": ref_sha}
+    if plan["mode"] == "module":
+        scaffold_block["functions"] = plan["checked_functions"]
+    else:
+        scaffold_block["function"] = plan["function"]
     manifest = {
         "unit": uid,
+        "mode": plan["mode"],
         "reference": {"entry": f"../adapters/{stem}_ref.py:run"},
         "candidate": {"entry": f"../adapters/{stem}_cand.py:run"},
         "corpus": f"../corpora/corpus-{uid}.jsonl",
-        "scaffold": {
-            "tool": TOOL, "version": VERSION, "seed": args.seed,
-            "function": fn.name, "function_source": how,
-            "candidate_module": args.candidate_module,
-            "adapters_shared_sha256": ref_sha,
-        },
+        "scaffold": scaffold_block,
     }
-    return {
+    if plan["mode"] == "module":
+        manifest["functions"] = plan["checked_functions"]
+
+    result = {
         "unit": uid, "python_path": u["python_path"],
         "module": module_name_of(u["python_path"]),
-        "function": fn.name, "function_source": how,
-        "parameters": param_specs, "result": result_spec,
+        "mode": plan["mode"], "function_source": plan["function_source"],
+        "parameters": plan["param_specs"], "hand_tune": plan["hand_tune"],
         "files": {k: str(p) for k, p in files.items()},
-        "texts": texts, "manifest": manifest, "hand_tune": hand_tune,
+        "texts": texts, "manifest": manifest,
         "adapters": {"symmetric": ref_sha == cand_sha,
                      "shared_sha256": ref_sha},
         "edge_rows": len(edge_rows),
         "candidate_module": args.candidate_module,
     }
+    if plan["mode"] == "module":
+        result["functions"] = plan["checked_functions"]
+        result["functions_detail"] = plan["functions_detail"]
+        result["union_parameters"] = plan["union_specs"]
+    else:
+        result["function"] = plan["function"]
+        result["result"] = plan["result_spec"]
+    return result
 
 
 def _write_unit(result: dict) -> None:
@@ -1325,6 +1664,31 @@ def _generate_corpus(result: dict, seed: int, rows: int) -> dict:
             "flagged_params": mod.flagged_params()}
 
 
+def _module_fn_stats(recs: list) -> dict:
+    """Module-mode dry-run evidence (issue #48): per-function ok/error
+    counts from the {fn: value | {"__error__": ...}} envelopes of the
+    reference records. This is what makes an envelope corpus auditable —
+    rows are 'ok' even when a function errored, so the per-function tally
+    is the honest ground truth."""
+    stats: dict[str, dict] = {}
+    ok_rows = 0
+    for rec in recs:
+        if rec is None or not rec.get("ok"):
+            continue
+        ok_rows += 1
+        value = rec.get("value")
+        if not isinstance(value, dict):
+            continue
+        for name, v in value.items():
+            entry = stats.setdefault(name, {"ok": 0, "error": 0})
+            is_err = (isinstance(v, dict) and set(v) == {"__error__"}
+                      and isinstance(v["__error__"], dict))
+            entry["error" if is_err else "ok"] += 1
+    for name, entry in stats.items():
+        entry["rows"] = ok_rows
+    return stats
+
+
 def _dry_run_corpus(result: dict, out_dir: Path, timeout: float) -> dict:
     """Run the fresh corpus against the reference adapter through
     oracle.py's own subprocess runner — a corpus that would judge hollow
@@ -1341,19 +1705,36 @@ def _dry_run_corpus(result: dict, out_dir: Path, timeout: float) -> dict:
         # validated; report it as its own finding kind, never as row noise
         return {"setup_error": setup_error, "counts": {}, "rows": [],
                 "reference_ok": 0, "reference_ok_fraction": None,
-                "degenerate": True, "warning": None, "first_errors": []}
+                "degenerate": True, "warning": None, "first_errors": [],
+                "functions": {}, "functions_all_error": [],
+                "degenerate_detail": None}
     rows = [oracle._corpus_row_status(i, rec) for i, rec in enumerate(recs)]
     counts = {}
     for r in rows:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     gt = oracle.reference_ground_truth(recs, len(rows), oracle.merge_rules({}))
+    fn_stats = _module_fn_stats(recs) if result["mode"] == "module" else {}
+    all_error = sorted(n for n, s in fn_stats.items() if s["error"] and s["ok"] == 0)
+    degenerate = gt["degenerate"]
+    degenerate_detail = None
+    if not degenerate and all_error and len(all_error) == len(fn_stats):
+        # every judged function errored on every envelope — no per-function
+        # parity evidence at all, the module-mode face of issue #30
+        degenerate = True
+        degenerate_detail = ("every judged function errored on every reference "
+                             "dry-run row — the module corpus carries no parity "
+                             "evidence (issue #30); fix the corpus or the "
+                             "flagged parameters")
     return {
         "rows": rows, "counts": counts,
         "reference_ok": gt["reference_ok"],
         "reference_ok_fraction": gt["reference_ok_fraction"],
-        "degenerate": gt["degenerate"],
+        "degenerate": degenerate,
+        "degenerate_detail": degenerate_detail,
         "warning": gt["warning"],
         "first_errors": [r for r in rows if r["status"] == "error"][:3],
+        "functions": fn_stats,
+        "functions_all_error": all_error if not degenerate else [],
     }
 
 
@@ -1375,8 +1756,9 @@ def _select_units(units: list, chunks: list[str] | None) -> list[dict]:
 def _classify_dry_run(result: dict, dry: dict, findings: list, warnings: list) -> None:
     """Turn the dry-run record into findings/warnings per tools/README.md:
     hand-tune flags and a reference that cannot run (or errors on every
-    row) are findings; a thin-but-alive reference and non-ok rows are
-    warnings."""
+    row — or, in module mode, every FUNCTION erroring on every row) are
+    findings; a thin-but-alive reference, non-ok rows, and a single
+    all-error function are warnings."""
     unit = result["unit"]
     if result["hand_tune"]:
         findings.append({"unit": unit, "kind": "hand_tune",
@@ -1389,11 +1771,18 @@ def _classify_dry_run(result: dict, dry: dict, findings: list, warnings: list) -
     elif dry["degenerate"]:
         findings.append({
             "unit": unit, "kind": "degenerate_corpus",
-            "detail": "the reference adapter errors on every corpus row — a judge "
+            "detail": dry.get("degenerate_detail") or
+                      "the reference adapter errors on every corpus row — a judge "
                       "run would be hollow/INCOMPARABLE (issue #30); fix the corpus "
                       "or the flagged parameters"})
-    elif dry["warning"]:
-        warnings.append(f"unit {unit}: {dry['warning']}")
+    else:
+        if dry["warning"]:
+            warnings.append(f"unit {unit}: {dry['warning']}")
+        for name in dry.get("functions_all_error") or []:
+            warnings.append(f"unit {unit}: module-mode function {name!r} errored on "
+                            "every reference dry-run row — its parity is unjudged "
+                            "(issue #48); fix its corpus values or hand-complete "
+                            "its flagged parameters")
     for status, n in sorted(dry["counts"].items()):
         if status != "ok" and n:
             warnings.append(f"unit {unit}: {n}/{len(dry['rows'])} "
@@ -1417,6 +1806,14 @@ def cmd_scaffold(args) -> int:
     if not (args.state or args.state_pos):
         raise ToolError("a migration-state.json path is required (positional or --state)",
                         kind="usage")
+    # --function is repeatable / comma-separated like --unit (issue #48):
+    # a subset in module mode, the single choice in function mode
+    args.functions = [w.strip() for chunk in (args.function or [])
+                      for w in chunk.split(",") if w.strip()]
+    if args.mode == "function" and len(args.functions) > 1:
+        raise ToolError("--mode function judges ONE function per manifest; pass "
+                        "--mode module (the default) to judge several through "
+                        "the conformance envelope (issue #48)", kind="usage")
     state_path = Path(args.state or args.state_pos)
     state = read_json(state_path)
     units = state.get("units", [])
@@ -1454,8 +1851,11 @@ def cmd_scaffold(args) -> int:
     code = EXIT_FINDINGS if findings else EXIT_OK
     ok_units = sum(1 for r in results if not r["hand_tune"])
     hand_tune_n = sum(len(r["hand_tune"]) for r in results)
-    human = (f"scaffolded {len(results)} unit(s) under {out} (seed {args.seed}): "
-             f"{ok_units} fully generated, {hand_tune_n} hand-tune flag(s)"
+    n_fns = sum(len(r.get("functions") or []) for r in results)
+    human = (f"scaffolded {len(results)} unit(s) under {out} (seed {args.seed}, "
+             f"mode {args.mode}"
+             + (f", {n_fns} judged function(s)" if args.mode == "module" else "")
+             + f"): {ok_units} fully generated, {hand_tune_n} hand-tune flag(s)"
              + (f"; {len(findings)} finding(s)" if findings else "")
              + ("; FAIL" if findings else ""))
     emit({
@@ -1476,7 +1876,7 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("scaffold", help="per unit: symmetric ref/cand adapters + "
                                         "seeded corpus generator + judge-ready manifest "
-                                        "(issue #32)")
+                                        "(issue #32; module conformance: issue #48)")
     p.add_argument("state_pos", nargs="?", help="migration-state.json (or use --state)")
     p.add_argument("--state", help="migration-state.json (same as the positional)")
     p.add_argument("--unit", action="append",
@@ -1495,8 +1895,19 @@ def main(argv=None) -> int:
                    help="optional contract.json file (or the contracts/ dir from "
                         "contract_extract.py --out) — invariants are copied into the "
                         "generator and the function choice is cross-checked")
-    p.add_argument("--function", help="entry function to wrap (default: the "
-                                      "module-stem-named public function, else the first)")
+    p.add_argument("--mode", choices=("module", "function"), default="module",
+                   help="module (default, issue #48): ONE manifest judges the "
+                        "unit's WHOLE public API — the adapter calls every "
+                        "judged function per row and returns "
+                        "{fn: result | {__error__}} so per-function errors "
+                        "compare instead of failing the row; function: the "
+                        "legacy single-entry scaffold")
+    p.add_argument("--function", action="append", metavar="NAME",
+                   help="public function(s) to judge (repeatable / comma-"
+                        "separated). module mode: the envelope subset "
+                        "(default: every public function); function mode: "
+                        "the single entry (default: the module-stem-named "
+                        "public function, else the first)")
     p.add_argument("--candidate-module",
                    help="PyO3 wheel module for the candidate adapter (default: a "
                         "HAND-TUNE placeholder — the wheel is unknown at Stage 2)")
