@@ -195,10 +195,35 @@ def python_version_string() -> str:
 
 def module_name_of(python_path: str) -> str:
     """Dotted module name for a source path: strip src//lib/ layout prefix
-    and trailing __init__ (src/pkg/parse.py -> pkg.parse)."""
+    and trailing __init__ (src/pkg/parse.py -> pkg.parse).
+
+    NB: the strip assumes the classic src-layout where ``src/`` is NOT part
+    of the import name. Projects whose import root IS the top-level src
+    directory import ``src.pkg.parse`` — use ``import_candidates_of`` when
+    matching a path against real import strings (issue #26)."""
     parts = list(Path(python_path).with_suffix("").parts)
     if parts and parts[0] in ("src", "lib"):
         parts = parts[1:]
     if parts and parts[-1] == "__init__":
         parts = parts[:-1]
     return ".".join(parts)
+
+
+def import_candidates_of(python_path: str) -> list[str]:
+    """Dotted import-name candidates a unit may be imported under, canonical
+    first: the layout-stripped name (``src/pkg/parse.py`` -> ``pkg.parse``)
+    plus, when a src/lib prefix was stripped, the un-stripped name
+    (``src.pkg.parse``). Some projects' import root IS the top-level src/
+    directory — their tests do ``from src.parse import x`` and their entry
+    points read ``src.cli:main`` — so a path answers to both spellings.
+    Matching either candidate against a file's imports maps them (issue #26:
+    matching only the stripped name reported every unit uncovered and every
+    test dangling on such layouts)."""
+    parts = list(Path(python_path).with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    full = ".".join(parts)
+    stripped = module_name_of(python_path)
+    if stripped and stripped != full:
+        return [stripped, full]
+    return [full] if full else []

@@ -9,7 +9,11 @@ already exist (an LLM may enrich them later; that is an edit, not a check).
 
 Test → unit mapping (deterministic, in priority order):
   1. the test file imports the unit's module (``from pkg.parse import x`` /
-     ``import pkg.parse`` / aliased attribute use) — authoritative;
+     ``import pkg.parse`` / aliased attribute use) — authoritative. A unit
+     answers to BOTH the layout-stripped dotted name (``src/pkg/parse.py`` →
+     ``pkg.parse``) and the un-stripped one (``src.pkg.parse``): projects
+     whose import root IS the top-level ``src/`` directory import the latter
+     (issue #26);
   2. filename convention ``test_<module>.py`` / ``<module>_test.py`` when the
      test file has no scoped imports at all.
 Tests matching no scoped unit are DANGLING and reported (never dropped
@@ -38,14 +42,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    EXIT_FINDINGS, EXIT_OK, ToolError, emit, module_name_of, read_json,
-    run_child, run_cli, write_json_atomic,
+    EXIT_FINDINGS, EXIT_OK, ToolError, emit, import_candidates_of,
+    module_name_of, read_json, run_child, run_cli, write_json_atomic,
 )
 
 TOOL = "contract_extract.py"
 VERSION = 1
 INVARIANT_TAGS = ("Invariant:", "Postcondition:", "Property:")
 NODEID_RE = re.compile(r"^(\S+\.py)::(\S+)$")
+NO_UNIT_MATCH = "imports no scoped unit and matches no unit module name"
 
 
 # ---------------------------------------------------------------- pytest ---
@@ -178,8 +183,14 @@ def cmd_extract(args) -> int:
             test_trees[tf] = ast.parse(path.read_text()) if path else None
 
     # module names come from the DECLARED python_path (project-relative),
-    # matching how test files import them — never from the resolved location
+    # matching how test files import them — never from the resolved location.
+    # Each unit answers to BOTH the layout-stripped dotted name
+    # (src/pkg/parse.py -> pkg.parse) and the un-stripped one (src.pkg.parse):
+    # projects whose import root IS the top-level src/ directory import the
+    # latter (issue #26) — match either spelling.
     module_of_unit = {u["id"]: module_name_of(u["python_path"]) for u in units}
+    candidates_of_unit = {u["id"]: import_candidates_of(u["python_path"])
+                          for u in units}
 
     covering: dict[str, list[str]] = {uid: [] for uid in unit_files}
     dangling: list[dict] = []
@@ -191,8 +202,9 @@ def cmd_extract(args) -> int:
             continue
         tmods = imports_of(tree)
         matched = []
-        for uid, umod in module_of_unit.items():
-            if umod in tmods or any(m.startswith(umod + ".") for m in tmods):
+        for uid, cands in candidates_of_unit.items():
+            if any(c in tmods or any(m.startswith(c + ".") for m in tmods)
+                   for c in cands):
                 matched.append(uid)
         if not matched and not tmods:
             # filename convention fallback: tests/test_parse.py -> *.parse
@@ -204,7 +216,7 @@ def cmd_extract(args) -> int:
                            if umod.split(".")[-1] == tail]
         if not matched:
             dangling.append({"nodeid": nodeid,
-                             "reason": "imports no scoped unit and matches no unit module name"})
+                             "reason": NO_UNIT_MATCH})
         for uid in matched:
             covering[uid].append(nodeid)
 
@@ -259,15 +271,25 @@ def cmd_extract(args) -> int:
     # uncovered units fail unless explicitly tolerated (still reported)
     hard = dangling + ([] if args.allow_uncovered else uncovered)
     code = EXIT_FINDINGS if hard else EXIT_OK
+    # An all-uncovered board where the dangling tests DID import something
+    # (that matched no unit) reads like a weak suite, but is far more likely
+    # a layout/import-root mismatch than 1243 useless tests — say so instead
+    # of a bare wall of nodeids (issue #26).
+    layout_mismatch_suspected = bool(unit_files) and len(uncovered) == len(unit_files) \
+        and any(d["reason"] == NO_UNIT_MATCH for d in dangling)
     human = (f"contracts: {len(contracts)} unit(s), coverage {coverage_pct}% "
              f"({len(uncovered)} uncovered), {len(dangling)} dangling test(s)"
-             + ("; FAIL" if code == EXIT_FINDINGS else ""))
+             + ("; FAIL" if code == EXIT_FINDINGS else "")
+             + (" — likely layout mismatch: no test import matched any unit "
+                "module name; check the units' python_path import root"
+                if layout_mismatch_suspected else ""))
     payload = {
         "tool": TOOL, "version": VERSION,
         "contracts": contracts,
         "coverage_pct": coverage_pct,
         "uncovered_units": uncovered,
         "dangling_tests": dangling,
+        "layout_mismatch_suspected": layout_mismatch_suspected,
         "findings": findings,
         "written_to": str(out_dir) if out_dir else None,
         "summary": {"exit_code": code, "human": human},
