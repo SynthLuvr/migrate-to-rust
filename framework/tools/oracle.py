@@ -21,11 +21,11 @@ Verbatim from the acceptance test ``test_judge_subprocess_end_to_end``::
 
 Do NOT pre-wrap corpus lines in a ``{"i": ..., "input": ...}`` envelope:
 that is *internal stdin framing* the oracle adds itself (below). A
-pre-wrapped line reaches the entry as ``{"i": ..., "input": {...}}`` —
-typically the same TypeError on both sides of every run, which the judge
-then reports as a hollow all-EQUIVALENT verdict. ``_load_corpus`` refuses
-a corpus in which every line carries exactly the framing keys, and
-``corpus --validate`` dry-runs an entry per-row before judging.
+pre-wrapped line reaches the entry double-wrapped, both sides raise the
+same TypeError on every run, and the judge reports a hollow all-EQUIVALENT
+verdict — so ``_load_corpus`` refuses a corpus in which every line carries
+exactly the framing keys, and ``corpus --validate`` dry-runs an entry
+per-row before judging.
 
 **Child-process protocol (what the oracle writes)** — one child process
 per side; the oracle frames each corpus value on the child's stdin as::
@@ -89,6 +89,7 @@ import re
 import sys
 import types
 import unicodedata
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -449,15 +450,21 @@ def _execute_entry_subprocess(entry: str, inputs: list, manifest_dir: Path,
 
 # ---------------------------------------------------------------- judge ----
 
-def _refuse_prewrapped_corpus(values: list, path) -> None:
-    """A corpus pre-wrapped in the child stdin framing (issue #29): every
-    line is {"i": <int>, "input": ...}. The oracle adds that envelope
-    itself when streaming to the child, so pre-wrapped lines double-wrap —
-    both sides raise the same TypeError on every run and the judge reports
-    a hollow all-EQUIVALENT verdict. Refuse loudly instead (a refusal is a
-    result, not a crash)."""
+def _load_corpus(path: Path) -> list:
+    """Load a corpus as the list of raw input values. Refuses (a) an empty
+    corpus and (b) a corpus pre-wrapped in the child stdin framing (issue
+    #29: every line is {"i": <int>, "input": ...}). The oracle adds that
+    envelope itself when streaming to the child, so pre-wrapped lines
+    double-wrap — both sides raise the same TypeError on every run and the
+    judge reports a hollow all-EQUIVALENT verdict. Lines that merely
+    contain i/input-ish keys are legitimate data, not a refusal."""
+    rows = read_jsonl(path)
+    values = [v for _, v in rows]
+    if not values:
+        raise ValueError(f"corpus {path} is empty — nothing to judge")
     if all(isinstance(v, dict) and set(v) == {"i", "input"}
-           and isinstance(v["i"], int) and not isinstance(v["i"], bool)
+           and isinstance(v["i"], int)
+           and not isinstance(v["i"], bool)  # bool is an int subclass
            for v in values):
         raise ValueError(
             f"corpus {path} is pre-wrapped in the child-process stdin "
@@ -468,14 +475,6 @@ def _refuse_prewrapped_corpus(values: list, path) -> None:
             "file format in the module docstring / tools/README.md "
             "(issue #29)."
         )
-
-
-def _load_corpus(path: Path) -> list:
-    rows = read_jsonl(path)
-    values = [v for _, v in rows]
-    if not values:
-        raise ValueError(f"corpus {path} is empty — nothing to judge")
-    _refuse_prewrapped_corpus(values, path)
     return values
 
 
@@ -507,18 +506,32 @@ def cmd_judge(args) -> int:
         }, human_flag=args.human)
 
 
+def _corpus_row_status(i: int, rec: dict | None) -> dict:
+    """One runner record -> its dry-run row {i, status, detail}."""
+    if rec is None:
+        return {"i": i, "status": "missing",
+                "detail": "child produced no record for this input"}
+    if rec.get("unserializable"):
+        return {"i": i, "status": "unserializable", "detail": rec.get("detail")}
+    if rec.get("ok"):
+        return {"i": i, "status": "ok", "detail": None}
+    err = rec.get("error", {})
+    return {"i": i, "status": "error",
+            "detail": f"{err.get('type')}: {err.get('message')}"}
+
+
 def cmd_corpus(args) -> int:
-    """Dry-run ONE entry over a corpus and report per-row reference status
-    (ok / error / unserializable / missing) before judging — issue #29's
-    "would have surfaced this in seconds" helper: a pre-wrapped or
-    malformed corpus shows up as a wall of identical errors here, not as a
-    hollow 40/40 EQUIVALENT verdict from the judge."""
+    """Dry-run ONE entry over a corpus: per-row status (ok / error /
+    unserializable / missing) before you spend a judge run on it — a
+    malformed corpus shows up as a wall of identical errors here, not as
+    a hollow all-EQUIVALENT verdict from the judge."""
     corpus_path = Path(args.validate).resolve()
     inputs = _load_corpus(corpus_path)
     if args.runs:
         inputs = inputs[: args.runs]
     recs = _execute_entry_subprocess(args.entry, inputs,
                                      corpus_path.parent, args.timeout)
+    corpus_digest = sha256_bytes(corpus_path.read_bytes())
 
     setup_error = next((r["setup_error"] for r in recs
                         if r and r.get("setup_error")), None)
@@ -526,34 +539,17 @@ def cmd_corpus(args) -> int:
         human = f"corpus dry-run: entry failed to run: {setup_error}"
         emit({
             "tool": TOOL, "version": VERSION, "entry": args.entry,
-            "corpus": {"path": str(corpus_path),
-                       "sha256": sha256_bytes(corpus_path.read_bytes())},
+            "corpus": {"path": str(corpus_path), "sha256": corpus_digest},
             "setup_error": setup_error,
             "summary": {"exit_code": EXIT_SETUP, "human": human},
         }, human_flag=args.human)
         return EXIT_SETUP
 
-    rows = []
-    for i, rec in enumerate(recs):
-        if rec is None:
-            rows.append({"i": i, "status": "missing",
-                         "detail": "child produced no record for this input"})
-        elif rec.get("unserializable"):
-            rows.append({"i": i, "status": "unserializable",
-                         "detail": rec.get("detail")})
-        elif rec.get("ok"):
-            rows.append({"i": i, "status": "ok", "detail": None})
-        else:
-            err = rec.get("error", {})
-            rows.append({"i": i, "status": "error",
-                         "detail": f"{err.get('type')}: {err.get('message')}"})
-
-    counts: dict[str, int] = {}
-    for r in rows:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
-    ok = counts.get("ok", 0)
-    # the hollow-verdict signature (issue #29): zero rows produced a value,
-    # so a judge run over this corpus compares only error-vs-error pairs
+    rows = [_corpus_row_status(i, rec) for i, rec in enumerate(recs)]
+    counts = Counter(row["status"] for row in rows)
+    ok = counts["ok"]
+    # hollow-verdict signature (issue #29): no row produced a value, so a
+    # judge run over this corpus would compare only error-vs-error pairs
     hollow = bool(rows) and ok == 0
     warning = None
     if hollow:
@@ -566,14 +562,15 @@ def cmd_corpus(args) -> int:
         )
 
     code = EXIT_OK if ok == len(rows) else EXIT_FINDINGS
-    human = (f"corpus {corpus_path.name} vs {args.entry}: "
-             f"{ok}/{len(rows)} rows ok"
-             + (f", {len(rows) - ok} error/unserializable" if ok < len(rows) else "")
-             + (" — HOLLOW: no row produced a value" if hollow else ""))
+    human = f"corpus {corpus_path.name} vs {args.entry}: {ok}/{len(rows)} rows ok"
+    if ok < len(rows):
+        human += f", {len(rows) - ok} error/unserializable"
+    if hollow:
+        human += " — HOLLOW: no row produced a value"
     emit({
         "tool": TOOL, "version": VERSION, "entry": args.entry,
         "corpus": {"path": str(corpus_path), "lines": len(inputs),
-                   "sha256": sha256_bytes(corpus_path.read_bytes())},
+                   "sha256": corpus_digest},
         "rows": rows, "counts": dict(sorted(counts.items())),
         "ok": ok, "total": len(rows),
         "hollow_equivalent_risk": hollow, "warning": warning,

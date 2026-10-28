@@ -139,8 +139,6 @@ def test_judge_subprocess_end_to_end(monkeypatch, capsys, tmp_path):
 # is internal stdin protocol.
 
 def test_docs_pin_the_corpus_file_format():
-    # the docstring documents the raw-value format with the acceptance
-    # test's example verbatim, and names the framing as internal
     doc = oracle.__doc__
     assert "one raw JSON value per" in doc
     assert '{"xs": [1, 2], "bad": false}' in doc
@@ -152,8 +150,6 @@ def test_docs_pin_the_corpus_file_format():
 
 
 def test_judge_refuses_prewrapped_corpus(monkeypatch, capsys, tmp_path):
-    # following the OLD docstring produced exactly this corpus — and a
-    # hollow all-equivalent verdict. Now it must be a loud usage refusal.
     (tmp_path / "impl.py").write_text("def run(v):\n    return v\n")
     (tmp_path / "corpus.jsonl").write_text("\n".join([
         json.dumps({"i": 0, "input": {"xs": [1, 2], "bad": False}}),
@@ -174,14 +170,13 @@ def test_judge_refuses_prewrapped_corpus(monkeypatch, capsys, tmp_path):
     assert "raw JSON values" in out["error"]["detail"]
 
 
-def test_prewrap_guard_tolerates_legitimate_keys(monkeypatch, capsys, tmp_path):
-    # a corpus whose inputs merely CONTAIN i/input-ish keys (or only some
-    # lines shaped like framing) is data, not a mistake — no refusal
+def test_prewrap_guard_tolerates_legitimate_keys(tmp_path):
+    # each value defeats one clause of the every-line-is-framing guard
     values = [
-        {"input": "a"},                       # missing "i"
+        {"input": "a"},                           # missing "i"
         {"i": 2, "input": {"x": 1}, "extra": 0},  # extra key
-        {"i": "not-an-int", "input": [1]},    # i not an int
-        [1, 2, 3],                            # not even a dict
+        {"i": "not-an-int", "input": [1]},        # i not an int
+        [1, 2, 3],                                # not even a dict
     ]
     path = tmp_path / "corpus.jsonl"
     path.write_text("\n".join(json.dumps(v) for v in values) + "\n")
@@ -201,7 +196,7 @@ def test_corpus_validate_reports_per_row_status(monkeypatch, capsys, tmp_path):
     code, out = run_tool(monkeypatch, capsys, "oracle.py",
                          ["corpus", "--validate", str(tmp_path / "corpus.jsonl"),
                           "--entry", "impl:run"])
-    assert code == 2  # one error row -> findings-class, attention needed
+    assert code == 2  # one error row -> findings
     assert out["rows"][0]["status"] == "ok"
     assert out["rows"][1]["status"] == "error"
     assert "ValueError" in out["rows"][1]["detail"]
@@ -211,9 +206,7 @@ def test_corpus_validate_reports_per_row_status(monkeypatch, capsys, tmp_path):
 
 
 def test_corpus_validate_flags_the_hollow_signature(monkeypatch, capsys, tmp_path):
-    # the issue #29 scenario: an entry that errors on EVERY input (e.g. a
-    # wrong input shape corpus-wide). Per-row dry-run must flag that a
-    # judge verdict over this corpus would be hollow.
+    # an entry that errors on every input is the hollow-verdict signature
     (tmp_path / "impl.py").write_text(
         "def run(v):\n"
         "    return {'n': len(v['payload']['xs'])}\n")  # KeyError on every row
