@@ -65,8 +65,7 @@ prompt: |
   path is empty or "UNSET", do not ask for it: record the missing-target
   reason in the run report, set run_status to failed_safely in
   framework/state/migration-state.json (a run never sits "awaiting input"),
-  and stop. Initialize
-  framework/state/migration-state.json from
+  and stop. Initialize framework/state/migration-state.json from
   framework/state/migration-state.schema.json and keep it current through
   every stage. Read the background files from disk as needed: SUMMARY.md,
   TOOLCHAIN.md, and research/5-idioms-and-ecosystem-mapping.md.

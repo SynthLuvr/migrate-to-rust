@@ -45,8 +45,8 @@ pending).
 resolved by **policy rule GO-1** (`decided_by: "policy:GO-1"`, evidence
 journaled — this snapshot is an L3 autopilot run; at L0/L1 the same gate
 would stay open and the run would end with the dossier for the operator's
-between-runs decision — the run never asks mid-run, it records
-`decided_by: "human"` out-of-band). No units exist yet.
+between-runs decision — the run never asks mid-run; the operator records
+`decided_by: "human"` outside the run). No units exist yet.
 
 **Stage 1 — Plan** ([`../stages/1-plan.md`](../stages/1-plan.md)) → the
 `units[]` backbone: every unit enters as `status: pending` with `deps[]`,

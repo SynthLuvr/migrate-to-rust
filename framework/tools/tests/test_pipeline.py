@@ -249,7 +249,7 @@ def test_resolve_gates_journals_policy_decisions(monkeypatch, capsys, tmp_path):
                for e in st["journal"])
 
 
-def test_resolve_gates_refuses_below_l2_gates_are_human_stops(monkeypatch, capsys, tmp_path):
+def test_resolve_gates_refuses_supervised_levels(monkeypatch, capsys, tmp_path):
     p = tmp_path / "state.json"
     run_tool(monkeypatch, capsys, "state.py", [
         "init", str(p), "--name", "demo", "--python-path", "src/demo",
@@ -257,7 +257,7 @@ def test_resolve_gates_refuses_below_l2_gates_are_human_stops(monkeypatch, capsy
     code, out = run_tool(monkeypatch, capsys, "pipeline.py",
                          ["resolve-gates", str(p)])
     assert code == 2 and "L2" in out["error"]
-    assert "nothing asks mid-run" in out["error"]  # the refusal never asks
+    assert "nothing asks mid-run" in out["error"]
     assert _load(p)["human_gates"] == []  # nothing self-approved
 
 
@@ -427,7 +427,7 @@ def test_driver_refuses_to_run_supervised_levels(monkeypatch, capsys, tmp_path):
     code, out = run_tool(monkeypatch, capsys, "pipeline.py",
                          ["run", str(p), "--dry-run"])
     assert code == 2 and "L2" in out["error"]
-    assert "never asks" in out["error"]  # the refusal itself never asks
+    assert "never asks" in out["error"]
     # pre-authorizing upfront is journaled, not silent
     code, out = run_tool(monkeypatch, capsys, "pipeline.py",
                          ["run", str(p), "--dry-run", "--autonomy", "L2"])

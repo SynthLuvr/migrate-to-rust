@@ -934,11 +934,11 @@ def cmd_migrate(args) -> int:
     ensure(state, "budget_ledger",
            {"tokens_total": 0, "hours_human_total": 0.0, "regression_triage_hours": 0.0},
            "budget_ledger", None)
-    # issue #22 backfills: pre-authorization block (L0 preserves the
-    # supervised meaning of a pre-policy file — never silently re-authorize
-    # an old run as autonomous; NEW runs init at the never-ask default L2),
-    # run_status, and decided_by for gates resolved before the
-    # policy layer existed — those were human decisions by definition
+    # issue #22 backfills: the autonomy block, run_status, and decided_by
+    # for gates resolved before the policy layer existed (human decisions
+    # by definition). The autonomy block backfills as L0 — never silently
+    # re-authorize a pre-policy run as autonomous (new runs init at the
+    # never-ask default L2).
     ensure(state, "autonomy", autonomy_block("L0"), "autonomy", None)
     ensure(state, "run_status", "pending", "run_status", None)
     for i, g in enumerate(state.get("human_gates", [])):

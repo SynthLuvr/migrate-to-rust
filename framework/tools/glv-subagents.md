@@ -128,7 +128,7 @@ Per unit, in leaf-first dependency order:
    `APPROVE` / `FIX` / `ESCALATE`: `FIX` loops via `/prompt` (counted
    against `MAX_ROUNDS`); `ESCALATE` goes to the escalation queue — the
    end-of-run dossier, deferred via ESC-1 at L2+ — with both
-   candidates and the minimal repro attached (deferred via ESC-1 at L2+).
+   candidates and the minimal repro attached.
 4. The orchestrator — never the delegate — writes the verdict and the
    session ids into `migration-state.json`, then `state.save()` after
    every unit.
