@@ -63,10 +63,31 @@ Quick human lookups without HTTP: `glv sessions`, `glv view <id>`,
 
 ## One GLV session = one role invocation
 
+**Including the orchestrator itself.** When the chain harness
+(`tools/succession.py`, issue #25) drives a run, the orchestrator is a
+*series* of GLV sessions — `run-<project>-s<n>` — so a whole migration
+finishes from one human prompt: session 1 rides the operator's prompt;
+when a session's context budget exhausts before the run reaches a
+terminal state, the harness composes the successor's resume brief from
+the state file (position, escalation dossier, journal tail, run-budget
+remaining, hygiene findings), starts the next session over this API,
+stops the predecessor if still live, journals a **stop-notice** (operator
+informed, not involved), and resets `run_status` to `running` — all
+through `state.py`. Guardrails: depth cap (`budget.max_chain_depth`,
+policy default 10) and a monotonic-progress guard (a successor that
+advances neither stage nor ≥1 decided unit ends the chain
+`failed_safely`); the run-level ceilings bind the *whole* chain (tokens
+sum through the single state file, wall clock sums over sessions).
+`budget_exhausted` survives as a final status only when the run-level
+ceilings hit — or in degraded mode, GLV unreachable. GLV unreachable at
+chain start is a refusal (exit 2) naming the pre-#25 fallback.
+
 - **Name deterministically.** `unit-<unit-id>-translator-c<k>` and
-  `unit-<unit-id>-reviewer-r<n>` (retries get a `-retry` suffix). The
+  `unit-<unit-id>-reviewer-r<n>` (retries get a `-retry` suffix);
+  orchestrator chain sessions `run-<project>-s<n>`. The
   names surface in `GET /api/sessions` listings and go into the state
-  file's per-unit `sessions[]` (with `notes` for prose) as the audit
+  file's per-unit `sessions[]` (with `notes` for prose) or the top-level
+  `session_chain.sessions[]` (orchestrator chain) as the audit
   trail — both defined in `../state/migration-state.schema.json`.
 - **`working_dir` is the isolation unit.** Point each concurrent
   translator at its own checkout — `git worktree add`, one per in-flight

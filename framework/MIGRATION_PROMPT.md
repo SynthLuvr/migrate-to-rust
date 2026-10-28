@@ -40,6 +40,16 @@ operate a pipeline; the gates decide, not you.
   state file through `tools/state.py`, and never touch gates, `run_status`,
   or `stage` — those are the driver's. Judgment stays inside stages (tranche
   selection, decomposition, repair); gate decisions are code.
+- **Chained (any level)** — when the run is started by
+  [`tools/succession.py chain`](tools/succession.py) (issue #25), the
+  orchestrator role itself runs as a series of GLV sessions: if your
+  session's context budget exhausts before the run reaches a terminal
+  state, record `budget_exhausted` and stop — the harness spawns a
+  successor session with the full resume context (state file path,
+  dossier, journal tail, budget remaining) automatically. A run then
+  finishes from one human prompt with zero manual restarts; the run-level
+  ceilings and the chain guardrails (depth cap, monotonic progress) bound
+  everything.
 
 ## Hard rules — violating any one fails the task
 
@@ -144,7 +154,10 @@ Divergent / Incomparable`; every Divergent carries a written explanation.
   GLV server ([SynthLuvr/glv](https://github.com/SynthLuvr/glv)) is
   reachable, run these roles as GLV sessions over its HTTP API — one
   session per role invocation. The oracle still judges; GLV only carries
-  the roles.
+  the roles. GLV also carries the **orchestrator chain**
+  ([`tools/succession.py`](tools/succession.py), issue #25): session-level
+  `budget_exhausted` spawns the successor session automatically, so the
+  whole run finishes from one human prompt.
 
 ## Gates — autonomy levels and policy resolution (issue #22)
 
@@ -191,7 +204,13 @@ Rules of the rules:
   `no_go_measured` / `budget_exhausted` / `failed_safely` — never "awaiting
   input". Every terminal state emits the same deliverable set (run report
   with the gate + escalation dossiers, state file, journal). Global
-  token/time ceilings are enforced by the driver.
+  token/time ceilings are enforced by the driver. `budget_exhausted` at
+  the *session* level (the orchestrator's context window) is a scheduling
+  event, not a result: with GLV reachable, `tools/succession.py` chains a
+  successor session automatically (depth-capped, progress-guarded,
+  stop-noticed — issue #25), so it never survives as a run's final status;
+  it stays final only for the run-level ceilings (or in degraded mode,
+  GLV unreachable), where a human raises the ceiling to resume.
 - Undecidable-from-evidence gates (e.g. a substitution with no recorded
   module) stay open and drain into the report — they never block silently.
 - Safety rests on the dual-build design: per-unit Python fallback, the
@@ -209,4 +228,5 @@ Rules of the rules:
 | Speed number without a repro script | vendor benchmark rot | every benchmark ships with its corpus + script |
 | Optimized Python matches the port | port wasn't the win | report honestly; keeping Python is a success |
 | Agent pauses to ask a human at a gate | pre-policy gate behavior | gates resolve in code, or the run ends with the dossier for between-runs operator review — "ask" is never an available move |
+| Run parks in `budget_exhausted`, waiting for a human to notice and restart | session-level exhaustion (the orchestrator's context window) treated as a human-facing result | `tools/succession.py` spawns the successor GLV session automatically (issue #25); only run-level ceiling exhaustion reaches a human — and then the answer is "raise the ceiling", not "restart by hand" |
 | Private project names leak into public artifacts (PRs, issues, commits) | run reports and state files name the target project | `runs/` stays gitignored; anonymize target-project names in anything committed or posted publicly — refer to "a target project", never its name |

@@ -24,6 +24,11 @@ Terminal-state discipline: a run ALWAYS ends in ``complete`` /
 report incl. the escalation dossier, state file, journal). Safety rests on
 the existing dual-build design: per-unit Python fallback, one-env-var shim,
 rollback pin — every autonomous decision stays reversible per unit.
+Session-level ``budget_exhausted`` (the orchestrator session's context
+window, not these run-level ceilings) is handled by ``succession.py``
+(issue #25), which chains successor GLV sessions automatically; this
+driver's own ``budget_exhausted`` exit therefore means the run-level
+bound hit — raise the ceiling to resume.
 
 Autonomy levels (pre-authorized BEFORE the run; zero mid-run questions at
 any level — the agent never asks): L0 supervised (gates are hard stops: the
@@ -190,6 +195,12 @@ def _policy_structure_errors(policy: dict) -> list[str]:
     if (not isinstance(budget, dict)
             or "max_tokens" not in budget or "max_wall_clock_minutes" not in budget):
         errors.append("budget: max_tokens and max_wall_clock_minutes required")
+    max_chain_depth = budget.get("max_chain_depth") if isinstance(budget, dict) else None
+    if max_chain_depth is not None and (not isinstance(max_chain_depth, int)
+                                        or isinstance(max_chain_depth, bool)
+                                        or max_chain_depth < 1):
+        errors.append("budget.max_chain_depth: integer >= 1 required "
+                      "(the successor-chain depth cap, issue #25)")
     return errors
 
 
@@ -1139,17 +1150,45 @@ def cmd_preflight(args) -> int:
 
 # ----------------------------------------------------------------- report --
 
-def _tokens_spent(state: dict) -> int:
-    """Run-level budget usage: the ledger plus every unit's spend."""
+def tokens_spent(state: dict) -> int:
+    """Run-level budget usage: the ledger plus every unit's spend.
+
+    Public (no underscore): succession.py composes it to enforce the
+    run-level ceilings across a whole session chain — the sum over
+    sessions is inherent because every session writes the one state
+    file (issue #25)."""
     ledger = (state.get("budget_ledger") or {}).get("tokens_total") or 0
     per_unit = sum((u.get("budget") or {}).get("tokens_spent", 0) or 0
                    for u in state.get("units", []))
     return ledger + per_unit
 
 
+def _chain_report_lines(chain: dict, tokens: int, ceiling: int | None) -> list[str]:
+    """The Session chain section of the run report (issue #25): depth,
+    wall clock and budget summed over every session in the chain, one
+    line per session and notice. Empty when the run never chained."""
+    if not chain.get("sessions"):
+        return []
+    lines = ["", "## Session chain (issue #25)", "",
+             f"- depth: {chain.get('depth', 0)} of max "
+             f"{chain.get('max_depth', '—')} successions · wall clock "
+             f"across the chain: {chain.get('wall_clock_minutes', 0)} min",
+             f"- budget across the chain: {tokens} tokens recorded"
+             + (f" / ceiling {ceiling}" if ceiling else "")
+             + " (sum over every session — successors get a fresh "
+               "session budget, never a fresh run budget)"]
+    for s in chain["sessions"]:
+        lines.append(f"- s{s.get('index')} **{s.get('name')}** "
+                     f"({s.get('id')}): {s.get('outcome') or 'in flight'}"
+                     + (f" — {s.get('succession_reason')}"
+                        if s.get("succession_reason") else ""))
+    lines += [f"- notice: {n}" for n in chain.get("notices") or []]
+    return lines
+
+
 def build_report(state: dict, policy: dict) -> str:
     level = state_tool.autonomy_level(state)
-    tokens = _tokens_spent(state)
+    tokens = tokens_spent(state)
     ceiling = ((state.get("autonomy") or {}).get("budget") or {}).get("max_tokens")
     counts = Counter(u.get("status", "?") for u in state.get("units", []))
     lines = [
@@ -1188,6 +1227,8 @@ def build_report(state: dict, policy: dict) -> str:
     for g in deferred:
         lines.append(f"- gate **{g.get('gate')}** [{g.get('state')}]: "
                      f"{g.get('note') or 'see state file'}")
+    lines += _chain_report_lines(state.get("session_chain") or {},
+                                 tokens, ceiling)
     lines.append("")
     return "\n".join(lines)
 
@@ -1351,7 +1392,9 @@ def cmd_run(args) -> int:
         return _emit_refusal(
             f"run_status={run_status} is a finished run — start a fresh run "
             f"(state.py init) to migrate again; resume is only for "
-            f"budget_exhausted/failed_safely after raising the ceiling",
+            f"budget_exhausted/failed_safely after raising the ceiling "
+            f"(or, when GLV is reachable, tools/succession.py chains "
+            f"successor sessions automatically — issue #25)",
             args.human, file=str(path))
     if not args.dry_run and not args.agent_cmd:
         return _emit_refusal(
@@ -1383,7 +1426,7 @@ def cmd_run(args) -> int:
     try:
         while True:
             state = _load_state(path)
-            tokens = _tokens_spent(state)
+            tokens = tokens_spent(state)
             elapsed = (time.monotonic() - started) / 60
             if max_tokens is not None and tokens > max_tokens:
                 raise _Terminal("budget_exhausted",
@@ -1447,7 +1490,12 @@ def cmd_run(args) -> int:
              f"run_status={run_status}, stage={state.get('stage')}"
              + (f" — {terminal.reason}" if terminal is not None else
                 f" (--once: resume with another pipeline.py run)")
-             + f"; report: {rp}")
+             + f"; report: {rp}"
+             + ("; session-level exhaustion chains a successor automatically "
+                "via tools/succession.py (GLV transport, issue #25) — this "
+                "manual resume path is only for run-level ceilings the "
+                "operator has raised" if run_status == "budget_exhausted"
+                else ""))
     emit({"tool": TOOL, "version": VERSION, "file": str(path),
           "run_status": run_status, "stage": state.get("stage"),
           "autonomy": state.get("autonomy"),
@@ -1523,7 +1571,7 @@ def cmd_report(args) -> int:
 def cmd_status(args) -> int:
     load_policy(args.policy)  # validate --policy even though status needs no rules
     state = _load_state(Path(args.state))
-    tokens = _tokens_spent(state)
+    tokens = tokens_spent(state)
     ceiling = ((state.get("autonomy") or {}).get("budget") or {}).get("max_tokens")
     open_gates = [g for g in state.get("human_gates", []) if g.get("state") == "open"]
     human = (f"run={state.get('run_status', 'pending')} stage={state.get('stage')}/"
