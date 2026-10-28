@@ -400,17 +400,18 @@ def test_min_length_series_functions_get_realistic_rows(monkeypatch, capsys, tmp
 
     rows = [json.loads(line)
             for line in (out / "corpora/corpus-u-ichi.jsonl").read_text().splitlines()]
-    bars = [r["bars"] for r in rows if "bars" in r]
-    long_rows = [b for b in bars if len(b) >= 60]
-    short_rows = [b for b in bars if len(b) < 10]
+    series = [r["bars"] for r in rows if "bars" in r]
+    long_rows = [bars for bars in series if len(bars) >= 60]
+    short_rows = [bars for bars in series if len(bars) < 10]
     assert len(long_rows) >= 12, "realistic series lengths must dominate"
     assert short_rows, "short lengths stay as deliberate error rows"
-    for b in long_rows:  # intra-row relationships hold by construction
-        for bar in b:
+    for bars in long_rows:
+        for bar in bars:  # coherent within the bar: high/low bracket it
             assert bar["high"] >= max(bar["open"], bar["close"])
             assert 0 < bar["low"] <= min(bar["open"], bar["close"])
-    for b in long_rows:  # and the walk is coherent bar-to-bar
-        assert all(b[i + 1]["open"] == b[i]["close"] for i in range(len(b) - 1))
+        # and coherent bar-to-bar: open chains to the previous close
+        assert all(bars[i + 1]["open"] == bars[i]["close"]
+                   for i in range(len(bars) - 1))
 
     # the unit is exercised, not merely warned about: ichimoku computes on
     # the realistic rows (it errors on every short one — the error path)
@@ -443,7 +444,7 @@ def test_thin_ground_truth_is_a_finding_not_a_warned_exit0(
     assert code == 2, "a corpus that cannot exercise the unit is a finding"
     unit = payload["units"][0]
     dry = unit["corpus_dry_run"]
-    assert dry["reference_ok_fraction"] == dry["reference_ok_fraction"]  # not None
+    assert dry["reference_ok_fraction"] is not None
     assert 0 < dry["reference_ok"] and dry["reference_ok_fraction"] < 0.5
     assert dry["degenerate"] is False  # not the issue #30 case
     finding = next(f for f in payload["findings"]
@@ -587,11 +588,9 @@ def test_module_mode_catches_sibling_divergence_first_public_misses(
     code, payload = _scaffold(monkeypatch, capsys, state, proj, out2,
                               "--mode", "function",
                               "--candidate-module", "ind.indicators_rust")
-    # issue #49: this corpus is thin — sma_series only survives on the rows
-    # where the drawn `period` int lands in its documented 1..64 — so the
-    # scaffold no longer green-lights it (a warned-through exit 0 is the
-    # gap the issue describes). Exit 2 is a finding, not a refusal: the
-    # artifacts exist and still judge, as below.
+    # issue #49: sma_series only survives where the drawn `period` lands
+    # in its documented 1..64, so this legacy corpus is thin — a finding
+    # (exit 2), not a green light; the artifacts still judge, below
     assert code == 2
     thin = next(f for f in payload["findings"] if f["kind"] == "thin_ground_truth")
     assert thin["unit"] == "u-ind" and "min_reference_ok_fraction" in thin["detail"]

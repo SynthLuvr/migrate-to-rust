@@ -117,18 +117,16 @@ List/tuple series parameters draw **realistic lengths** (issue #49):
 random-walk series of 60–320 elements dominate — coherent OHLCV bars
 (high/low bracket the bar, open chains to the previous close) for
 open/high/low/close dataclass items, walked floats/ints otherwise — with
-a short-length minority kept as deliberate error rows; 0–9 element lists
-left min-length series functions (52+ bars, 63+ values) erroring on
-nearly every corpus row.
+a short-length minority kept as deliberate error rows; the old 0–9
+element lists left min-length series functions erroring on nearly every
+row.
 Before reporting success the scaffold also dry-runs its own fresh corpus
 against the reference adapter through `oracle.py`'s runner, so a corpus
 that would judge hollow (degenerate — issue #30), **thin** (reference ok
-below `min_reference_ok_fraction` — issue #49: a finding, exit 2, the
-same class of problem as an unexpressible param, never a warned-through
-exit 0 that judges on the few surviving rows), or malformed (issue #29)
-is a finding in seconds, not after a Stage-4 judge run. Existing output
-is never overwritten without `--force` (hand-tuned edits must not be
-lost).
+below `min_reference_ok_fraction`, a finding since issue #49 — never a
+warned-through exit 0), or malformed (issue #29) is a finding in seconds,
+not after a Stage-4 judge run. Existing output is never overwritten
+without `--force` (hand-tuned edits must not be lost).
 
 ## The deterministic driver — `pipeline.py` (issue #22)
 

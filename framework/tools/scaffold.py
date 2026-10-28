@@ -66,22 +66,25 @@ Heuristic mapping (signature annotation -> generator/rebuilder):
   list/set/frozenset/dict/tuple, the    -> recursive generators; the adapter
   Sequence/Mapping/Iterable aliases       rebuilds real list/set/dict/tuple
   Optional[X] / X | None / X | Y         -> optional / union
-  list/tuple SERIES parameters also get -> realistic lengths (issue #49):
-  realistic CONTENT                     random-walk series of 60-320
-                                          elements — coherent OHLCV bars
-                                          for open/high/low/close dataclass
-                                          items (high/low bracket the bar),
-                                          floats/ints walked, not iid noise
-                                          — plus a short-length minority as
-                                          deliberate error rows; 0-9 element
-                                          lists left series functions (52+
-                                          bars, 63+ values) erroring on
-                                          nearly every row
+  list/tuple series parameters          -> realistic lengths + content
+                                          (issue #49): random-walk series
+                                          of 60-320 elements dominate —
+                                          coherent OHLCV bars (high/low
+                                          bracket the bar, open chains to
+                                          the previous close) for open/
+                                          high/low/close dataclass items,
+                                          walked floats/ints otherwise —
+                                          with a short-length minority
+                                          kept as deliberate error rows;
+                                          0-9 element lists left series
+                                          functions (52+ bars, 63+
+                                          values) erroring on nearly
+                                          every row
   @dataclass in the unit module or any   -> rows carry a {field: value}
   project module it imports                dict; the adapter calls the real
   constructor (nested dataclasses recurse)
-  anything else (incl. inside a list   -> flagged for HAND-COMPLETION,
-  or dataclass field)                    never guessed: the parameter
+  anything else — including inside a    -> flagged for HAND-COMPLETION,
+  list or a dataclass field               never guessed: the parameter
                                           generates None/JSON-any
                                           stand-ins, the reason is in the
                                           payload's hand_tune[] and in a
@@ -1090,13 +1093,12 @@ in {"i", "input"} framing; oracle.py adds that envelope itself (issue #29).
 Edge rows cover zero-values and signature boundaries (often the documented
 error path); random rows follow the baked-in specs.
 
-List/tuple parameters draw REALISTIC series lengths (issue #49): random-
-walk series of 60-320 elements dominate — coherent OHLCV bars for
-open/high/low/close dataclass items (high/low bracket the bar), walked
-floats/ints otherwise — with a short-length minority kept as deliberate
-error rows. 0-9 element lists left series functions (52+ bars, 63+
-values) erroring on nearly every corpus row, far below the oracle's
-min_reference_ok_fraction.
+List/tuple parameters draw REALISTIC series lengths (issue #49):
+random-walk series of 60-320 elements dominate — coherent OHLCV bars for
+open/high/low/close dataclass items, walked floats/ints otherwise — with
+a short-length minority kept as deliberate error rows (0-9 element lists
+left min-length functions erroring on nearly every row, far below the
+oracle's min_reference_ok_fraction).
 
 @@INVARIANTS@@Flagged parameters generate None until hand-completed:
 @@FLAGGED@@
@@ -1133,18 +1135,18 @@ _BIG_INTS = [0, 1, -1, 2, -2, 10, 255, 256, 65535, 65536,
 _SPECIAL_FLOATS = [0.0, -0.0, 1e-9, -1e-9, 1e9, -1e9, 1.5, -2.25,
                    3.141592653589793, 1e308, -1e308, 5e-324, 0.1 + 0.2,
                    float("inf"), float("-inf"), float("nan")]
-# issue #49: series parameters need realistic depth, not edge-dominated
-# tiny lists — a 52-bar ichimoku or 63-value relative-strength errors on
-# every 0-9 element row and the corpus judges on almost nothing
-_SHORT_SIZES = [0, 1, 1, 2, 2, 3, 4, 6, 9]  # deliberate error/boundary rows
+# series parameters need realistic depth (issue #49): 0-9 element lists
+# left min-length functions (52+ bars, 63+ values) erroring on nearly
+# every row — keep a short minority as deliberate error/boundary rows
+_SHORT_SIZES = [0, 1, 1, 2, 2, 3, 4, 6, 9]
 _SERIES_MIN = 60
 _SERIES_MAX = 320
 
 
 def g_len(rng):
-    """List length (issue #49): realistic series lengths dominate so
-    min-length functions run on most rows; the short pool stays as the
-    deliberate error/boundary coverage (plus the edge rows)."""
+    """Series length: realistic lengths dominate so min-length functions
+    run on most rows; the short pool stays as deliberate error/boundary
+    coverage (issue #49)."""
     if rng.random() < 0.2:
         return rng.choice(_SHORT_SIZES)
     return rng.randint(_SERIES_MIN, _SERIES_MAX)
@@ -1178,31 +1180,37 @@ def _ohlcv_fields(item):
     return fields if {"open", "high", "low", "close"} <= set(fields) else None
 
 
+def _ohlcv_bar(rng, close, fields):
+    """One bar chained from the previous close: high/low bracket the bar,
+    so the intra-row relationships hold by construction. Volume and extra
+    fields stay generatable per their own specs."""
+    open_ = close
+    close = max(round(open_ * (1.0 + rng.uniform(-0.05, 0.05)), 6), 0.01)
+    high = round(max(open_, close) * (1.0 + rng.uniform(0.0, 0.02)), 6)
+    low = max(round(min(open_, close) * (1.0 - rng.uniform(0.0, 0.02)), 6), 0.01)
+    ohlc = {"open": open_, "high": high, "low": low, "close": close}
+    bar = {}
+    for name, field in fields.items():
+        spec = field["spec"]
+        if name in ohlc and spec["kind"] in ("int", "float"):
+            bar[name] = int(ohlc[name]) if spec["kind"] == "int" else ohlc[name]
+        elif name == "volume" and spec["kind"] == "int":
+            bar[name] = rng.randint(0, 10 ** 6)
+        elif name == "volume" and spec["kind"] == "float":
+            bar[name] = round(rng.uniform(0.0, 10.0 ** 6), 6)
+        elif field.get("has_default") and rng.random() < 0.3:
+            continue  # exercise the dataclass default
+        else:
+            bar[name] = gen(spec, rng)
+    return bar, close
+
+
 def g_ohlcv(rng, n, fields):
-    """Coherent random-walk bars (issue #49): open = previous close, close
-    walked, high/low bracket the bar — the intra-row relationships hold by
-    construction, not by luck; volume and extra fields stay generatable."""
+    """Coherent random-walk bars (issue #49): open chains to the previous
+    close, close is walked, high/low bracket the bar."""
     bars, close = [], rng.uniform(10.0, 500.0)
     for _ in range(n):
-        open_ = close
-        close = max(round(open_ * (1.0 + rng.uniform(-0.05, 0.05)), 6), 0.01)
-        high = round(max(open_, close) * (1.0 + rng.uniform(0.0, 0.02)), 6)
-        low = max(round(min(open_, close) * (1.0 - rng.uniform(0.0, 0.02)), 6), 0.01)
-        coherent = {"open": open_, "high": high, "low": low, "close": close}
-        bar = {}
-        for name, f in fields.items():
-            spec = f["spec"]
-            if name in coherent and spec["kind"] in ("int", "float"):
-                bar[name] = int(coherent[name]) if spec["kind"] == "int" \
-                    else coherent[name]
-            elif name == "volume" and spec["kind"] == "int":
-                bar[name] = rng.randint(0, 10 ** 6)
-            elif name == "volume" and spec["kind"] == "float":
-                bar[name] = round(rng.uniform(0.0, 10.0 ** 6), 6)
-            elif f.get("has_default") and rng.random() < 0.3:
-                continue  # exercise the dataclass default
-            else:
-                bar[name] = gen(spec, rng)
+        bar, close = _ohlcv_bar(rng, close, fields)
         bars.append(bar)
     return bars
 
@@ -1285,7 +1293,7 @@ def gen(spec, rng, depth=0):
     if k == "literal":
         return rng.choice(spec["values"]) if spec.get("values") else None
     if k == "list":
-        return g_series(spec["item"], rng, g_len(rng), depth)  # issue #49
+        return g_series(spec["item"], rng, g_len(rng), depth)
     if k == "set":
         n = rng.choice([0, 1, 1, 2, 3, 5])
         items, seen = [], set()
@@ -1309,7 +1317,7 @@ def gen(spec, rng, depth=0):
         return out
     if k == "tuple":
         if spec.get("variadic"):
-            return g_series(spec["item"], rng, g_len(rng), depth)  # issue #49
+            return g_series(spec["item"], rng, g_len(rng), depth)
         return [gen(s, rng, depth + 1) for s in spec["items"]]
     if k == "optional":
         return None if rng.random() < 0.2 else gen(spec["item"], rng, depth + 1)
@@ -1539,38 +1547,36 @@ def _load_contract(path: str, unit_id: str, warnings: list[str]) -> dict | None:
 
 
 def _infeasible_generation_paths(spec: dict) -> list[str]:
-    """Paths at which a spec holds an ``unknown`` kind *inside* a container
-    or dataclass (``list[Frame]`` where Frame is not a @dataclass, a
-    dataclass field of an unresolvable type, ...): the generator can only
-    emit None/JSON-any stand-ins there, so the realistic rows issue #49
-    requires are infeasible — flagged for hand-completion exactly like an
-    unexpressible top-level type. A top-level ``unknown`` is flagged by the
-    caller and not re-walked (one flag per cause, never duplicates)."""
+    """Paths at which an ``unknown`` kind sits *inside* a container or
+    dataclass (``list[Frame]`` where Frame is not a @dataclass, an
+    unresolvable dataclass field, ...): only None/JSON-any stand-ins can
+    be generated there, so the realistic rows issue #49 requires are
+    infeasible — flagged for hand-completion like an unexpressible
+    top-level type. A top-level ``unknown`` is flagged by the caller, so
+    it is not re-walked here (one flag per cause, never duplicates)."""
+
     def walk(s: dict, path: str) -> list[str]:
         k = s["kind"]
         if k == "unknown":
             return [path]
         if k in ("list", "set", "optional"):
             return walk(s["item"], f"{path}[item]")
-        if k == "tuple":
-            if s.get("variadic"):
-                return walk(s["item"], f"{path}[item]")
+        if k == "tuple" and s.get("variadic"):
+            return walk(s["item"], f"{path}[item]")
+        if k in ("tuple", "union"):
             return [p for i, it in enumerate(s["items"])
                     for p in walk(it, f"{path}[{i}]")]
         if k == "dict":
             return (walk(s["key"], f"{path}[key]")
                     + walk(s["value"], f"{path}[value]"))
-        if k == "union":
-            return [p for i, it in enumerate(s["items"])
-                    for p in walk(it, f"{path}[{i}]")]
         if k == "dataclass":
             return [p for f in s["fields"]
                     for p in walk(f["spec"], f"{path}.{f['name']}")]
         return []  # JSON scalars / any / literal / none: generatable
-    k = spec["kind"]
-    if k in ("list", "set", "tuple", "dict", "dataclass", "optional", "union"):
-        return walk(spec, "")
-    return []
+
+    if spec["kind"] == "unknown":
+        return []
+    return walk(spec, "")
 
 
 def _param_specs(params: dict[str, dict], ctx: FileCtx) -> tuple[dict, list[dict]]:
@@ -1902,15 +1908,13 @@ def _select_units(units: list, chunks: list[str] | None) -> list[dict]:
 
 
 def _classify_dry_run(result: dict, dry: dict, findings: list, warnings: list) -> None:
-    """Turn the dry-run record into findings/warnings per tools/README.md:
-    hand-tune flags, a reference that cannot run, one erroring on every row
-    (or, in module mode, every FUNCTION erroring on every row), and a
+    """Turn the dry-run record into findings/warnings per tools/README.md.
+    Findings (exit 2): hand-tune flags; a reference that cannot run or
+    errors on every row (every judged function, in module mode); a
     reference-ok fraction below min_reference_ok_fraction — a corpus that
-    cannot exercise the unit (issue #49) — are findings (exit 2); non-ok
-    rows and a single all-error function are warnings. A warned-through
-    exit 0 is exactly the hand-tune contract's silent gap the issue
-    describes: params the heuristic cannot express exit 2, and a corpus
-    that cannot feed the unit must too."""
+    cannot exercise the unit (issue #49), the same contract as params the
+    heuristic cannot express. Warnings: non-ok rows, and a single
+    all-error function."""
     unit = result["unit"]
     if result["hand_tune"]:
         findings.append({"unit": unit, "kind": "hand_tune",
@@ -1928,14 +1932,14 @@ def _classify_dry_run(result: dict, dry: dict, findings: list, warnings: list) -
                       "run would be hollow/INCOMPARABLE (issue #30); fix the corpus "
                       "or the flagged parameters"})
     else:
-        frac = dry.get("reference_ok_fraction")
-        min_frac = dry.get("min_reference_ok_fraction")
-        if frac is not None and min_frac is not None and frac < min_frac:
+        frac = dry["reference_ok_fraction"]
+        if frac is not None and frac < dry["min_reference_ok_fraction"]:
             findings.append({
                 "unit": unit, "kind": "thin_ground_truth",
                 "detail": f"reference ok on only {dry['reference_ok']}/"
                           f"{len(dry['rows'])} dry-run rows ({frac:.1%} < "
-                          f"min_reference_ok_fraction {min_frac}) — the corpus "
+                          f"min_reference_ok_fraction "
+                          f"{dry['min_reference_ok_fraction']}) — the corpus "
                           "cannot exercise the unit (issue #49); give the series "
                           "parameters realistic generation or hand-complete the "
                           "flagged parameters"})
