@@ -10,6 +10,11 @@ the agent spends most of its budget. Loop spec: `MIGRATION_PROMPT.md`.
    assigned files and never the state file. Different units may proceed in
    parallel; shared parents wait for all children. With a reachable GLV
    server, run each delegate as a GLV session per `tools/glv-subagents.md`.
+   Mechanize the whole per-unit loop — candidate files, briefs, the bounded
+   verbatim-feedback repair rounds, gate-then-oracle ranking, and the
+   verdict pack for `state.py` — with one command:
+   `tools/delegate.py run-candidates` (issue #33); the state file stays
+   orchestrator-only either way.
 3. Run the mechanical import fixer first — most compile failures are
    mis-imported *real* modules, not hallucinated crates (>50% per
    arXiv:2606.08444).

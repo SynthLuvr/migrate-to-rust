@@ -122,6 +122,12 @@ for unit in backlog (dependency order, leaf-first):
     state.save()   # after EVERY unit — resumable, reversible per unit
 ```
 
+The per-unit candidate loop above — K partitioned translators, the
+mechanical import fix, compile gates with verbatim feedback, oracle
+ranking, and the winner's verdict pack for `state.py` — is mechanized as
+one command by [`tools/delegate.py`](tools/delegate.py)
+`run-candidates` (issue #33); delegates report, the orchestrator records.
+
 Judge = output hash / structured comparison / property tests. **Never an LLM
 judge** (CETBench: unreliable). Every run classified `Equivalent /
 Divergent / Incomparable`; every Divergent carries a written explanation.

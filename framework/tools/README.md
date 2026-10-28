@@ -138,6 +138,58 @@ loop:
   explicit warning (the offline corner); the target root is recorded, so
   re-runs need no flag.
 
+## The stage-4 candidate runner — `delegate.py` (issue #33)
+
+Also a composition layer, not a ninth gap-tool: it mechanizes the repair
+loop's per-unit translator delegation (K candidates, strict file
+partitioning, compile-then-oracle ranking, bounded fix rounds) in ONE
+command, so the orchestrator stops hand-rolling the bookkeeping — the
+failure mode issue #33 documents from a real run (K=1 under budget,
+partitioning by instruction, manual gates and judge invocation, and a
+delegate hitting its turn cap mid-unit):
+
+```console
+python framework/tools/delegate.py run-candidates \
+  --state runs/<project>/migration-state.json --unit u-foo --k 3 \
+  --agent-cmd 'goose session run {brief_file} {feedback_file}'
+```
+
+Per unit it: computes the per-candidate target paths
+(`src/u_<unit>_c1.rs` … `_cK`, following the unit's recorded `rust_path`
+directory) and writes each delegate an assignment **brief** — its own
+file + the contract + the Python source + `roles/translator.md`, nothing
+else (partitioning becomes an artifact, not an instruction); runs each
+candidate through round 0 + up to `MAX_ROUNDS` repair rounds (from the
+unit's `budget.max_rounds`; `--max-rounds` overrides) over a mechanical
+**import gate** (extern crates must be a Cargo.toml dependency, the crate
+itself, or an approved `substitutions.json` entry — most "hallucinated
+crates" are mis-imported real modules) and the compile gates
+(`cargo fmt --check` / `clippy` / `test` by default, `--gate` overrides),
+feeding gate output back **verbatim** through `{feedback_file}` — the
+strongest signal, per the loop spec, and the reason the template must
+reference that placeholder whenever repair rounds are possible; then
+builds the wheel once (`--build-cmd`, default `maturin develop`) and
+judges **only the gate-green candidates**, one `oracle.py judge` run each
+via a derived manifest that retargets the scaffolded candidate adapter
+(issue #32) at that candidate's wheel module
+(`--candidate-module 'mycrate.units.u_foo_{candidate}'`); and prints the
+ranked table (equivalent/divergent/incomparable counts, diff-kind
+histogram) with the winner.
+
+**It never writes the state file** — the orchestrator/driver stays the
+only writer (role separation). It emits a JSON verdict pack (stdout +
+`<state_dir>/delegates/<unit>/verdict-pack.json`) carrying the ranking,
+per-round evidence (agent exits, gate outputs, `-->`-span attribution,
+the exact failing diff on stall), ready-to-run `state.py set`/`mark`
+commands, and per-unit `sessions[]` entries. Runner-agnostic
+(`--agent-cmd` is a template — goose / Claude Code / Codex all fit, the
+same pattern `pipeline.py run` uses) and restartable anywhere in the
+loop (issue #25): re-runs re-derive everything from disk, `--only c2,c3`
+resumes a subset after a budget-exhausted hand-off, `--dry-run` prints
+the derived plan. Exit codes: 0 winner equivalent · 2 divergent winner /
+no gate-green candidate / budget-exhausted refusal · 3 all judged
+incomparable · 4 wheel-build failure.
+
 ## Minimal viable subset
 If you only build three things before starting: **#1 oracle**, **#4 state**,
 **#7 attribution**. The oracle is the difference between a migration and the
@@ -206,6 +258,16 @@ python framework/tools/pipeline.py run state.json \
   --agent-cmd 'goose run --recipe {framework}/recipe.yaml' --autonomy L2
 python framework/tools/pipeline.py resolve-gates state.json   # policy only, no agent
 python framework/tools/pipeline.py status|report state.json
+
+# the stage-4 candidate runner (issue #33): K translators, partitioned
+# files, bounded verbatim-feedback repair rounds, oracle ranking, verdict
+# pack — one command per unit; the state file stays orchestrator-only
+python framework/tools/delegate.py run-candidates --state state.json --unit u-foo \
+  --k 3 --agent-cmd 'goose session run {brief_file} {feedback_file}' \
+  --target-root /abs/target \
+  --candidate-module 'mycrate.units.u_foo_{candidate}'   # scaffolded manifest
+python framework/tools/delegate.py run-candidates --state state.json --unit u-foo \
+  --only c2,c3 --agent-cmd '...'   # resume mid-loop (issue #25)
 
 # #2 / #3 feed Stage 1 → Stage 2  (plan takes from-cprofile's envelope as-is)
 python framework/tools/port_plan.py from-cprofile --profile run.prof > hotspots.json
