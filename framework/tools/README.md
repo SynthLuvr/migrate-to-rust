@@ -295,6 +295,8 @@ python framework/tools/oracle.py judge --manifest runs/manifests/u-bars.json
 # #4 the only writer of the state file
 python framework/tools/state.py init state/migration-state.json --name X --python-path src/x --autonomy-level L2
 python framework/tools/state.py set  state.json --field 'units[u1].status=ported'
+python framework/tools/state.py set  state.json --field 'project.workload=plain string' \
+                                       --field '@json:go_no_go={"decision":"pending"}'
 python framework/tools/state.py mark state.json --unit u1 --status escalated --note "..."
 python framework/tools/state.py resolve-gate state.json --gate go_no_go --decision approved --by policy:GO-1
 python framework/tools/state.py shim state.json --unit u1 --write shims/u1.py
