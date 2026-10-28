@@ -148,8 +148,8 @@ That command produced [`oracle/u-tokenize-1.verdict.json`](oracle/u-tokenize-1.v
 byte-for-byte except two path fields the tool absolutizes (`manifest`,
 `corpus.path`, relativized here) and `generated_at` (the run timestamp).
 Everything verdict-relevant — `runs[]`, `counts`, `diff_kind_histogram`,
-`verdicts_digest` (`c17b3f2f4feb6613`), `normalization` — is deterministic
-and will match on any machine.
+`verdicts_digest` (`c17b3f2f4feb6613`), `ground_truth`, `normalization` —
+is deterministic and will match on any machine.
 
 Why each run classifies the way it does:
 
@@ -164,6 +164,14 @@ Run 1 is one of the 5 canonical bug classes `oracle.py self-test` injects
 `caught: 5/5`). Run 2 is the honest verdict: the unit's legacy API returns
 a set, so it needs a canonical adapter (`sorted(list(s))`) before it can be
 judged at all — "incomparable" is never a synonym for "close enough".
+
+The verdict also carries the ground-truth guard's warning (issue #30): the
+reference produced a value on only 1 of 3 rows (33% < the default
+`min_reference_ok_fraction` of 0.5), so the summary warns that the verdict
+rests on thin ground truth even though it is honestly DIVERGENT. Had the
+reference errored on *every* row — a corpus degenerate for this entry —
+the summary would classify INCOMPARABLE, never EQUIVALENT, because
+error==error matches are not parity evidence.
 
 The manifest also shows normalization overrides in place
 (`error_compare: type-and-message`); the full rule set is documentation,

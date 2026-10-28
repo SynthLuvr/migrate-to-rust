@@ -255,3 +255,218 @@ def test_corpus_validate_also_refuses_prewrapped(monkeypatch, capsys, tmp_path):
     assert code == 1
     assert out["error"]["kind"] == "usage"
     assert "pre-wrapped" in out["error"]["detail"]
+
+
+# ---------------------------------------------------------- issue #30 ----
+# A corpus whose every row the reference implementation rejects used to
+# judge 40/40 EQUIVALENT (compare_error calls error==error equivalent per
+# run) — a hollow pass: not one row had ground truth. The summary verdict
+# must be INCOMPARABLE, never EQUIVALENT; error-path mismatches on such a
+# corpus are corpus artifacts, not candidate defects.
+
+def _degenerate_scaffold(tmp_path, cand_src=None):
+    """Manifest whose reference rejects every corpus row; the candidate
+    errors identically unless ``cand_src`` says otherwise."""
+    ref_src = "def run(v):\n    raise TypeError('rows are not what the reference expects')\n"
+    (tmp_path / "impl.py").write_text(ref_src)
+    (tmp_path / "cand.py").write_text(cand_src or ref_src)
+    (tmp_path / "corpus.jsonl").write_text("\n".join(
+        json.dumps({"x": i}) for i in range(4)) + "\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "unit": "u-30",
+        "reference": {"entry": "impl:run"},
+        "candidate": {"entry": "cand:run"},
+        "corpus": "corpus.jsonl",
+    }))
+    return manifest
+
+
+def test_judge_all_error_reference_corpus_is_incomparable(monkeypatch, capsys, tmp_path):
+    # the exact Stage-2 scenario: both sides raise the SAME exception on
+    # every row -> 4/4 per-run equivalent, zero ground truth
+    manifest = _degenerate_scaffold(tmp_path)
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["judge", "--manifest", str(manifest)])
+    assert code == 3
+    assert out["verdict"] == "incomparable"       # never EQUIVALENT
+    assert out["counts"] == {"equivalent": 4, "divergent": 0, "incomparable": 0}
+    assert out["ground_truth"] == {
+        "reference_ok": 0, "runs": 4, "reference_ok_fraction": 0.0,
+        "min_reference_ok_fraction": 0.5, "degenerate": True,
+        "detail": "reference errored on every corpus row — corpus is "
+                  "degenerate for this entry",
+        "warning": None,
+    }
+    assert "INCOMPARABLE" in out["summary"]["human"]
+    assert "degenerate" in out["summary"]["human"]
+    assert "not parity evidence" in out["summary"]["human"]
+
+
+def test_degenerate_overrides_divergent_error_pairs(monkeypatch, capsys, tmp_path):
+    # candidate raises a DIFFERENT exception on every row: per-run divergent,
+    # but with zero reference ground truth the summary stays INCOMPARABLE —
+    # the error-path evidence is kept for the operator, it just cannot gate
+    manifest = _degenerate_scaffold(
+        tmp_path, cand_src="def run(v):\n    raise KeyError('different')\n")
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["judge", "--manifest", str(manifest)])
+    assert code == 3
+    assert out["verdict"] == "incomparable"
+    assert out["counts"] == {"equivalent": 0, "divergent": 4, "incomparable": 0}
+    assert out["ground_truth"]["degenerate"] is True
+    assert out["diff_kind_histogram"] == {"error-type": 4}
+    assert "corpus artifacts" in out["summary"]["human"]
+
+
+def test_judge_setup_failure_still_incomparable_with_detail(monkeypatch, capsys, tmp_path):
+    # a reference that cannot even be imported: no ground truth on any row
+    manifest = _degenerate_scaffold(
+        tmp_path, cand_src=None)
+    m = json.loads((tmp_path / "manifest.json").read_text())
+    m["reference"] = {"entry": "no_such_module:run"}
+    (tmp_path / "manifest.json").write_text(json.dumps(m))
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["judge", "--manifest", str(manifest)])
+    assert code == 3
+    assert out["verdict"] == "incomparable"
+    assert out["counts"]["incomparable"] == 4
+    assert out["ground_truth"]["degenerate"] is True
+    assert "failed to run" in out["ground_truth"]["detail"]
+    assert "no ground truth on any row" in out["ground_truth"]["detail"]
+
+
+def test_compare_all_error_reference_runs_is_incomparable(monkeypatch, capsys, tmp_path):
+    # shadow-mode (Stage 6) pre-captured runs get the same guard
+    runs = tmp_path / "runs.json"
+    err = {"type": "TypeError", "message": "m"}
+    runs.write_text(json.dumps({
+        "unit": "u-30",
+        "reference": [{"i": i, "ok": False, "error": err} for i in range(2)],
+        "candidate": [{"i": i, "ok": False, "error": err} for i in range(2)],
+    }))
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["compare", "--runs", str(runs)])
+    assert code == 3
+    assert out["verdict"] == "incomparable"
+    assert out["counts"]["equivalent"] == 2
+    assert out["ground_truth"]["degenerate"] is True
+
+
+def test_thin_ground_truth_warns_but_can_stay_equivalent(monkeypatch, capsys, tmp_path):
+    # 1 of 4 reference rows ok (25% < the default 50%): the verdict can
+    # still be equivalent, but the warning fires — nobody should believe a
+    # green verdict built on a mostly-rejected corpus without seeing it
+    src = ("def run(v):\n"
+           "    if v['bad']:\n"
+           "        raise ValueError('bad input')\n"
+           "    return {'n': len(v['xs'])}\n")
+    (tmp_path / "impl.py").write_text(src)
+    (tmp_path / "cand.py").write_text(src)
+    (tmp_path / "corpus.jsonl").write_text("\n".join(
+        json.dumps({"xs": [i], "bad": i > 0}) for i in range(4)) + "\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "unit": "u-thin", "reference": {"entry": "impl:run"},
+        "candidate": {"entry": "cand:run"}, "corpus": "corpus.jsonl",
+    }))
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["judge", "--manifest", str(manifest)])
+    assert code == 0
+    assert out["verdict"] == "equivalent"
+    assert out["counts"]["equivalent"] == 4
+    gt = out["ground_truth"]
+    assert gt["degenerate"] is False
+    assert gt["reference_ok"] == 1 and gt["reference_ok_fraction"] == 0.25
+    assert "1/4" in gt["warning"] and "min_reference_ok_fraction" in gt["warning"]
+    assert "WARNING" in out["summary"]["human"]
+
+
+def test_min_reference_ok_fraction_is_configurable(monkeypatch, capsys, tmp_path):
+    # same 1/4-ok runs: 0.2 admits 25%, 0 silences the warning entirely
+    ok = {"i": 0, "ok": True, "value": {"n": 1}}
+    bad = [{"i": i, "ok": False, "error": {"type": "ValueError", "message": "bad"}}
+           for i in (1, 2, 3)]
+    for frac, warns in ((0.2, False), (0.0, False), (0.5, True)):
+        runs = tmp_path / f"runs-{frac}.json"
+        runs.write_text(json.dumps({
+            "unit": "u-thin",
+            "normalization": {"min_reference_ok_fraction": frac},
+            "reference": [ok] + bad, "candidate": [ok] + bad,
+        }))
+        code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                             ["compare", "--runs", str(runs)])
+        assert code == 0 and out["verdict"] == "equivalent"
+        assert out["ground_truth"]["min_reference_ok_fraction"] == frac
+        assert (out["ground_truth"]["warning"] is not None) is warns
+
+
+def test_zero_ok_guard_cannot_be_disabled(monkeypatch, capsys, tmp_path):
+    # min_reference_ok_fraction=0 only silences the WARNING; the zero-ok
+    # INCOMPARABLE guard itself is not optional (the guard belongs in the
+    # judge, not in the operator's discipline)
+    runs = tmp_path / "runs.json"
+    err = {"type": "TypeError", "message": "m"}
+    runs.write_text(json.dumps({
+        "unit": "u-30",
+        "normalization": {"min_reference_ok_fraction": 0},
+        "reference": [{"i": i, "ok": False, "error": err} for i in range(2)],
+        "candidate": [{"i": i, "ok": False, "error": err} for i in range(2)],
+    }))
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["compare", "--runs", str(runs)])
+    assert code == 3
+    assert out["verdict"] == "incomparable"
+    assert out["ground_truth"]["degenerate"] is True
+    assert out["ground_truth"]["warning"] is None
+
+
+def test_bad_min_reference_ok_fraction_is_refused(monkeypatch, capsys, tmp_path):
+    for bad in (1.5, True, "half"):
+        runs = tmp_path / "runs.json"
+        runs.write_text(json.dumps({
+            "unit": "u", "normalization": {"min_reference_ok_fraction": bad},
+            "reference": [], "candidate": [],
+        }))
+        code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                             ["compare", "--runs", str(runs)])
+        assert code == 1
+        assert out["error"]["kind"] == "usage"
+        assert "min_reference_ok_fraction" in out["error"]["detail"]
+
+
+def test_rules_document_min_reference_ok_fraction(monkeypatch, capsys):
+    _, out = run_tool(monkeypatch, capsys, "oracle.py", ["rules"])
+    assert out["defaults"]["min_reference_ok_fraction"] == 0.5
+    assert "INCOMPARABLE" in out["docs"]["min_reference_ok_fraction"]
+    assert "zero ok reference runs" in out["docs"]["min_reference_ok_fraction"]
+
+
+def test_self_test_proves_the_degenerate_corpus_guard(monkeypatch, capsys):
+    _, out = run_tool(monkeypatch, capsys, "oracle.py", ["self-test"])
+    guard = out["degenerate_corpus_guard"]
+    assert guard["held"] is True
+    assert guard["summary_verdict"] == "incomparable"
+    assert guard["per_run_equivalent"] == 2   # error==error pairs...
+    assert guard["reference_ok"] == 0         # ...with zero ground truth
+    assert "guard held" in out["summary"]["human"]
+
+
+def test_corpus_validate_warns_on_thin_ground_truth(monkeypatch, capsys, tmp_path):
+    # 1 of 4 rows ok: not hollow (a value was produced) but below the
+    # judge's default threshold — the dry-run warns before a judge run
+    (tmp_path / "impl.py").write_text(
+        "def run(v):\n"
+        "    if v['bad']:\n"
+        "        raise ValueError('bad input')\n"
+        "    return {'n': len(v['xs'])}\n")
+    (tmp_path / "corpus.jsonl").write_text("\n".join(
+        json.dumps({"xs": [i], "bad": i > 0}) for i in range(4)) + "\n")
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["corpus", "--validate", str(tmp_path / "corpus.jsonl"),
+                          "--entry", "impl:run"])
+    assert code == 2  # three error rows
+    assert out["hollow_equivalent_risk"] is False
+    assert out["reference_ok_fraction"] == 0.25
+    assert out["warning"] and "1/4" in out["warning"]
+    assert "THIN" in out["summary"]["human"]

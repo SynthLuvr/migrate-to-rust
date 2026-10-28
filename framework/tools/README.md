@@ -90,7 +90,8 @@ Uniform conventions (so the agent can compose the tools blind):
   every exit path; genuine programming errors still crash loudly.
 - **Exit codes**: `0` clean · `1` usage/IO · `2` findings (divergence,
   attribution loss, lint errors, cycles, human decision needed) · `3`
-  incomparable-without-divergence · `4` setup failure (e.g. no pytest).
+  incomparable (no divergence, or a degenerate all-error reference corpus)
+  · `4` setup failure (e.g. no pytest).
 - **Determinism**: fixed seeds (`PYTHONHASHSEED=0` for children, seeded
   bootstrap in #5), sorted iteration, no wall-clock in verdict fields.
   `oracle.py` emits a `verdicts_digest` — identical inputs+rules must give
@@ -144,9 +145,12 @@ when streaming a corpus to a child process — it is **never** the corpus
 file format. Pre-wrapped lines double-wrap, both sides raise the same
 TypeError on every run, and the judge reports a hollow all-EQUIVALENT
 verdict, so `_load_corpus` refuses a corpus in which every line carries
-exactly the framing keys (issue #29). `oracle.py corpus --validate`
+exactly the framing keys (issue #29), and even past that guard the judge's
+ground-truth rule classifies an all-error reference corpus INCOMPARABLE,
+never EQUIVALENT (issue #30). `oracle.py corpus --validate`
 dry-runs one entry per-row (ok / error / unserializable) and flags the
-hollow signature (`hollow_equivalent_risk`) before you spend a judge run.
+hollow signature (`hollow_equivalent_risk`) plus thin ground truth before
+you spend a judge run.
 
 Design decisions worth knowing before you extend:
 
@@ -162,6 +166,17 @@ Design decisions worth knowing before you extend:
   divergence, not a normalization. `self-test` injects the 5 canonical bug
   classes through the *production* judging path (no special-cased
   verdicts) and also proves benign differences are forgiven.
+  **Ground-truth guard (issue #30)**: a corpus on which the reference side
+  has zero `ok:true` runs is degenerate — `compare_error` rightly calls
+  error==error equivalent *per run*, but a run set with no successful
+  reference output carries no parity evidence, so the summary verdict is
+  INCOMPARABLE, never EQUIVALENT (error-path mismatches on such a corpus
+  are corpus artifacts, not candidate defects). The
+  `normalization.min_reference_ok_fraction` rule (default 0.5, in `rules`
+  output) warns when fewer reference runs succeeded; 0 silences the
+  warning, the zero-ok guard itself cannot be disabled. `bench.py`'s
+  parity gate imports the same guard: a degenerate corpus aborts the
+  benchmark with no timing claim.
 - **state.py** journals every transition into the state file's own
   `journal[]` (append-only; `set`/`mark` refuse to touch it), writes
   atomically (tmp + rename), and *rolls back* any change that would leave
@@ -195,9 +210,10 @@ Design decisions worth knowing before you extend:
   `context: diff` (re-run file mode before recording a verdict). Findings
   cite the reviewer-checklist item they encode.
 - **bench.py** runs the parity gate *first* and aborts without any timing
-  claim on divergence; refuses a dirty corpus; ships a self-contained
-  repro script pinning the corpus commit; timing stats use a seeded
-  bootstrap CI.
+  claim on divergence — or on a degenerate corpus whose reference side
+  errors on every row (issue #30: no ground truth, no number); refuses a
+  dirty corpus; ships a self-contained repro script pinning the corpus
+  commit; timing stats use a seeded bootstrap CI.
 - **upstream_watch.py** never silently skips: changed files map to units
   (exact path or package-unit prefix), unmapped files are listed with
   reasons, dependents join the re-run plan transitively, and
