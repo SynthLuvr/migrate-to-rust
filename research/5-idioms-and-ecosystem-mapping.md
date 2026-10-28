@@ -108,6 +108,32 @@
 
 An AI framework generating PyO3 code must emit the **current API generation** (Bound API + attach/detach + derive macros) and pin a documented target version, because tutorials older than 0.23 (and even 0.23–0.27 free-threading defaults) produce code that is deprecated or wrong today.
 
+### PyO3 signature-binding traps (✅V — reproduced on PyO3 0.29.0 + CPython 3.15.1, 2026-10-28; first hit in a real port run, framework issue #56)
+
+Two traps a port run hit 3× in one session; both escape tests and surface only as late oracle parity failures because the oracle compares errors **type-and-message**:
+
+1. **`Option<T>` parameters conflate an omitted argument with an explicit Python `None` — both extract to `None`.** All arguments are required unless a `#[pyo3(signature = (...))]` default gives them one ✅V [39], and the signature default is *arbitrary Rust code inserted unmodified* ✅V [39] — so a `Py`-typed parameter's only spellable default is `None`, which is precisely the conflation. For loose-input Python APIs where the default is **observable** *and* explicit `None` is **legal input**, the two must diverge:
+   - `to_float(value, default=0.0)` / `to_int(value, default=0)`: callers pass `default=None` for "give me `None` back on junk" (omitted → `0.0`/`0`; explicit `None` → `None` returned verbatim). The naive `default: Option<Py<PyAny>>` + `match`/`unwrap_or` port returns the same value for both (verified: returns `None` where Python returns `0.0` — a `null`-vs-`float` divergence).
+   - `calculate_atr(highs, lows, closes, period=14)`: Python evaluates `period + 1` first, so `period=None` raises `TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'` while omitted → `14`.
+
+   **Working pattern — manual binding** (verified equivalent on 3.15.1):
+
+   ```rust
+   #[pyfunction]
+   #[pyo3(signature = (*args))]
+   fn to_float(py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
+       // get_item(i) per arg; omitted (args.len() <= i) → literal default;
+       // is_none() → Python semantics (None in, None out)
+   }
+   ```
+
+   Corollary: because defaults are Rust expressions, a custom `FromPyObject` type with a `Default` impl *can* carry a non-`None` default, but a plain literal cannot feed a `PyAny`-typed parameter ✅V [39]. `pyo3_review.py` rule `PYO3-OPTION` lints `Option<Py<PyAny>>`-style parameters on exported functions as a warning (framework/roles/reviewer.md §2).
+2. **CPython `TypeError` wording differs per operator class** (✅V reproduced on CPython 3.15.1 and 3.10.12, 2026-10-28 — stable across those versions):
+   - arithmetic operators: `unsupported operand type(s) for *: 'NoneType' and 'float'` (operands in call order, space-separated);
+   - comparisons: `'<' not supported between instances of 'float' and 'NoneType'`.
+
+   A port that formats one wording for both classes diverges **byte-wise** on a whole error class — caught only by type-and-message oracle comparison. Any hand-built `TypeError` at the boundary must pick the wording by operator class (and preserve operand order).
+
 ---
 
 ## (e) Performance gotchas — when a Rust rewrite helps and when it doesn't
@@ -184,5 +210,6 @@ An AI framework generating PyO3 code must emit the **current API generation** (B
 | 36 | Charlie Marsh — *Ruff: An Extremely Fast Python Linter…* (PyCon talk) — https://www.youtube.com/watch?v=r1EZ3GXuwBA | ✅V |
 | 37 | "Snek in Rust" (Carl Meyer, pypackers.org) — https://www.pypackers.org/p/snek-in-rust | ⚠️U (treat as secondary) |
 | 38 | astral.sh/blog/ruff announcement | ⚠️U (use [35]/[36] instead) |
+| 39 | PyO3 user guide — Function signatures (required-by-default args, `arg=Value` defaults are Rust code inserted unmodified) — https://pyo3.rs/main/function/signature | ✅V 2026-10-28 |
 
-*Legend: ✅V = verified live 2026-10-25 · ◐C = canonical stable reference, not re-fetched · ⚠️U = unverified/flagged.*
+*Legend: ✅V = verified live 2026-10-25 (or as noted inline) · ◐C = canonical stable reference, not re-fetched · ⚠️U = unverified/flagged.*
