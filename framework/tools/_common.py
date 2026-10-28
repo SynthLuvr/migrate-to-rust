@@ -164,9 +164,8 @@ def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,
               env_extra: dict[str, str] | None = None) -> tuple[int, str, str]:
     """Deterministic child-process helper: fixed env additions, captured
     stdout/stderr, hard timeout. `env_extra` layers caller variables on top
-    (e.g. a per-unit CARGO_TARGET_DIR — build isolation, delegate.py
-    issue #55) without loosening the fixed ones. Returns (returncode,
-    stdout, stderr)."""
+    (e.g. a per-unit CARGO_TARGET_DIR) without loosening the fixed ones.
+    Returns (returncode, stdout, stderr)."""
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = "0"
     env["PYTHONDONTWRITEBYTECODE"] = "1"

@@ -517,6 +517,20 @@ def _contended_world(tmp_path):
     return proj, state, runs
 
 
+def _iso_scripts(tmp_path):
+    """The isolation-aware stubs: an agent that always writes a green
+    candidate, and a gate that asserts where it runs (sandbox or real
+    crate, per ISO_EXPECT) and fails the candidate named in FAIL_FOR."""
+    agent = tmp_path / "agent.py"
+    agent.write_text(AGENT_SCRIPT)
+    gate = tmp_path / "iso-gate.py"
+    gate.write_text(ISO_GATE_SCRIPT)
+    agent_cmd = (f"{sys.executable} {agent} always {{candidate}} "
+                 f"{{rust_file}} {{feedback_file}} {{round}}")
+    gate_cmd = f"{sys.executable} {gate} {{rust_file}} {{target_root}}"
+    return agent_cmd, gate_cmd
+
+
 def test_gates_run_in_a_per_candidate_sandbox(monkeypatch, capsys, tmp_path):
     """The default: each candidate's gates run in a sandbox copy of the
     crate carrying ONLY that candidate's module (file + mod line), under
@@ -524,13 +538,7 @@ def test_gates_run_in_a_per_candidate_sandbox(monkeypatch, capsys, tmp_path):
     file cannot fail this candidate's verify loop, and the REAL crate is
     never mutated (it stays the delegates' authoritative tree)."""
     proj, state, runs = _contended_world(tmp_path)
-    agent = tmp_path / "agent.py"
-    agent.write_text(AGENT_SCRIPT)
-    gate = tmp_path / "iso_gate.py"
-    gate.write_text(ISO_GATE_SCRIPT)
-    agent_cmd = f"{sys.executable} {agent} always {{candidate}} " \
-                f"{{rust_file}} {{feedback_file}} {{round}}"
-    gate_cmd = f"{sys.executable} {gate} {{rust_file}} {{target_root}}"
+    agent_cmd, gate_cmd = _iso_scripts(tmp_path)
     monkeypatch.setenv("ISO_EXPECT", "1")
 
     code, out = _run(monkeypatch, capsys, state, proj, agent_cmd, gate_cmd,
@@ -569,16 +577,10 @@ def test_wheel_build_sandbox_carries_only_green_candidates(
     candidates ride it — a stalled candidate's half-written module cannot
     fail the winners' wheel build."""
     proj, state, runs = _contended_world(tmp_path)
-    agent = tmp_path / "agent.py"
-    agent.write_text(AGENT_SCRIPT)
-    gate = tmp_path / "iso_gate.py"
-    gate.write_text(ISO_GATE_SCRIPT)
+    agent_cmd, gate_cmd = _iso_scripts(tmp_path)
     build_rec = tmp_path / "build-rec.json"
     build = tmp_path / "iso_build.py"
     build.write_text(ISO_BUILD_SCRIPT)
-    agent_cmd = f"{sys.executable} {agent} always {{candidate}} " \
-                f"{{rust_file}} {{feedback_file}} {{round}}"
-    gate_cmd = f"{sys.executable} {gate} {{rust_file}} {{target_root}}"
     build_cmd = f"{sys.executable} {build} {build_rec}"
     monkeypatch.setenv("ISO_EXPECT", "1")
     monkeypatch.setenv("FAIL_FOR", "c2")        # c2 stalls red, c1/c3 green
@@ -607,13 +609,7 @@ def test_no_isolate_builds_shares_the_real_crate(monkeypatch, capsys,
     """--no-isolate-builds restores the pre-#55 behavior: gates run in the
     REAL crate with the ambient target dir — siblings and all."""
     proj, state, runs = _contended_world(tmp_path)
-    agent = tmp_path / "agent.py"
-    agent.write_text(AGENT_SCRIPT)
-    gate = tmp_path / "iso_gate.py"
-    gate.write_text(ISO_GATE_SCRIPT)
-    agent_cmd = f"{sys.executable} {agent} always {{candidate}} " \
-                f"{{rust_file}} {{feedback_file}} {{round}}"
-    gate_cmd = f"{sys.executable} {gate} {{rust_file}} {{target_root}}"
+    agent_cmd, gate_cmd = _iso_scripts(tmp_path)
     monkeypatch.delenv("ISO_EXPECT", raising=False)
 
     code, out = _run(monkeypatch, capsys, state, proj, agent_cmd, gate_cmd,
