@@ -190,6 +190,57 @@ the derived plan. Exit codes: 0 winner equivalent · 2 divergent winner /
 no gate-green candidate / budget-exhausted refusal · 3 all judged
 incomparable · 4 wheel-build failure.
 
+## The matched-corpus A/B harness — `bench_ab.py` (issue #34)
+
+Also a composition layer, not a ninth gap-tool: three gates require the
+same evidence shape — **the same measured workload, Python path vs ported
+path** — and until now that measurement had to be planned by hand (run the
+target bench with the shim env var set vs unset, diff timings, verify
+payload identity): exactly the step an operator skips when a run ends
+budget-exhausted. `bench_ab.py` is that plan as a command:
+
+```console
+python framework/tools/bench_ab.py --state runs/<project>/migration-state.json \
+  --out runs/<project>/bench/ --gate go_no_go \
+  -- python -m pytest bench/            # the target's own bench command
+```
+
+It derives the shim env var exactly as `state.py shim` does (the function
+is imported, so the derivation cannot drift) and the unit set actually
+live on the rust side (`ported`/`divergent_explained`; `retired` units
+have no callable fallback), then runs the given command once per side,
+**interleaved python-first** so drift hits both sides equally: the python
+side with `<PREFIX>_FALLBACK=<ported-unit-ids>`, the ported side with
+`<PREFIX>_FALLBACK=none` (both set explicitly — an ambient value cannot
+leak into a side). Per run it captures wall/user/sys time (child CPU via
+`os.times()` deltas), stdout/stderr artifacts with sha256, and — the point
+of the whole exercise — **byte-identity of the payloads**: divergent
+stdout aborts with NO ratio claim (timing without identity proves
+nothing); `--mask REGEX` may hide known-volatile fields (printed
+durations), recorded as `masked_identical`, never as `identical`. A side
+that fails or times out is findings (exit 2), never a benchmark.
+
+The emitted artifact (`<out>/bench-ab.json`, verbatim what stdout
+carried) is vendor-rot-proof per the "speed number without a repro
+script" failure mode: command, corpus pinning (`--corpus` hashed +
+git-committed like `bench.py`, `--corpus-desc` for the description), both
+sides' timings, the seeded bootstrap ratio (imported from `bench.py`),
+output hashes, the state file's rust-live unit set + sha256, and a
+self-contained `bench-ab.repro.sh` that re-runs both sides with the exact
+env assignments and warns when the target repo's HEAD moved.
+
+`--gate {go_no_go,redesign_approval,cutover}` additionally writes the
+measurement into the state file as gate evidence — through `state.py`'s
+journaled, validated writer (`merge_evidence` + `save_validated`; never a
+hand-edit): `bench_improvement_pct=` (the exact key RED-1 reads),
+`end_to_end_saving_pct=` (GO-1), plus ratio/identity/artifact provenance.
+`pipeline.py resolve-gates` consumes it, and `_eval_go_no_go` **prefers
+the measured `end_to_end_saving_pct` over the Stage-0 projection** — the
+bar was a claim until a matched benchmark existed. Gate evidence is
+refused (nothing written, exit 2) when outputs diverge: no honest claim
+to record. Stdout is always one JSON object; exit 0 verdict · 2 findings
+(divergence/failed run) · 1 usage/IO.
+
 ## Minimal viable subset
 If you only build three things before starting: **#1 oracle**, **#4 state**,
 **#7 attribution**. The oracle is the difference between a migration and the
@@ -268,6 +319,13 @@ python framework/tools/delegate.py run-candidates --state state.json --unit u-fo
   --candidate-module 'mycrate.units.u_foo_{candidate}'   # scaffolded manifest
 python framework/tools/delegate.py run-candidates --state state.json --unit u-foo \
   --only c2,c3 --agent-cmd '...'   # resume mid-loop (issue #25)
+
+# the matched-corpus A/B harness (issue #34): same measured workload,
+# python fallback vs ported, identity-gated timing + repro — and the
+# measurement lands on the gate as evidence resolve-gates consumes
+python framework/tools/bench_ab.py --state state.json \
+  --gate go_no_go --corpus bench/corpus.jsonl \
+  -- python -m pytest bench/            # the target's own bench command
 
 # #2 / #3 feed Stage 1 → Stage 2  (plan takes from-cprofile's envelope as-is)
 python framework/tools/port_plan.py from-cprofile --profile run.prof > hotspots.json
@@ -364,6 +422,13 @@ Design decisions worth knowing before you extend:
   errors on every row (issue #30: no ground truth, no number); refuses a
   dirty corpus; ships a self-contained repro script pinning the corpus
   commit; timing stats use a seeded bootstrap CI.
+- **bench_ab.py** (issue #34) A/Bs the target's own bench command through
+  the shim env var both ways; identity gates the claim exactly as
+  bench.py's parity gate does (stdout is the payload — stderr divergence
+  warns, never aborts); its `--gate` writes go through `state.py`'s
+  journaled writer and are refused outright on divergent outputs, and
+  `_eval_go_no_go` prefers the measured `end_to_end_saving_pct` over the
+  Stage-0 projection (a projection is a claim until measured).
 - **upstream_watch.py** never silently skips: changed files map to units
   (exact path or package-unit prefix), unmapped files are listed with
   reasons, dependents join the re-run plan transitively, and

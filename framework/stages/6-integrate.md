@@ -22,6 +22,13 @@ Purpose: ship the wheel and move traffic, reversibly.
 6. Keep the dual-build state: per-unit Python fallback remains callable until
    Stage 7 retires it deliberately.
 7. Document the rollback path (previous wheel pin) in the release notes.
+8. **Re-measure end-to-end with the ported units live** — the honest-reporting
+   rule ("port wasn't the win → report honestly") is a measurement, not an
+   opinion: `tools/bench_ab.py` runs the target's own bench command through
+   the shim both ways (Python fallback vs ported), gates the timing on
+   byte-identical payloads, and records the result on the gate as evidence
+   (`--gate`) — GO-1 reads the measured `end_to_end_saving_pct` over the
+   Stage-0 projection.
 
 ## Exit criteria
 - [ ] Shadow diff window clean (rate agreed with the operator/policy)
