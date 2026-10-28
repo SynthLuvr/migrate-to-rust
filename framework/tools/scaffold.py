@@ -450,9 +450,9 @@ def _pick_function(tree: ast.Module, module_stem: str, override: str | None):
 
 def _select_module_functions(tree: ast.Module, overrides: list[str]):
     """The public functions a module-conformance scaffold judges (issue
-    #48): all of them, or the --function subset (repeatable /
-    comma-separated). Unknown names are a usage error listing what exists,
-    not silence. Returns (functions, how) with how ∈ all-public | flag."""
+    #48): all of them, or the --function subset. Unknown names are a usage
+    error listing what exists, not silence. Returns (functions, how) with
+    how ∈ all-public | flag."""
     fns = _public_functions(tree)
     known = sorted(f.name for f in fns)
     if overrides:
@@ -461,7 +461,8 @@ def _select_module_functions(tree: ast.Module, overrides: list[str]):
             raise ToolError(f"--function {unknown} is not a public function in "
                             f"the unit module; public functions: {known}",
                             kind="usage")
-        return [f for f in fns if f.name in set(overrides)], "flag"
+        wanted = set(overrides)
+        return [f for f in fns if f.name in wanted], "flag"
     if not fns:
         raise ToolError("unit module has no public module-level function to scaffold "
                         "(classes and private helpers are not oracle entries)", kind="usage")
@@ -655,13 +656,17 @@ UNIT = @@UNIT_REPR@@
 # ==== END BACKEND =========================================================
 
 
-def _resolve_module(rel_path: str, dotted: str):
-    """Import a project module by dotted name (both layout spellings,
-    issue #26) with the project root(s) on sys.path; fall back to loading
-    the file by path. Used for the reference unit and for dataclasses."""
+def _ensure_roots():
+    """PROJECT_ROOT and its src/ layout on sys.path (issue #26)."""
     for r in (PROJECT_ROOT, os.path.join(PROJECT_ROOT, "src")):
         if os.path.isdir(r) and r not in sys.path:
             sys.path.insert(0, r)
+
+
+def _resolve_module(rel_path: str, dotted: str):
+    """Import a project module by dotted name, falling back to loading the
+    file by path. Used for the reference unit and for dataclasses."""
+    _ensure_roots()
     try:
         return importlib.import_module(dotted)
     except ImportError:
@@ -675,6 +680,15 @@ def _resolve_module(rel_path: str, dotted: str):
 
 def _dc_class(spec):
     return getattr(_resolve_module(spec["path"], spec["module"]), spec["name"])
+
+
+def _require_exports(mod, names, owner, remedy):
+    """Every judged export must exist — a missing one is a setup error
+    naming it (issue #48), never a silent gap in the verdict."""
+    missing = [n for n in names if not hasattr(mod, n)]
+    if missing:
+        raise ImportError(f"{owner} exposes no {missing} — {remedy}")
+    return {n: getattr(mod, n) for n in names}
 
 
 def _shape_ok(value, spec) -> bool:
@@ -952,119 +966,101 @@ LOAD_CALL_MODULE = '''FNS = _load_functions()  # a failure here is a setup error
                          # oracle.py reports it honestly (exit 4) instead of
                          # judging half an adapter'''
 
-REF_BACKEND = '''# Reference side: import the ORIGINAL python unit. PROJECT_ROOT is where
+# The BACKEND sections are composed per side: each side's constants and
+# import dance (_load_module) are shared between function and module mode;
+# only the loader tail differs (one function vs every judged export).
+
+REF_HEADER = '''# Reference side: import the ORIGINAL python unit. PROJECT_ROOT is where
 # scaffold.py ran; override with MIGRATE_PROJECT_ROOT to relocate the run.
 PROJECT_ROOT = os.environ.get("MIGRATE_PROJECT_ROOT", @@ROOT_REPR@@)
 _MODULE_CANDIDATES = @@MODULE_CANDIDATES@@  # layout-stripped + src-prefixed (issue #26)
 _UNIT_PATH = @@UNIT_PATH_REPR@@             # project-relative, for the file fallback
+'''
 
+CAND_HEADER = '''# Candidate side: import the PyO3 wheel. The wheel's module name is NOT
+# knowable at Stage 2 scaffold time — set CANDIDATE_MODULE below (or re-run
+# scaffold.py with --candidate-module <module> --force at Stage 4) before
+# judging. Until then importing this adapter is a setup error, which
+# oracle.py reports honestly instead of judging half an adapter.
+CANDIDATE_MODULE = @@CANDIDATE_MODULE@@  # e.g. "mycrate.units.u_bars"
+PROJECT_ROOT = os.environ.get("MIGRATE_PROJECT_ROOT", @@ROOT_REPR@@)
+'''
 
-def _load_function():
-    for r in (PROJECT_ROOT, os.path.join(PROJECT_ROOT, "src")):
-        if os.path.isdir(r) and r not in sys.path:
-            sys.path.insert(0, r)
+REF_IMPORT = '''
+
+def _load_module():
+    """Each dotted spelling of the unit (issue #26), then the file
+    fallback."""
+    _ensure_roots()
     for name in _MODULE_CANDIDATES:
         try:
-            return getattr(importlib.import_module(name), FUNCTION)
+            return importlib.import_module(name)
         except ImportError:
             continue
-    mod = _resolve_module(_UNIT_PATH, _MODULE_CANDIDATES[0])
+    return _resolve_module(_UNIT_PATH, _MODULE_CANDIDATES[0])
+'''
+
+CAND_IMPORT = '''
+
+def _load_module():
+    """The wheel is normally INSTALLED; the source-tree fallback (via
+    _ensure_roots) only serves symmetry checks and pre-wheel smoke tests —
+    it can never shadow an installed wheel."""
+    if not CANDIDATE_MODULE:
+        raise NotImplementedError(
+            "scaffold.py: candidate module not set — the PyO3 wheel is unknown "
+            "at Stage 2. Set CANDIDATE_MODULE (or re-run scaffold.py "
+            "--candidate-module <wheel-module> --force), then re-judge (issue #32).")
     try:
-        return getattr(mod, FUNCTION)
+        return importlib.import_module(CANDIDATE_MODULE)
+    except ImportError:
+        _ensure_roots()
+        return importlib.import_module(CANDIDATE_MODULE)
+'''
+
+REF_FUNCTION_TAIL = '''
+
+def _load_function():
+    try:
+        return getattr(_load_module(), FUNCTION)
     except AttributeError as e:
         raise ImportError(f"reference module {_MODULE_CANDIDATES[0]} exposes no "
                           f"{FUNCTION!r}") from e
 '''
 
-CAND_BACKEND = '''# Candidate side: import the PyO3 wheel. The wheel's module name is NOT
-# knowable at Stage 2 scaffold time — set CANDIDATE_MODULE below (or re-run
-# scaffold.py with --candidate-module <module> --force at Stage 4) before
-# judging. Until then importing this adapter is a setup error, which
-# oracle.py reports honestly instead of judging half an adapter.
-# The wheel is normally INSTALLED, so a plain import is tried first; the
-# source-tree fallback (MIGRATE_PROJECT_ROOT) only serves symmetry checks
-# and pre-wheel smoke tests — it can never shadow an installed wheel.
-CANDIDATE_MODULE = @@CANDIDATE_MODULE@@  # e.g. "mycrate.units.u_bars"
+CAND_FUNCTION_TAIL = '''
+
 _CANDIDATE_FUNCTION = @@FUNCTION_REPR@@  # wheel export name; rename if it differs
-PROJECT_ROOT = os.environ.get("MIGRATE_PROJECT_ROOT", @@ROOT_REPR@@)
 
 
 def _load_function():
-    if not CANDIDATE_MODULE:
-        raise NotImplementedError(
-            "scaffold.py: candidate module not set — the PyO3 wheel is unknown "
-            "at Stage 2. Set CANDIDATE_MODULE (or re-run scaffold.py "
-            "--candidate-module <wheel-module> --force), then re-judge (issue #32).")
-    try:
-        return getattr(importlib.import_module(CANDIDATE_MODULE), _CANDIDATE_FUNCTION)
-    except ImportError:
-        for r in (PROJECT_ROOT, os.path.join(PROJECT_ROOT, "src")):
-            if os.path.isdir(r) and r not in sys.path:
-                sys.path.insert(0, r)
-        return getattr(importlib.import_module(CANDIDATE_MODULE), _CANDIDATE_FUNCTION)
+    return getattr(_load_module(), _CANDIDATE_FUNCTION)
 '''
 
-REF_MODULE_BACKEND = '''# Reference side (module conformance, issue #48): import the ORIGINAL
-# python unit. PROJECT_ROOT is where scaffold.py ran; override with
-# MIGRATE_PROJECT_ROOT to relocate the run.
-PROJECT_ROOT = os.environ.get("MIGRATE_PROJECT_ROOT", @@ROOT_REPR@@)
-_MODULE_CANDIDATES = @@MODULE_CANDIDATES@@  # layout-stripped + src-prefixed (issue #26)
-_UNIT_PATH = @@UNIT_PATH_REPR@@             # project-relative, for the file fallback
-
+REF_MODULE_TAIL = '''
 
 def _load_functions():
-    for r in (PROJECT_ROOT, os.path.join(PROJECT_ROOT, "src")):
-        if os.path.isdir(r) and r not in sys.path:
-            sys.path.insert(0, r)
-    mod = None
-    for name in _MODULE_CANDIDATES:
-        try:
-            mod = importlib.import_module(name)
-            break
-        except ImportError:
-            continue
-    if mod is None:
-        mod = _resolve_module(_UNIT_PATH, _MODULE_CANDIDATES[0])
-    missing = [n for n in FUNCTIONS if not hasattr(mod, n)]
-    if missing:
-        raise ImportError(f"reference module {_MODULE_CANDIDATES[0]} exposes no "
-                          f"{missing} — the unit's whole public API is the "
-                          "contract (issue #48)")
-    return {n: getattr(mod, n) for n in FUNCTIONS}
+    # module conformance (issue #48): every judged export, none missing
+    return _require_exports(_load_module(), FUNCTIONS,
+                            f"reference module {_MODULE_CANDIDATES[0]}",
+                            "the unit's whole public API is the "
+                            "contract (issue #48)")
 '''
 
-CAND_MODULE_BACKEND = '''# Candidate side (module conformance, issue #48): import the PyO3 wheel.
-# The wheel's module name is NOT knowable at Stage 2 scaffold time — set
-# CANDIDATE_MODULE below (or re-run scaffold.py with --candidate-module
-# <module> --force at Stage 4) before judging. Until then importing this
-# adapter is a setup error, which oracle.py reports honestly instead of
-# judging half an adapter. The wheel must export EVERY judged function
-# name — a missing export is a setup error naming it, never a silent gap
-# in the verdict.
-CANDIDATE_MODULE = @@CANDIDATE_MODULE@@  # e.g. "mycrate.units.u_bars"
-PROJECT_ROOT = os.environ.get("MIGRATE_PROJECT_ROOT", @@ROOT_REPR@@)
-
+CAND_MODULE_TAIL = '''
 
 def _load_functions():
-    if not CANDIDATE_MODULE:
-        raise NotImplementedError(
-            "scaffold.py: candidate module not set — the PyO3 wheel is unknown "
-            "at Stage 2. Set CANDIDATE_MODULE (or re-run scaffold.py "
-            "--candidate-module <wheel-module> --force), then re-judge (issue #32).")
-    try:
-        mod = importlib.import_module(CANDIDATE_MODULE)
-    except ImportError:
-        for r in (PROJECT_ROOT, os.path.join(PROJECT_ROOT, "src")):
-            if os.path.isdir(r) and r not in sys.path:
-                sys.path.insert(0, r)
-        mod = importlib.import_module(CANDIDATE_MODULE)
-    missing = [n for n in FUNCTIONS if not hasattr(mod, n)]
-    if missing:
-        raise ImportError(f"candidate module {CANDIDATE_MODULE} exposes no "
-                          f"{missing} — the port must export the unit's whole "
-                          "public API (issue #48)")
-    return {n: getattr(mod, n) for n in FUNCTIONS}
+    # module conformance (issue #48): every judged export, none missing
+    return _require_exports(_load_module(), FUNCTIONS,
+                            f"candidate module {CANDIDATE_MODULE}",
+                            "the port must export the unit's whole "
+                            "public API (issue #48)")
 '''
+
+REF_BACKEND = REF_HEADER + REF_IMPORT + REF_FUNCTION_TAIL
+CAND_BACKEND = CAND_HEADER + CAND_IMPORT + CAND_FUNCTION_TAIL
+REF_MODULE_BACKEND = REF_HEADER + REF_IMPORT + REF_MODULE_TAIL
+CAND_MODULE_BACKEND = CAND_HEADER + CAND_IMPORT + CAND_MODULE_TAIL
 
 GENERATOR_TEMPLATE = '''#!/usr/bin/env python3
 """gen_@@STEM@@.py — seeded corpus generator for unit @@UNIT@@ (issue #32).
@@ -1312,63 +1308,59 @@ def _hand_tune_block(items: list[dict]) -> str:
     return "\n" + "\n".join(f"  - {it['where']}: {it['reason']}" for it in items)
 
 
-def _render_adapter(*, side: str, mode: str, unit: str, hand_tune: list[dict],
-                    project_root: Path, module_candidates: list[str],
-                    unit_path: str, candidate_module: str | None,
-                    function: str | None = None, param_specs: dict | None = None,
-                    result_spec: dict | None = None,
-                    functions: dict | None = None,
-                    union_specs: dict | None = None) -> str:
-    """One side of the symmetric pair, function or module mode (issue #48).
-    Function-mode param_specs is the RAW {name: spec} mapping (the
-    generator gets the has_default wrapper instead); module mode carries
-    the per-function table + the union specs instead."""
+def _render_adapter(*, side: str, plan: dict, unit: str, root: Path,
+                    module_candidates: list[str], unit_path: str,
+                    candidate_module: str | None) -> str:
+    """One side of the symmetric pair (issue #48). The plan's mode picks
+    the backend pair and the protocol/entry/run/load fragments: function
+    mode declares one function's specs, module mode the per-function table
+    plus the union of the judged parameters."""
     stem = _sanitize_stem(unit)
-    if mode == "module":
+    if plan["mode"] == "module":
         backends = (REF_MODULE_BACKEND, CAND_MODULE_BACKEND)
         mode_tokens = {
             "@@PROTOCOL@@": PROTOCOL_MODULE,
             "@@ENTRY_DECLS@@": ENTRY_DECLS_MODULE,
             "@@RUN_DEF@@": RUN_DEF_MODULE,
             "@@LOAD_CALL@@": LOAD_CALL_MODULE,
-            "@@FUNCTIONS@@": pformat(functions, sort_dicts=False, width=88),
-            "@@UNION_SPECS@@": pformat(union_specs, sort_dicts=False, width=88),
+            "@@FUNCTIONS@@": pformat(plan["functions_detail"], sort_dicts=False, width=88),
+            "@@UNION_SPECS@@": pformat(plan["union_specs"], sort_dicts=False, width=88),
         }
     else:
         backends = (REF_BACKEND, CAND_BACKEND)
-        scalar = {"@@FUNCTION@@": function,
-                  "@@FUNCTION_REPR@@": repr(function), "@@STEM@@": stem}
+        scalar = {"@@FUNCTION@@": plan["function"],
+                  "@@FUNCTION_REPR@@": repr(plan["function"]), "@@STEM@@": stem}
 
         def _frag(text: str) -> str:  # resolve fragment-local tokens up front
             for k, v in scalar.items():
                 text = text.replace(k, v)
             return text
+        raw_specs = {n: info["spec"] for n, info in plan["param_specs"].items()}
         mode_tokens = {
             "@@PROTOCOL@@": _frag(PROTOCOL_FUNCTION),
             "@@ENTRY_DECLS@@": _frag(ENTRY_DECLS_FUNCTION),
             "@@RUN_DEF@@": _frag(RUN_DEF_FUNCTION),
             "@@LOAD_CALL@@": LOAD_CALL_FUNCTION,
-            "@@PARAM_SPECS@@": pformat(param_specs, sort_dicts=False, width=88),
-            "@@RESULT_SPEC@@": pformat(result_spec, sort_dicts=False, width=88),
+            "@@PARAM_SPECS@@": pformat(raw_specs, sort_dicts=False, width=88),
+            "@@RESULT_SPEC@@": pformat(plan["result_spec"], sort_dicts=False, width=88),
         }
-    ref_text, cand_text = backends
     if side == "ref":
-        backend = (ref_text
-                   .replace("@@ROOT_REPR@@", repr(str(project_root)))
+        backend = (backends[0]
+                   .replace("@@ROOT_REPR@@", repr(str(root)))
                    .replace("@@MODULE_CANDIDATES@@", repr(module_candidates))
                    .replace("@@UNIT_PATH_REPR@@", repr(unit_path)))
     else:
-        backend = (cand_text
+        backend = (backends[1]
                    .replace("@@CANDIDATE_MODULE@@", repr(candidate_module))
-                   .replace("@@ROOT_REPR@@", repr(str(project_root))))
-    if mode == "function":
-        backend = backend.replace("@@FUNCTION_REPR@@", repr(function))
+                   .replace("@@ROOT_REPR@@", repr(str(root))))
+    if plan["mode"] == "function":
+        backend = backend.replace("@@FUNCTION_REPR@@", repr(plan["function"]))
     return _fill_template(ADAPTER_TEMPLATE, {
         "@@UNIT@@": unit,
         "@@UNIT_REPR@@": repr(unit),
         "@@STEM@@": stem,
-        "@@HANDTUNE_MARK@@": f" ({len(hand_tune)} item(s))" if hand_tune else "",
-        "@@HANDTUNE_LIST@@": _hand_tune_block(hand_tune),
+        "@@HANDTUNE_MARK@@": f" ({len(plan['hand_tune'])} item(s))" if plan["hand_tune"] else "",
+        "@@HANDTUNE_LIST@@": _hand_tune_block(plan["hand_tune"]),
         "@@BACKEND@@": backend.rstrip("\n"),
         **mode_tokens,
     }, f"{side} adapter for {unit}")
@@ -1460,23 +1452,49 @@ def _param_specs(params: dict[str, dict], ctx: FileCtx) -> tuple[dict, list[dict
     return specs, hand_tune
 
 
+def _typed_params(fn, ctx: FileCtx, where: str = "") -> tuple[dict, list[dict]]:
+    """({name: {"spec", "has_default"}}, hand-tune flags) for one function;
+    ``where`` locates the flags ("fn: param x" in module mode)."""
+    params, notes = _signature_params(fn)
+    specs, flags = _param_specs(params, ctx)
+    hand_tune = [{**f, "where": where + f["where"]} for f in flags]
+    hand_tune += [{"where": where + "signature", "reason": n} for n in notes]
+    return specs, hand_tune
+
+
+def _result_spec(fn, ctx: FileCtx, uid: str, warnings: list[str]) -> dict | None:
+    """Return-annotation spec (None = unannotated); an annotation the
+    heuristic cannot express warns — the adapters fall back to an honest
+    _jsonify walk (unserializable outputs judge incomparable)."""
+    spec = _parse_ann(fn.returns, ctx) if fn.returns else None
+    if spec is not None and spec["kind"] == "unknown":
+        warnings.append(f"unit {uid}: {fn.name}() return annotation "
+                        f"{spec.get('text')!r} is not JSON-expressible — the "
+                        "adapters fall back to an honest _jsonify walk "
+                        "(unserializable outputs judge incomparable)")
+    return spec
+
+
+def _warn_framing_hazard(param_names, owner: str, uid: str,
+                         warnings: list[str]) -> None:
+    """A surface taking exactly 'i' and 'input' emits rows indistinguishable
+    from the pre-wrapped stdin framing oracle.py refuses (issue #29) —
+    warn, never scaffold silently."""
+    if set(param_names) == {"i", "input"}:
+        warnings.append(f"unit {uid}: {owner} takes exactly params 'i' and "
+                        "'input' — rows are indistinguishable from pre-wrapped "
+                        "framing and oracle.py will refuse the corpus "
+                        "(issue #29); rename or hand-tune")
+
+
 def _analyze_function_mode(tree: ast.Module, ctx: FileCtx, src_stem: str,
                            args, uid: str, warnings: list[str]) -> dict:
     """Legacy single-entry plan (issue #32): one function, one adapter pair
     judging only it (--mode function)."""
     fn, how = _pick_function(tree, src_stem, args.functions[0] if args.functions else None)
-    params, notes = _signature_params(fn)
-    param_specs, hand_tune = _param_specs(params, ctx)
-    hand_tune += [{"where": "signature", "reason": n} for n in notes]
-    result_spec = _parse_ann(fn.returns, ctx) if fn.returns else None
-    if result_spec is not None and result_spec["kind"] == "unknown":
-        warnings.append(f"unit {uid}: return annotation {result_spec.get('text')!r} "
-                        "is not JSON-expressible — the adapters fall back to an honest "
-                        "_jsonify walk (unserializable outputs judge incomparable)")
-    if set(param_specs) == {"i", "input"}:
-        warnings.append(f"unit {uid}: {fn.name}() takes exactly params 'i' and 'input' — "
-                        "its rows are indistinguishable from pre-wrapped framing and "
-                        "oracle.py will refuse the corpus (issue #29); rename or hand-tune")
+    param_specs, hand_tune = _typed_params(fn, ctx)
+    result_spec = _result_spec(fn, ctx, uid, warnings)
+    _warn_framing_hazard(param_specs, f"{fn.name}()", uid, warnings)
     return {
         "mode": "function", "function": fn.name, "function_source": how,
         "functions_detail": None, "union_specs": None,
@@ -1495,38 +1513,24 @@ def _analyze_module_mode(tree: ast.Module, ctx: FileCtx, args, uid: str,
     fn_param_specs: dict[str, dict] = {}
     hand_tune: list[dict] = []
     for fn in fns:
-        params, notes = _signature_params(fn)
-        specs, flags = _param_specs(params, ctx)
-        hand_tune += [{**flag, "where": f"{fn.name}: {flag['where']}"} for flag in flags]
-        hand_tune += [{"where": f"{fn.name}: signature", "reason": n} for n in notes]
-        rs = _parse_ann(fn.returns, ctx) if fn.returns else None
-        if rs is not None and rs["kind"] == "unknown":
-            warnings.append(f"unit {uid}: {fn.name}() return annotation "
-                            f"{rs.get('text')!r} is not JSON-expressible — the "
-                            "adapters fall back to an honest _jsonify walk "
-                            "(unserializable outputs judge incomparable)")
+        specs, flags = _typed_params(fn, ctx, where=f"{fn.name}: ")
+        hand_tune += flags
         fn_param_specs[fn.name] = specs
         functions_detail[fn.name] = {
             "params": {n: info["spec"] for n, info in specs.items()},
-            "result": rs,
+            "result": _result_spec(fn, ctx, uid, warnings),
         }
     union = _union_of(fn_param_specs, hand_tune)
-    if set(union) == {"i", "input"}:
-        warnings.append(f"unit {uid}: the judged functions take exactly params "
-                        "'i' and 'input' — rows are indistinguishable from "
-                        "pre-wrapped framing and oracle.py will refuse the "
-                        "corpus (issue #29); rename or hand-tune")
-    # corpus specs: the union; has_default = defaulted in EVERY declaring
-    # function, so a row may omit it without breaking any caller
-    gen_specs = {n: {"spec": info["spec"],
-                     "has_default": not info["required"]}
+    _warn_framing_hazard(union, "the judged functions", uid, warnings)
+    # has_default = defaulted in EVERY declaring function, so a row may
+    # omit the parameter without breaking any caller
+    gen_specs = {n: {"spec": info["spec"], "has_default": not info["required"]}
                  for n, info in union.items()}
     return {
         "mode": "module", "function": None, "function_source": how,
         "functions_detail": functions_detail, "union_specs": union,
         "param_specs": gen_specs, "result_spec": None,
-        "hand_tune": hand_tune,
-        "checked_functions": [f.name for f in fns],
+        "hand_tune": hand_tune, "checked_functions": [f.name for f in fns],
     }
 
 
@@ -1562,20 +1566,14 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
     module_candidates = import_candidates_of(u["python_path"])
     resolved = src.resolve()
     rel = resolved.relative_to(root) if resolved.is_relative_to(root) else resolved
-    adapter_kw = dict(unit=uid, hand_tune=plan["hand_tune"], project_root=root,
-                      module_candidates=module_candidates,
-                      unit_path=rel.as_posix(),
-                      candidate_module=args.candidate_module)
-    if plan["mode"] == "module":
-        adapter_kw.update(functions=plan["functions_detail"],
-                          union_specs=plan["union_specs"])
-    else:
-        adapter_kw.update(function=plan["function"],
-                          param_specs={n: info["spec"] for n, info
-                                       in plan["param_specs"].items()},
-                          result_spec=plan["result_spec"])
-    ref_text = _render_adapter(side="ref", mode=plan["mode"], **adapter_kw)
-    cand_text = _render_adapter(side="cand", mode=plan["mode"], **adapter_kw)
+    ref_text = _render_adapter(side="ref", plan=plan, unit=uid, root=root,
+                               module_candidates=module_candidates,
+                               unit_path=rel.as_posix(),
+                               candidate_module=args.candidate_module)
+    cand_text = _render_adapter(side="cand", plan=plan, unit=uid, root=root,
+                                module_candidates=module_candidates,
+                                unit_path=rel.as_posix(),
+                                candidate_module=args.candidate_module)
     ref_sha, cand_sha = _shared_adapter_sha256(ref_text, cand_text)
     edge_rows = _edge_rows(plan["param_specs"])
     gen_text = _render_generator(unit=uid, mode=plan["mode"],
@@ -1599,10 +1597,6 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
                       "mode": plan["mode"], "function_source": plan["function_source"],
                       "candidate_module": args.candidate_module,
                       "adapters_shared_sha256": ref_sha}
-    if plan["mode"] == "module":
-        scaffold_block["functions"] = plan["checked_functions"]
-    else:
-        scaffold_block["function"] = plan["function"]
     manifest = {
         "unit": uid,
         "mode": plan["mode"],
@@ -1611,9 +1605,6 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
         "corpus": f"../corpora/corpus-{uid}.jsonl",
         "scaffold": scaffold_block,
     }
-    if plan["mode"] == "module":
-        manifest["functions"] = plan["checked_functions"]
-
     result = {
         "unit": uid, "python_path": u["python_path"],
         "module": module_name_of(u["python_path"]),
@@ -1627,12 +1618,13 @@ def _scaffold_unit(u: dict, root: Path, project_root: Path, out: Path,
         "candidate_module": args.candidate_module,
     }
     if plan["mode"] == "module":
-        result["functions"] = plan["checked_functions"]
-        result["functions_detail"] = plan["functions_detail"]
-        result["union_parameters"] = plan["union_specs"]
+        checked = plan["checked_functions"]
+        scaffold_block["functions"] = manifest["functions"] = checked
+        result.update(functions=checked, functions_detail=plan["functions_detail"],
+                      union_parameters=plan["union_specs"])
     else:
-        result["function"] = plan["function"]
-        result["result"] = plan["result_spec"]
+        scaffold_block["function"] = plan["function"]
+        result.update(function=plan["function"], result=plan["result_spec"])
     return result
 
 
@@ -1684,7 +1676,7 @@ def _module_fn_stats(recs: list) -> dict:
             is_err = (isinstance(v, dict) and set(v) == {"__error__"}
                       and isinstance(v["__error__"], dict))
             entry["error" if is_err else "ok"] += 1
-    for name, entry in stats.items():
+    for entry in stats.values():
         entry["rows"] = ok_rows
     return stats
 
@@ -1738,11 +1730,16 @@ def _dry_run_corpus(result: dict, out_dir: Path, timeout: float) -> dict:
     }
 
 
+def _split_names(chunks: list[str] | None) -> list[str]:
+    """--unit/--function values: repeatable flags, comma-separated too."""
+    return [w for chunk in chunks or []
+            for w in (p.strip() for p in chunk.split(",")) if w]
+
+
 def _select_units(units: list, chunks: list[str] | None) -> list[dict]:
     """Units the user asked for (--unit repeatable / comma-separated), or
     all of them; unknown ids are a usage error, not silence."""
-    wanted = [w for chunk in chunks or []
-              for w in (p.strip() for p in chunk.split(",")) if w]
+    wanted = _split_names(chunks)
     if not wanted:
         return units
     known = {u["id"] for u in units}
@@ -1806,10 +1803,9 @@ def cmd_scaffold(args) -> int:
     if not (args.state or args.state_pos):
         raise ToolError("a migration-state.json path is required (positional or --state)",
                         kind="usage")
-    # --function is repeatable / comma-separated like --unit (issue #48):
-    # a subset in module mode, the single choice in function mode
-    args.functions = [w.strip() for chunk in (args.function or [])
-                      for w in chunk.split(",") if w.strip()]
+    # --function: the module-mode judged subset, or the single
+    # function-mode entry (enforced below)
+    args.functions = _split_names(args.function)
     if args.mode == "function" and len(args.functions) > 1:
         raise ToolError("--mode function judges ONE function per manifest; pass "
                         "--mode module (the default) to judge several through "

@@ -579,6 +579,8 @@ def test_module_mode_single_all_error_function_warns(monkeypatch, capsys, tmp_pa
     stats = payload["units"][0]["corpus_dry_run"]["functions"]
     assert stats["boom_fn"]["ok"] == 0 and stats["ok_fn"]["ok"] > 0
 
+
+def test_int_float_distinction_survives_the_adapter(monkeypatch, capsys, tmp_path):
     """The adapter must not silently widen types (int_float_distinct is a
     divergence rule, not a normalization): a float row for an int param is
     a corpus bug and must raise, not coerce."""
