@@ -29,7 +29,7 @@
     }
   },
   "budget": {
-    "$comment": "Global ceilings enforced by the driver (tools/pipeline.py run) — the run-level analogue of the per-unit MAX_ROUNDS budget. Copy into state.autonomy.budget at init time; the state block wins once present. max_chain_depth (issue #25): session-level budget_exhausted (the orchestrator session's context window) spawns a successor GLV session automatically via tools/succession.py; the cap bounds how many successions may chain (over it, or if a successor advances no observable state, the run ends failed_safely with the dossier). The ceilings above bound the ENTIRE chain — token spend sums through the single migration-state.json, wall clock sums over sessions — so a fresh session budget never means a fresh run budget.",
+    "$comment": "Global ceilings enforced by the driver (tools/pipeline.py run) — the run-level analogue of the per-unit MAX_ROUNDS budget. Copy into state.autonomy.budget at init time; the state block wins once present. max_chain_depth (issue #25): session-level budget_exhausted (the orchestrator session's context window) ALWAYS spawns a successor — the chain harness (tools/succession.py) bootstraps GLV itself (issue #47: it ensures `glv serve` is up and mints its own named token per session; no alternate transport, no human provisioning step); the cap bounds how many successions may chain (over it, or if a successor advances no observable state, the run ends failed_safely with the dossier). The ceilings bound the ENTIRE chain — token spend sums through the single migration-state.json, wall clock sums over sessions — so a fresh session budget never means a fresh run budget.",
     "max_tokens": 5000000,
     "max_wall_clock_minutes": 720,
     "max_agent_retries_per_stage": 2,

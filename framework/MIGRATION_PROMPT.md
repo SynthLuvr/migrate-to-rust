@@ -46,10 +46,15 @@ operate a pipeline; the gates decide, not you.
   session's context budget exhausts before the run reaches a terminal
   state, record `budget_exhausted` and stop — the harness spawns a
   successor session with the full resume context (state file path,
-  dossier, journal tail, budget remaining) automatically. A run then
-  finishes from one human prompt with zero manual restarts; the run-level
-  ceilings and the chain guardrails (depth cap, monotonic progress) bound
-  everything.
+  dossier, journal tail, budget remaining, GLV bootstrap pointer)
+  automatically. The harness bootstraps GLV itself (issue #47) — it
+  ensures `glv serve` is up and mints one named token
+  (`run-<project>-s<n>`) per chain session; see
+  [`tools/glv-subagents.md`](tools/glv-subagents.md) § "GLV bootstrap",
+  the runbook section every session runs before any role or chain work.
+  A run then finishes from one human prompt with zero manual restarts;
+  the run-level ceilings and the chain guardrails (depth cap, monotonic
+  progress) bound everything.
 
 ## Hard rules — violating any one fails the task
 
@@ -150,14 +155,19 @@ Divergent / Incomparable`; every Divergent carries a written explanation.
   (refcounts, PyErr hygiene, GIL detach, free-threading) + attribution diff.
   Use a *different* model for review than translation if available —
   Volatility3 found this cheaper *and* better.
-- **transport** ([`tools/glv-subagents.md`](tools/glv-subagents.md)): when a
-  GLV server ([SynthLuvr/glv](https://github.com/SynthLuvr/glv)) is
-  reachable, run these roles as GLV sessions over its HTTP API — one
-  session per role invocation. The oracle still judges; GLV only carries
-  the roles. GLV also carries the **orchestrator chain**
-  ([`tools/succession.py`](tools/succession.py), issue #25): session-level
-  `budget_exhausted` spawns the successor session automatically, so the
-  whole run finishes from one human prompt.
+- **transport** ([`tools/glv-subagents.md`](tools/glv-subagents.md)):
+  roles run as GLV ([SynthLuvr/glv](https://github.com/SynthLuvr/glv))
+  sessions over its HTTP API — one session per role invocation; GLV is
+  the only transport. Bootstrap it yourself as your first act per the
+  runbook's **GLV bootstrap** section (probe `GET /api/openapi.json`,
+  start `glv serve` if nothing answers, mint your own token
+  `glv token create --name run-<project>-s<n>`, export
+  `GLV_BASE_URL`/`GLV_API_TOKEN`, re-mint on a 401 run). The oracle
+  still judges; GLV only carries the roles. GLV also carries the
+  **orchestrator chain**
+  ([`tools/succession.py`](tools/succession.py), issue #25):
+  session-level `budget_exhausted` spawns the successor session
+  automatically, so the whole run finishes from one human prompt.
 
 ## Gates — autonomy levels and policy resolution (issue #22)
 
@@ -206,11 +216,12 @@ Rules of the rules:
   with the gate + escalation dossiers, state file, journal). Global
   token/time ceilings are enforced by the driver. `budget_exhausted` at
   the *session* level (the orchestrator's context window) is a scheduling
-  event, not a result: with GLV reachable, `tools/succession.py` chains a
-  successor session automatically (depth-capped, progress-guarded,
-  stop-noticed — issue #25), so it never survives as a run's final status;
-  it stays final only for the run-level ceilings (or in degraded mode,
-  GLV unreachable), where a human raises the ceiling to resume.
+  event, not a result: `tools/succession.py` chains a successor session
+  automatically (depth-capped, progress-guarded, stop-noticed — issues
+  #25/#47), so it never survives as a run's final status; it stays final
+  only when the run-level ceilings themselves are spent — the
+  pre-authorized budget is gone, and raising it is the operator's
+  between-runs decision, never a mid-run ask.
 - Undecidable-from-evidence gates (e.g. a substitution with no recorded
   module) stay open and drain into the report — they never block silently.
 - Safety rests on the dual-build design: per-unit Python fallback, the
@@ -228,5 +239,5 @@ Rules of the rules:
 | Speed number without a repro script | vendor benchmark rot | every benchmark ships with its corpus + script |
 | Optimized Python matches the port | port wasn't the win | report honestly; keeping Python is a success |
 | Agent pauses to ask a human at a gate | pre-policy gate behavior | gates resolve in code, or the run ends with the dossier for between-runs operator review — "ask" is never an available move |
-| Run parks in `budget_exhausted`, waiting for a human to notice and restart | session-level exhaustion (the orchestrator's context window) treated as a human-facing result | `tools/succession.py` spawns the successor GLV session automatically (issue #25); only run-level ceiling exhaustion reaches a human — and then the answer is "raise the ceiling", not "restart by hand" |
+| Run parks in `budget_exhausted`, waiting for a human to notice and restart | session-level exhaustion (the orchestrator's context window) treated as a human-facing result | `tools/succession.py` spawns the successor GLV session automatically (issue #25) and bootstraps GLV itself (issue #47); only run-level ceiling exhaustion ends the chain — and then the operator's move is to raise the ceiling between runs, never to restart by hand |
 | Private project names leak into public artifacts (PRs, issues, commits) | run reports and state files name the target project | `runs/` stays gitignored; anonymize target-project names in anything committed or posted publicly — refer to "a target project", never its name |

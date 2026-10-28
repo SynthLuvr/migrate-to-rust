@@ -26,9 +26,11 @@ acceptance-test suite in `tests/` wired into CI. Shared plumbing lives in
 ## External helper — GLV subagent transport
 
 GLV ([SynthLuvr/glv](https://github.com/SynthLuvr/glv)) is not one of the
-eight scripts — it is the transport the framework's *role separation* runs
-on when a GLV server is reachable. Spec, API cheat sheet, and delegation
-loop: [`glv-subagents.md`](glv-subagents.md).
+eight scripts — it is the transport the framework's *role separation*
+runs on, and the only one: every session bootstraps it itself (server
+probe/start + its own minted token) per the **GLV bootstrap** section of
+[`glv-subagents.md`](glv-subagents.md) (issue #47). Spec, API cheat
+sheet, and delegation loop: [`glv-subagents.md`](glv-subagents.md).
 
 ## The Stage 2/4 scaffold — `scaffold.py` (issue #32)
 
@@ -148,11 +150,20 @@ notice and restart by hand) becomes a scheduling event in code instead of
 "awaiting input":
 
 ```console
-export GLV_BASE_URL="http://localhost:3000" GLV_API_TOKEN="glv_at_…"
 python framework/tools/succession.py chain \
   --state runs/<project>/migration-state.json \
   --prompt-file runs/<project>/first-prompt.md
 ```
+
+The harness bootstraps GLV itself as its first act (issue #47): it
+probes `GET /api/openapi.json`, starts `glv serve` in the background
+when nothing answers, mints one token per chain session
+(`glv token create --name run-<project>-s<n>` — `glv token list` is
+the audit trail), and exports `GLV_BASE_URL`/`GLV_API_TOKEN` itself.
+A sudden run of 401s re-mints without stopping; a mid-chain connection
+loss revives the server and retries; only a transport that cannot be
+revived ends the chain — `failed_safely` with a journaled stop-notice
+(a genuine terminal with the dossier, never a park).
 
 Per session it: starts the GLV session with the brief (session 1 rides the
 operator's single prompt; successors get a composed resume brief — state
@@ -177,11 +188,9 @@ the whole chain**: token spend sums through the single state file, wall
 clock sums over sessions — successors get a fresh session budget, never a
 fresh run budget. Only genuine terminals (`complete` / `no_go_measured` /
 `failed_safely`) — or the run-level ceilings themselves, the one honest
-`budget_exhausted` — end the chain. GLV unreachable at start → refusal
-with the documented degraded fallback (pre-#25 behavior: `pipeline.py
-run` + manual resume); unreachable mid-chain → the exhausted state stands
-with a notice, exit 0 — a terminal state, never a hang. Restartable
-anywhere: a re-invocation adopts a recorded-but-unsettled session.
+`budget_exhausted` — end the chain. Restartable
+anywhere: a re-invocation adopts a recorded-but-unsettled session,
+re-bootstrapping the transport on the way.
 `succession.py hygiene` runs the resume-path check standalone (exit 2
 while unresolved); `succession.py brief` prints the next session's brief
 without side effects.

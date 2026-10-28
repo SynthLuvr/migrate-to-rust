@@ -8,27 +8,54 @@ in-process subagent calls: every translator candidate and every reviewer
 pass is a GLV session the orchestrator starts, waits on, and reads back.
 The oracle still decides — GLV only carries the roles.
 
+GLV is **the unconditional transport** (issue #47): there is no
+alternate operating mode and no second transport — and nothing about
+GLV is a human prerequisite. Every session bootstraps it itself, as its
+first act, per the section below (the chain harness
+`tools/succession.py` does the same in code).
+
 Source of truth for every path and field below: `GET /api/openapi.json`
 on the running server.
 
-## Prerequisites
+## GLV bootstrap — every session's first act, unconditionally
 
-1. `glv serve` is running (default port 3000; `-c/--max-concurrent`,
-   default 6, is the run queue shared by all served agents).
-2. The orchestrator holds an API token. Mint one on the server host:
+The session performs these steps itself, in this order, before any
+role or chain work. No step asks a human; no failure changes the
+transport.
+
+1. **Ensure the server is up.** Probe `GET /api/openapi.json` — any
+   HTTP answer (a `401` JSON body included) means the server is
+   serving; authentication is the token's job, not the probe's. If
+   nothing answers, start the server yourself, in the background:
 
    ```bash
-   glv token create migrate-orchestrator
-   # raw token on stdout; expires in 30 days; only its SHA-256
-   # hash is stored
+   GLV_BASE_URL="${GLV_BASE_URL:-http://localhost:3000}"
+   curl -fsS -m 5 "$GLV_BASE_URL/api/openapi.json" >/dev/null 2>&1 || \
+     nohup glv serve >>/tmp/glv-serve.log 2>&1 &
+   # -c/--max-concurrent (default 6) is the run queue shared by all
+   # served agents; leave it at the default unless the host says no
+   ```
+
+   Then re-probe until it answers (`tools/succession.py` does exactly
+   this: probe → start → wait).
+2. **Mint this session's own token** — never reuse a predecessor's.
+   The name is the audit trail: `glv token list` shows one
+   `run-<project>-s<n>` per chain session:
+
+   ```bash
+   glv token create --name run-<project>-s<n>
+   # raw token (glv_at_…) printed ONCE; expires in 30 days; only its
+   # SHA-256 hash is stored server-side
    ```
 
    No filesystem access to the GLV data dir (SSH port-forward, sibling
-   container)? With `glv serve --allow-token-bootstrap`, a loopback-only
-   `POST /api/tokens` mints a token with no credential. Never enable
-   that flag behind a reverse proxy — loopback detection is the security
-   boundary and proxies break it.
-3. Export both values, and commit neither:
+   container)? When the server runs `glv serve
+   --allow-token-bootstrap`, a loopback-only `POST /api/tokens` mints
+   a token with no credential — the path for agents with network reach
+   but no data-dir access. Never enable that flag behind a reverse
+   proxy — loopback detection is the security boundary and proxies
+   break it.
+3. **Export both values, and commit neither:**
 
    ```bash
    export GLV_BASE_URL="http://localhost:3000"
@@ -38,6 +65,10 @@ on the running server.
    Auth is `Authorization: Bearer glv_at_…` on every `/api` path; POST
    accepts the bearer only, GET also accepts a browser session cookie.
    `/api/*` answers 401 as JSON — never an HTML login redirect.
+4. **On a sudden run of 401s** (the 30-day expiry): re-mint
+   (`glv token create --name run-<project>-s<n>`), re-export
+   `GLV_API_TOKEN`, and continue — re-auth is never a stop and never a
+   human ask. Never fall back to riding a browser cookie.
 
 ## API cheat sheet
 
@@ -66,21 +97,24 @@ Quick human lookups without HTTP: `glv sessions`, `glv view <id>`,
 **Including the orchestrator itself.** When the chain harness
 (`tools/succession.py`, issue #25) drives a run, the orchestrator is a
 *series* of GLV sessions — `run-<project>-s<n>` — so a whole migration
-finishes from one human prompt: session 1 rides the operator's prompt;
-when a session's context budget exhausts before the run reaches a
-terminal state, the harness composes the successor's resume brief from
-the state file (position, escalation dossier, journal tail, run-budget
-remaining, hygiene findings), starts the next session over this API,
-stops the predecessor if still live, journals a **stop-notice** (operator
-informed, not involved), and resets `run_status` to `running` — all
-through `state.py`. Guardrails: depth cap (`budget.max_chain_depth`,
-policy default 10) and a monotonic-progress guard (a successor that
-advances neither stage nor ≥1 decided unit ends the chain
-`failed_safely`); the run-level ceilings bind the *whole* chain (tokens
-sum through the single state file, wall clock sums over sessions).
-`budget_exhausted` survives as a final status only when the run-level
-ceilings hit — or in degraded mode, GLV unreachable. GLV unreachable at
-chain start is a refusal (exit 2) naming the pre-#25 fallback.
+finishes from one human prompt: the harness bootstraps GLV itself
+first (serve probe/start + one minted token per session, issue #47),
+session 1 rides the operator's prompt; when a session's context budget
+exhausts before the run reaches a terminal state, the harness composes
+the successor's resume brief from the state file (position, escalation
+dossier, journal tail, run-budget remaining, hygiene findings), starts
+the next session over this API, stops the predecessor if still live,
+journals a **stop-notice** (operator informed, not involved), and
+resets `run_status` to `running` — all through `state.py`. Guardrails:
+depth cap (`budget.max_chain_depth`, policy default 10) and a
+monotonic-progress guard (a successor that advances neither stage nor
+≥1 decided unit ends the chain `failed_safely`); the run-level
+ceilings bind the *whole* chain (tokens sum through the single state
+file, wall clock sums over sessions). `budget_exhausted` survives as a
+final status only when the run-level ceilings hit; a mid-chain
+transport loss is self-healed (server revived, token re-minted on 401)
+and only an unrevivable transport ends the chain — `failed_safely`
+with the dossier.
 
 - **Name deterministically.** `unit-<unit-id>-translator-c<k>` and
   `unit-<unit-id>-reviewer-r<n>` (retries get a `-retry` suffix);
@@ -171,6 +205,7 @@ Per unit, in leaf-first dependency order:
   the orchestrator's commit discipline (provenance headers, checked by
   `attribution.py`).
 - **Expired tokens.** Tokens live 30 days. A sudden run of 401s on a
-  long migration means the token expired — mint a fresh one
-  (`glv token create`) and update `GLV_API_TOKEN`. Never fall back to
-  riding a browser cookie.
+  long migration means the token expired — re-mint (`glv token create`)
+  and update `GLV_API_TOKEN`. Never fall back to riding a browser
+  cookie. The chain harness does this re-mint itself (issue #47); a
+  session-driven loop follows bootstrap step 4 above.

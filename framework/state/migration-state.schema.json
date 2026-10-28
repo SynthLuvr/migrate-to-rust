@@ -204,7 +204,7 @@
     },
     "run_status": {
       "enum": ["pending", "running", "complete", "no_go_measured", "budget_exhausted", "failed_safely"],
-      "$comment": "Terminal-state discipline (issue #22): a driver run ALWAYS ends in complete / no_go_measured / budget_exhausted / failed_safely — never 'awaiting input'. Every terminal state emits the same deliverable set (run report incl. the escalation dossier, state file, journal). Issue #25: session-level budget_exhausted never survives a successor chain while GLV is reachable — tools/succession.py spawns the successor automatically; budget_exhausted remains a final status only for the run-level ceilings (or in degraded mode, GLV unreachable)."
+      "$comment": "Terminal-state discipline (issue #22): a driver run ALWAYS ends in complete / no_go_measured / budget_exhausted / failed_safely — never 'awaiting input'. Every terminal state emits the same deliverable set (run report incl. the escalation dossier, state file, journal). Issue #25: session-level budget_exhausted never survives a successor chain — tools/succession.py spawns the successor automatically over the GLV transport it bootstraps itself (issue #47); budget_exhausted remains a final status only for the run-level ceilings."
     },
     "session_chain": {
       "type": "object",
@@ -240,7 +240,7 @@
             }
           }
         },
-        "notices": { "type": "array", "items": { "type": "string" }, "$comment": "stop-notices: one per succession (and any degraded-mode failure) — the operator-informing artifact; the operator stays informed, not involved" }
+        "notices": { "type": "array", "items": { "type": "string" }, "$comment": "stop-notices: one per succession (and any transport failure that ends the chain) — the operator-informing artifact; the operator stays informed, not involved" }
       }
     },
     "journal": {
