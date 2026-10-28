@@ -78,16 +78,20 @@ GEN_NEW_RE = re.compile(r"\bPython::(?:attach|detach)\b|\.(?:attach|detach)\s*\(
 PYCLASS_FIELD_RE = re.compile(r":\s*(Rc<|RefCell<|Cell<)|\bthread_local!")
 STATIC_MUT_RE = re.compile(r"\bstatic\s+mut\b")
 INT_CAST_RE = re.compile(r"as\s+(i|u)(size|\d+)|\.extract::<\(i|u\)\w*>")
-# Option<Py-typed> parameters: dynamic-object optionals where an omitted arg
-# and an explicit Python None both extract to None (issue #56). PyDict/PyTuple
-# optionals (the **kwargs / *args idiom) are deliberately NOT matched.
+# Option<Py-typed> parameters: an omitted arg and an explicit Python None
+# both extract to None (issue #56). PyDict/PyTuple optionals (the **kwargs /
+# *args idiom) are deliberately not matched.
 OPTION_ARG_RE = re.compile(
     r"Option\s*<\s*&?\s*(?:"
-    r"Bound\s*<\s*'[^>]*?\s*,\s*PyAny\s*>"   # Option<&Bound<'_, PyAny>>
-    r"|Bound\s*<\s*PyAny\s*>"                # Option<Bound<PyAny>>
-    r"|Py\s*<\s*PyAny\s*>"                   # Option<Py<PyAny>>
+    r"Bound\s*<\s*(?:'[^>]*?\s*,\s*)?PyAny\s*>"
+    r"|Py\s*<\s*PyAny\s*>"
     r"|PyObject"                             # pre-0.26 alias
     r")\s*>")
+# Shared hazard rationale for PYO3-OPTION findings, file and diff mode alike.
+OPTION_WHY = (
+    "an omitted argument and an explicit Python None both extract to None "
+    "(issue #56) — diverges when the Python default is observable and "
+    "explicit None is legal input")
 
 ATTR_RE = re.compile(r"#\[\s*(pyfunction|pymethods|pyclass)")
 FN_RE = re.compile(r"^\s*(?:pub\s+)?(?:unsafe\s+)?(?:extern\s+)?fn\s+(\w+)")
@@ -210,33 +214,21 @@ def _attr_block_ranges(code: str, attr_re: re.Pattern, keyword: str) -> list[tup
     return ranges
 
 
-def _param_list_text(code_lines: list[str], fn_start: int) -> tuple[str, int]:
-    """(text, last_line) of a fn's parameter list starting at the `fn` line:
-    text runs from the opening `(` to the matching `)` inclusive, so return
-    types / bodies are excluded. Multi-line signatures supported; '' when no
-    parameter list is found within a bounded window."""
-    joined: list[str] = []
+def _param_list_text(code_lines: list[str], fn_start: int) -> str:
+    """Parameter list of the fn starting at `fn_start`: text from the
+    opening `(` through its matching `)`, so return types and bodies are
+    excluded. Multi-line signatures supported; '' when no parameter list
+    closes within a bounded window."""
+    window = "\n".join(code_lines[fn_start - 1:fn_start + 40])
     depth = 0
-    seen_open = False
-    for j in range(fn_start, min(len(code_lines), fn_start + 40) + 1):
-        joined.append(code_lines[j - 1])
-        depth += code_lines[j - 1].count("(") - code_lines[j - 1].count(")")
-        if "(" in code_lines[j - 1]:
-            seen_open = True
-        if seen_open and depth <= 0:
-            text = "\n".join(joined)
-            depth2, seen2, cut = 0, False, len(text)
-            for i, ch in enumerate(text):
-                if ch == "(":
-                    depth2 += 1
-                    seen2 = True
-                elif ch == ")":
-                    depth2 -= 1
-                    if seen2 and depth2 == 0:
-                        cut = i + 1
-                        break
-            return text[:cut], j
-    return "", fn_start
+    for i, ch in enumerate(window):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return window[:i + 1]
+    return ""
 
 
 def review_file(path: Path, findings: list[dict]) -> None:
@@ -272,20 +264,17 @@ def review_file(path: Path, findings: list[dict]) -> None:
                          "line": lineno, "snippet": snippet.strip()[:120],
                          "why": why, "checklist": CHECKLIST, "context": context})
 
-    # signature rules: Option<Py-typed> params on exported fns conflate an
-    # omitted argument with an explicit Python None (issue #56)
+    # signature rules: PYO3-OPTION reads param lists only, so return types
+    # (often Option<...> too) do not fire
     for fn_start, _fn_end, fname in exported:
-        sig_text, _sig_last = _param_list_text(code_lines, fn_start)
+        sig_text = _param_list_text(code_lines, fn_start)
         if not sig_text:
             continue
         for m in OPTION_ARG_RE.finditer(sig_text):
             lineno = fn_start + sig_text.count("\n", 0, m.start())
             add("PYO3-OPTION", "warning", lineno, raw_lines[lineno - 1],
-                f"Option<Py-typed> parameter on exported fn {fname}: an omitted "
-                f"argument and an explicit Python None both extract to None — "
-                f"diverges when the Python default is observable and explicit "
-                f"None is legal input (e.g. to_float(value, default=0.0) called "
-                f"with default=None); bind manually with #[pyo3(signature = "
+                f"Option<Py-typed> parameter on exported fn {fname}: "
+                f"{OPTION_WHY} — bind manually with #[pyo3(signature = "
                 f"(*args))] + args.get_item(i) (omitted -> literal default, "
                 f"is_none() -> Python semantics) unless explicit None is "
                 f"illegal input")
@@ -406,12 +395,10 @@ def review_diff(path: Path, findings: list[dict]) -> None:
                 findings.append({"rule": "PYO3-OPTION", "severity": "warning",
                                  "file": current_file or "<diff>", "line": new_lineno,
                                  "snippet": content[:120],
-                                 "why": "Option<Py-typed> parameter on an ADDED line: "
-                                        "omitted and explicit Python None both extract "
-                                        "to None — verify the Python default is not "
-                                        "observable (or explicit None is illegal) "
-                                        "before forgiving this (file mode is "
-                                        "signature-aware)",
+                                 "why": f"Option<Py-typed> parameter on an ADDED "
+                                        f"line: {OPTION_WHY} — verify before "
+                                        f"forgiving this (file mode is "
+                                        f"signature-aware)",
                                  "checklist": CHECKLIST, "context": "diff"})
             new_lineno += 1
         elif line.startswith("-"):

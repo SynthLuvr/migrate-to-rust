@@ -264,11 +264,11 @@ def test_pyo3_review_option_arg_conflation(monkeypatch, capsys, tmp_path):
     assert code == 0  # warning severity alone does not fail
     fires = [f for f in out["findings"] if f["rule"] == "PYO3-OPTION"]
     assert len(fires) == 1
-    f = fires[0]
-    assert f["severity"] == "warning"
-    assert f["line"] == 8                      # the param line, not the fn line
-    assert "to_float" in f["why"]
-    assert "*args" in f["why"]
+    first = fires[0]
+    assert first["severity"] == "warning"
+    assert first["line"] == 8                      # the param line, not the fn line
+    assert "to_float" in first["why"]
+    assert "*args" in first["why"]
     assert {f["rule"] for f in out["findings"]} == {"PYO3-OPTION"}
     # --strict promotes the warning to a failure
     code, out = run_tool(monkeypatch, capsys, "pyo3_review.py",
