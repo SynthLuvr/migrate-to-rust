@@ -108,17 +108,14 @@ UNDECIDABLE = "undecidable"
 # (exit 2) instead of letting a run start on assumptions.
 TEMPLATE_URL = "https://github.com/SynthLuvr/rust-template"
 HARD_CHECKS = ("suite", "oracle_selftest", "template")
-# --skip accepts the friendly spellings; SKIP_TO_CHECK maps them to check ids
 SKIP_TO_CHECK = {"suite": "suite", "pytest-collect": "pytest_collect",
                  "selftest": "oracle_selftest", "template": "template",
                  "toolchain": "toolchain"}
 PYTEST_NODEID_RE = re.compile(r"^\S+\.py::\S+$")
 PYTEST_SUMMARY_RE = re.compile(
     r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|deselected)")
-PYTEST_SUMMARY_KEYS = {"error": "error", "errors": "error"}  # plural fold
-# cargo/rustc/maturin/uv feed Stage 3 directly; the extras are the template's
-# gate stack (just doctor covers the crate, nothing checks it *before*
-# scaffolding — that is this check's job)
+# cargo/rustc/maturin/uv feed Stage 3 directly; the extras are the
+# template's gate stack
 TOOLCHAIN_VERSION_CMDS = {"cargo": ["cargo", "--version"],
                           "rustc": ["rustc", "--version"],
                           "maturin": ["maturin", "--version"],
@@ -716,7 +713,6 @@ _PY_PROBE_SRC = (
 
 
 def _probe_python(python: Path | str) -> dict:
-    """Version + implementation + free-threaded flag of one interpreter."""
     code, out, err = _probe([str(python), "-c", _PY_PROBE_SRC], timeout=60.0)
     if code != 0:
         return {"ok": False, "detail": (err.strip() or f"exit {code}")[:300]}
@@ -741,7 +737,7 @@ def _parse_pytest_summary(text: str) -> dict[str, int]:
     ('12 passed, 1 skipped in 3.42s'); plural keys fold to singular."""
     counts: dict[str, int] = {}
     for m in PYTEST_SUMMARY_RE.finditer(text or ""):
-        key = PYTEST_SUMMARY_KEYS.get(m.group(2), m.group(2))
+        key = m.group(2).removesuffix("s")
         counts[key] = counts.get(key, 0) + int(m.group(1))
     return counts
 
@@ -801,7 +797,7 @@ def _check_template(url: str) -> dict:
     offline, which the tests rely on)."""
     code, out, err = _probe(["git", "ls-remote", url, "HEAD"], timeout=60.0)
     sha = next((ln.split()[0] for ln in out.splitlines() if ln.strip()), None)
-    ok = code == 0 and bool(sha) and bool(re.fullmatch(r"[0-9a-f]{7,40}", sha or ""))
+    ok = code == 0 and bool(sha) and bool(re.fullmatch(r"[0-9a-f]{7,40}", sha))
     record = {"id": "template", "hard": True, "ok": ok, "url": url,
               "head_sha": sha if ok else None}
     record["detail"] = (f"rust-template reachable, HEAD {sha[:12]}"
@@ -845,10 +841,10 @@ def _check_pytest_collect(python: str, root: Path, capture_path: Path) -> dict:
     nodeids = [ln.strip() for ln in out.splitlines()
                if PYTEST_NODEID_RE.match(ln.strip())]
     capture_path.write_text(out, encoding="utf-8")
-    counts = _parse_pytest_summary(out[-500:])
     record = {"id": "pytest_collect", "ok": code in (0, 5) and bool(nodeids),
               "exit_code": code, "collected": len(nodeids),
-              "errors": counts.get("error", 0), "capture": str(capture_path)}
+              "errors": _parse_pytest_summary(out[-500:]).get("error", 0),
+              "capture": str(capture_path)}
     if code not in (0, 5):
         record["detail"] = (f"pytest --collect-only exited {code}: "
                             f"{((err or out).strip() or 'no output')[:200]} "
@@ -915,31 +911,28 @@ def _check_toolchain() -> dict:
 
 
 def _check_target_interpreter(root: Path | None, venv_python: Path | None,
-                              venv_note: str) -> tuple[dict, str | None]:
+                              venv_note: str) -> dict:
     """Target venv + interpreter version + Py_GIL_DISABLED (wheel flavor) +
     the derived PYO3_PYTHON the justfile pins for dev builds."""
     if venv_python is None:
-        record = {"id": "target_interpreter", "ok": False,
-                  "root": str(root) if root else None,
-                  "detail": f"not resolved: {venv_note} — PYO3_PYTHON and the "
-                            f"wheel flavor are unknown; Stage 3/4 dev builds "
-                            f"cannot be pinned"}
-        return record, f"target interpreter unresolved: {venv_note}"
+        return {"id": "target_interpreter", "ok": False,
+                "root": str(root) if root else None,
+                "detail": f"not resolved: {venv_note} — PYO3_PYTHON and the "
+                          f"wheel flavor are unknown; Stage 3/4 dev builds "
+                          f"cannot be pinned"}
     info = _probe_python(venv_python)
     if not info.get("ok"):
-        info.update({"id": "target_interpreter", "ok": False,
-                     "python": str(venv_python),
-                     "detail": f"probe failed: {info.get('detail')}"})
-        return info, None
+        return {"id": "target_interpreter", "ok": False,
+                "python": str(venv_python),
+                "detail": f"probe failed: {info.get('detail')}"}
     flavor = _wheel_flavor(bool(info.get("gil_disabled")))
-    record = {"id": "target_interpreter", "ok": True, "root": str(root),
-              "python": str(venv_python), "version": info["version"],
-              "implementation": info.get("implementation"),
-              "gil_disabled": bool(info.get("gil_disabled")),
-              "wheel_flavor": flavor, "pyo3_python": str(venv_python),
-              "detail": f"{info['version']} at {venv_python} — {flavor}; "
-                        f"PYO3_PYTHON={venv_python}"}
-    return record, None
+    return {"id": "target_interpreter", "ok": True, "root": str(root),
+            "python": str(venv_python), "version": info["version"],
+            "implementation": info.get("implementation"),
+            "gil_disabled": bool(info.get("gil_disabled")),
+            "wheel_flavor": flavor, "pyo3_python": str(venv_python),
+            "detail": f"{info['version']} at {venv_python} — {flavor}; "
+                      f"PYO3_PYTHON={venv_python}"}
 
 
 def build_preflight_report(project: str, block: dict) -> str:
@@ -967,9 +960,12 @@ def build_preflight_report(project: str, block: dict) -> str:
         rec = checks.get(cid)
         if not rec:
             continue
-        status = ("skipped" if rec.get("skipped")
-                  else ("ok" if rec.get("ok") else "FAILED")
-                  + (" · hard" if rec.get("hard") else ""))
+        if rec.get("skipped"):
+            status = "skipped"
+        else:
+            status = "ok" if rec.get("ok") else "FAILED"
+            if rec.get("hard"):
+                status += " · hard"
         lines.append(f"| {cid} | {status} | {rec.get('detail', '')} |")
     if block.get("warnings"):
         lines += ["", "## Warnings", ""]
@@ -982,16 +978,9 @@ def build_preflight_report(project: str, block: dict) -> str:
     return "\n".join(lines)
 
 
-def preflight_report_path_for(state_path: Path) -> Path:
-    """<state>.json -> <state>.preflight.md (same directory, like the run
-    report)."""
-    return state_path.parent / (state_path.stem + ".preflight.md")
-
-
-def collect_capture_path_for(state_path: Path) -> Path:
-    """<state>.json -> <state>.pytest-collect.txt — the capture file
-    contract_extract.py --pytest-collect replays."""
-    return state_path.parent / (state_path.stem + ".pytest-collect.txt")
+def _artifact_path(state_path: Path, suffix: str) -> Path:
+    """Sibling artifact of the state file: <state>.json -> <state><suffix>."""
+    return state_path.parent / (state_path.stem + suffix)
 
 
 def _skipped_record(cid: str, hard: bool) -> dict:
@@ -1016,10 +1005,9 @@ def cmd_preflight(args) -> int:
     subs = load_substitutions(args.substitutions)
     today = date.today()
     skipped = {SKIP_TO_CHECK[s] for s in (args.skip or [])}
-    checks: dict[str, dict] = {}
     warnings: list[str] = []
 
-    # target root + interpreter (everything below depends on these)
+    # everything below depends on the target root + its venv interpreter
     root, root_note = _resolve_target_root(args.target_root, state)
     if root is None:
         warnings.append(f"target root unresolved — {root_note}")
@@ -1029,43 +1017,37 @@ def cmd_preflight(args) -> int:
         warnings.append(f"{venv_note} — suite/self-test fall back to "
                         f"{sys.executable}; if the suite needs the venv's "
                         f"dependencies this fails loudly with the output tail")
-    checks["target_interpreter"], warn = _check_target_interpreter(
-        root, venv_python, venv_note)
-    if warn:
-        warnings.append(warn)
 
-    # template reachability + provenance SHA (Stage 3)
-    checks["template"] = (_skipped_record("template", True)
-                          if "template" in skipped
-                          else _check_template(args.template_url))
+    def run_check(cid, hard, run, *, needs_root=False):
+        """One code path for every check: --skip records an explicit skip
+        (a warning, never silent); a check needing the target when none was
+        resolved is unprovable (a failure when hard); else run it."""
+        if cid in skipped:
+            return _skipped_record(cid, hard)
+        if needs_root and root is None:
+            return _unprovable_record(cid, hard,
+                                      f"target root unresolved — {root_note}")
+        return run()
 
-    # oracle self-test, re-proven per run under the judging interpreter
-    checks["oracle_selftest"] = (
-        _skipped_record("oracle_selftest", True) if "oracle_selftest" in skipped
-        else _check_selftest(python))
+    checks = {
+        "target_interpreter": _check_target_interpreter(root, venv_python,
+                                                        venv_note),
+        "template": run_check("template", True,
+                              lambda: _check_template(args.template_url)),
+        "oracle_selftest": run_check("oracle_selftest", True,
+                                     lambda: _check_selftest(python)),
+        "pytest_collect": run_check(
+            "pytest_collect", False,
+            lambda: _check_pytest_collect(
+                python, root, _artifact_path(path, ".pytest-collect.txt")),
+            needs_root=True),
+        "suite": run_check("suite", True,
+                           lambda: _check_suite(python, root), needs_root=True),
+        "toolchain": run_check("toolchain", False, _check_toolchain),
+    }
+    if venv_python is None:
+        warnings.append(f"target interpreter unresolved: {venv_note}")
 
-    # pytest collection capture (Stage 2 / contract_extract)
-    if "pytest_collect" in skipped:
-        checks["pytest_collect"] = _skipped_record("pytest_collect", False)
-    elif root is None:
-        checks["pytest_collect"] = _unprovable_record(
-            "pytest_collect", False, f"target root unresolved — {root_note}")
-    else:
-        checks["pytest_collect"] = _check_pytest_collect(
-            python, root, collect_capture_path_for(path))
-
-    # the spec itself: target suite green + wall time (Stage 2 baseline)
-    if "suite" in skipped:
-        checks["suite"] = _skipped_record("suite", True)
-    elif root is None:
-        checks["suite"] = _unprovable_record(
-            "suite", True, f"target root unresolved — {root_note}")
-    else:
-        checks["suite"] = _check_suite(python, root)
-
-    # toolchain (soft) + substitutions freshness + interpreter match
-    checks["toolchain"] = (_skipped_record("toolchain", False)
-                           if "toolchain" in skipped else _check_toolchain())
     if checks["toolchain"].get("missing"):
         warnings.append("toolchain missing: "
                         + ", ".join(checks["toolchain"]["missing"])
@@ -1092,23 +1074,24 @@ def cmd_preflight(args) -> int:
     if mismatch:
         warnings.append(mismatch)
 
-    # hard prerequisites: failed OR unproven -> exit 2; skipped -> warning
+    # a hard check that failed or could not run (ok is not True) is a hard
+    # failure (exit 2); one skipped via --skip is only a warning
     hard_failures = [cid for cid in HARD_CHECKS
                      if not checks[cid].get("skipped")
                      and checks[cid].get("ok") is not True]
-    for cid in HARD_CHECKS:
-        if checks[cid].get("skipped"):
-            warnings.append(f"hard prerequisite '{cid}' skipped by --skip — "
-                            f"NOT proven this run")
+    warnings.extend(f"hard prerequisite '{cid}' skipped by --skip — "
+                    f"NOT proven this run"
+                    for cid in HARD_CHECKS if checks[cid].get("skipped"))
 
-    # target: the machine-facing summary Stage 3/4 pin from (the venv
-    # interpreter IS the derived PYO3_PYTHON); root recorded for re-runs
-    ti = checks["target_interpreter"]
-    target_summary = {"root": ti.get("root")}
+    # machine-facing summary Stage 3/4 pin from; the venv interpreter IS the
+    # derived PYO3_PYTHON, and root is recorded so re-runs need no flag
+    target_check = checks["target_interpreter"]
+    target_summary = {"root": target_check.get("root")}
     for key in ("python", "version", "gil_disabled", "wheel_flavor",
                 "pyo3_python"):
-        target_summary[key] = ti.get(key)
+        target_summary[key] = target_check.get(key)
 
+    report_path = _artifact_path(path, ".preflight.md")
     block = {
         "timestamp": now_iso(),
         "ok": not hard_failures,
@@ -1118,7 +1101,7 @@ def cmd_preflight(args) -> int:
         "framework_python": framework_python,
         "target": target_summary,
         "checks": checks,
-        "report_path": str(preflight_report_path_for(path)),
+        "report_path": str(report_path),
     }
     old = state.get("preflight")
     state["preflight"] = block
@@ -1129,19 +1112,18 @@ def cmd_preflight(args) -> int:
         return _emit_refusal(f"preflight block rejected — resulting state "
                              f"would be invalid: {e}", args.human,
                              file=str(path), rolled_back=True)
-    report = build_preflight_report(
-        state.get("project", {}).get("name", "?"), block)
-    rp = preflight_report_path_for(path)
-    rp.write_text(report, encoding="utf-8")
+    report_path.write_text(
+        build_preflight_report(state.get("project", {}).get("name", "?"), block),
+        encoding="utf-8")
 
     code = EXIT_FINDINGS if hard_failures else EXIT_OK
     human = (f"preflight {'OK' if not hard_failures else 'FAILED'}: "
              f"{len(checks)} check(s), {len(hard_failures)} hard failure(s), "
-             f"{len(warnings)} warning(s) -> {path} + {rp}")
+             f"{len(warnings)} warning(s) -> {path} + {report_path}")
     emit({"tool": TOOL, "version": VERSION, "file": str(path),
           "ok": not hard_failures, "hard_failures": hard_failures,
           "warnings": warnings, "checks": checks,
-          "report_path": str(rp),
+          "report_path": str(report_path),
           "summary": {"exit_code": code, "human": human}},
          human_flag=args.human)
     return code

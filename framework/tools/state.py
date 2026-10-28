@@ -179,17 +179,17 @@ def validate_schema(instance, schema: dict, path: str = "$", errors: list | None
         for key in schema.get("required", []):
             if key not in instance:
                 errors.append(f"{path}: missing required property {key!r}")
-        for key, sub in schema.get("properties", {}).items():
+        properties = schema.get("properties", {})
+        for key, sub in properties.items():
             if key in instance:
                 validate_schema(instance[key], sub, f"{path}.{key}", errors)
         addl = schema.get("additionalProperties")
         if addl is not None:
             for key, value in instance.items():
-                if key in schema.get("properties", {}):
+                if key in properties:
                     continue
                 if addl is False:
-                    errors.append(f"{path}: additional property {key!r} "
-                                  f"is not allowed")
+                    errors.append(f"{path}: additional property {key!r} is not allowed")
                 elif isinstance(addl, dict):
                     validate_schema(value, addl, f"{path}.{key}", errors)
     elif isinstance(instance, list):

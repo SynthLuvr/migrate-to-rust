@@ -12,10 +12,13 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from datetime import date
 from pathlib import Path
+
+import pytest
 
 import pipeline as pipeline_tool
 import state as state_tool
@@ -516,11 +519,8 @@ def test_status_summarizes_the_run(monkeypatch, capsys, tmp_path):
 
 
 # ------------------------------------------------- preflight (issue #31) --
-# one command that runs and records everything stages 0/3 silently assumed:
-# suite green + wall time, pytest collection capture, oracle self-test 5/5,
-# rust-template SHA, toolchain, target venv/interpreter/PYO3_PYTHON,
-# substitutions freshness, framework-vs-target interpreter match. The
-# template check runs offline against this repo's own git checkout.
+# e2e against a throwaway target repo; the template check runs offline
+# against this repo's own git checkout (--template-url REPO_ROOT).
 
 def _target_project(tmp_path, *, failing=False):
     """A throwaway target repo: a tests/ suite (green or red) plus a fake
@@ -535,7 +535,6 @@ def _target_project(tmp_path, *, failing=False):
         body += "\n\ndef test_broken():\n    assert 1 + 1 == 3\n"
     (root / "tests" / "test_math.py").write_text(body)
     if os.name == "nt":
-        import pytest
         pytest.skip("the exec-wrapper venv fixture is POSIX-only")
     vbin = root / ".venv" / "bin"
     vbin.mkdir(parents=True)
@@ -570,7 +569,6 @@ def test_preflight_green_writes_block_report_and_journal(monkeypatch, capsys,
     st = _load(p)
     pf = st["preflight"]
     assert pf["ok"] is True and pf["hard_failures"] == []
-    # provenance: the template SHA captured from THIS run (Stage 3 cites it)
     head = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
                           capture_output=True, text=True,
                           check=True).stdout.strip()
@@ -590,7 +588,7 @@ def test_preflight_green_writes_block_report_and_journal(monkeypatch, capsys,
     capture = Path(collect["capture"])
     assert capture == tmp_path / "state.pytest-collect.txt"
     assert capture.read_text().count("::") == 2
-    # the target interpreter block Stage 3/4 pin from
+    # the target interpreter summary Stage 3/4 pin from
     ti = pf["checks"]["target_interpreter"]
     assert ti["ok"] and ti["pyo3_python"] == ti["python"]
     assert ti["python"].endswith("/.venv/bin/python")
@@ -683,7 +681,6 @@ def test_preflight_warns_when_no_target_venv_is_found(monkeypatch, capsys,
                                                       tmp_path):
     p = _init_state(monkeypatch, capsys, tmp_path)
     root = _target_project(tmp_path)
-    import shutil
     shutil.rmtree(root / ".venv")
     code, out = _preflight(monkeypatch, capsys, p, root)
     # soft: the suite/self-test ran under the framework interpreter instead
