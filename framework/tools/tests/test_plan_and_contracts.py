@@ -168,11 +168,8 @@ def test_contract_files_written(monkeypatch, capsys, tmp_path):
 
 
 # ------------------------------------------- src-as-package layout (#26) ---
-# Some projects' import root IS the top-level src/ directory: tests do
-# ``from src.parse import ...`` and entry points read ``src.cli:main``.
-# module_name_of() strips the src/ prefix (-> "parse"), so matching only
-# the stripped spelling reported EVERY unit uncovered and EVERY test
-# dangling (issue #26).
+# These projects' import root IS the top-level src/ directory, so tests
+# import ``src.<module>`` — the spelling module_name_of() strips away.
 
 def _srcpkg(tmp_path):
     proj = tmp_path / "srcproj"
@@ -213,12 +210,11 @@ def test_src_layout_imports_cover_units(monkeypatch, capsys, tmp_path):
         "--pytest-collect", str(collect)])
     assert code == 0, out["summary"]["human"]
     assert out["coverage_pct"] == 100.0
-    assert out["uncovered_units"] == [] and out["dangling_tests"] == []
+    assert out["uncovered_units"] == []
+    assert out["dangling_tests"] == []
     by_unit = {c["unit"]: c for c in out["contracts"]}
-    assert by_unit["u-parse"]["covering_tests"] == \
-        ["tests/test_parse.py::test_roundtrip"]
-    assert by_unit["u-rank"]["covering_tests"] == \
-        ["tests/test_rank.py::test_sorted"]
+    assert by_unit["u-parse"]["covering_tests"] == ["tests/test_parse.py::test_roundtrip"]
+    assert by_unit["u-rank"]["covering_tests"] == ["tests/test_rank.py::test_sorted"]
     assert out["layout_mismatch_suspected"] is False
 
 
@@ -240,8 +236,7 @@ def test_src_layout_still_flags_true_uncovered_and_dangling(monkeypatch, capsys,
     assert code == 2
     assert out["uncovered_units"] == ["u-rank"]  # no test imports src.rank
     assert out["coverage_pct"] == 50.0
-    assert [d["nodeid"] for d in out["dangling_tests"]] == \
-        ["tests/test_engine.py::test_engine"]
+    assert [d["nodeid"] for d in out["dangling_tests"]] == ["tests/test_engine.py::test_engine"]
     by_unit = {c["unit"]: c for c in out["contracts"]}
     assert by_unit["u-parse"]["covering_tests"] == ["tests/test_parse.py::test_roundtrip"]
     assert out["layout_mismatch_suspected"] is False  # partial coverage: not a mismatch

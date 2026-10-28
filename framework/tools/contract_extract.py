@@ -9,11 +9,9 @@ already exist (an LLM may enrich them later; that is an edit, not a check).
 
 Test → unit mapping (deterministic, in priority order):
   1. the test file imports the unit's module (``from pkg.parse import x`` /
-     ``import pkg.parse`` / aliased attribute use) — authoritative. A unit
-     answers to BOTH the layout-stripped dotted name (``src/pkg/parse.py`` →
-     ``pkg.parse``) and the un-stripped one (``src.pkg.parse``): projects
-     whose import root IS the top-level ``src/`` directory import the latter
-     (issue #26);
+     ``import pkg.parse`` / aliased attribute use), matched under both the
+     layout-stripped name and the un-stripped ``src.``-prefixed one
+     (issue #26) — authoritative;
   2. filename convention ``test_<module>.py`` / ``<module>_test.py`` when the
      test file has no scoped imports at all.
 Tests matching no scoped unit are DANGLING and reported (never dropped
@@ -95,6 +93,13 @@ def imports_of(tree: ast.Module) -> set[str]:
             if node.module and node.level == 0:
                 mods.add(node.module)
     return mods
+
+
+def imports_any_of(imported: set[str], candidates: list[str]) -> bool:
+    """True when a candidate is among ``imported``, exactly or as a parent
+    package (import ``pkg.parse`` covers the unit module ``pkg``)."""
+    return any(c in imported or any(m.startswith(c + ".") for m in imported)
+               for c in candidates)
 
 
 def docstring_invariants(node) -> list[str]:
@@ -183,11 +188,7 @@ def cmd_extract(args) -> int:
             test_trees[tf] = ast.parse(path.read_text()) if path else None
 
     # module names come from the DECLARED python_path (project-relative),
-    # matching how test files import them — never from the resolved location.
-    # Each unit answers to BOTH the layout-stripped dotted name
-    # (src/pkg/parse.py -> pkg.parse) and the un-stripped one (src.pkg.parse):
-    # projects whose import root IS the top-level src/ directory import the
-    # latter (issue #26) — match either spelling.
+    # matching how test files import them — never from the resolved location
     module_of_unit = {u["id"]: module_name_of(u["python_path"]) for u in units}
     candidates_of_unit = {u["id"]: import_candidates_of(u["python_path"])
                           for u in units}
@@ -201,11 +202,8 @@ def cmd_extract(args) -> int:
             dangling.append({"nodeid": nodeid, "reason": "test file not found in project"})
             continue
         tmods = imports_of(tree)
-        matched = []
-        for uid, cands in candidates_of_unit.items():
-            if any(c in tmods or any(m.startswith(c + ".") for m in tmods)
-                   for c in cands):
-                matched.append(uid)
+        matched = [uid for uid, cands in candidates_of_unit.items()
+                   if imports_any_of(tmods, cands)]
         if not matched and not tmods:
             # filename convention fallback: tests/test_parse.py -> *.parse
             stem = Path(tf).stem
@@ -215,8 +213,7 @@ def cmd_extract(args) -> int:
                 matched = [uid for uid, umod in module_of_unit.items()
                            if umod.split(".")[-1] == tail]
         if not matched:
-            dangling.append({"nodeid": nodeid,
-                             "reason": NO_UNIT_MATCH})
+            dangling.append({"nodeid": nodeid, "reason": NO_UNIT_MATCH})
         for uid in matched:
             covering[uid].append(nodeid)
 
@@ -271,18 +268,18 @@ def cmd_extract(args) -> int:
     # uncovered units fail unless explicitly tolerated (still reported)
     hard = dangling + ([] if args.allow_uncovered else uncovered)
     code = EXIT_FINDINGS if hard else EXIT_OK
-    # An all-uncovered board where the dangling tests DID import something
-    # (that matched no unit) reads like a weak suite, but is far more likely
-    # a layout/import-root mismatch than 1243 useless tests — say so instead
-    # of a bare wall of nodeids (issue #26).
-    layout_mismatch_suspected = bool(unit_files) and len(uncovered) == len(unit_files) \
-        and any(d["reason"] == NO_UNIT_MATCH for d in dangling)
+    # every unit uncovered while dangling tests match no unit module name is
+    # far more likely a layout/import-root mismatch than a useless suite —
+    # hint at it instead of printing a bare wall of nodeids (issue #26)
+    all_uncovered = bool(unit_files) and len(uncovered) == len(unit_files)
+    layout_mismatch_suspected = all_uncovered and any(
+        d["reason"] == NO_UNIT_MATCH for d in dangling)
+    mismatch_hint = (" — likely layout mismatch: no test import matched any "
+                     "unit module name; check the units' python_path import "
+                     "root" if layout_mismatch_suspected else "")
     human = (f"contracts: {len(contracts)} unit(s), coverage {coverage_pct}% "
              f"({len(uncovered)} uncovered), {len(dangling)} dangling test(s)"
-             + ("; FAIL" if code == EXIT_FINDINGS else "")
-             + (" — likely layout mismatch: no test import matched any unit "
-                "module name; check the units' python_path import root"
-                if layout_mismatch_suspected else ""))
+             + ("; FAIL" if code == EXIT_FINDINGS else "") + mismatch_hint)
     payload = {
         "tool": TOOL, "version": VERSION,
         "contracts": contracts,
