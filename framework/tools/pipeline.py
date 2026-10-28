@@ -269,14 +269,22 @@ def _eval_go_no_go(state, gate, rule, ctx):
     bar = _num(params.get("min_end_to_end_saving_pct"), float) or 50.0
     gng = state.get("go_no_go") or {}
     projection = gng.get("projection") or {}
-    saving = _num(projection.get("end_to_end_saving_pct"))
+    # issue #34: the projection is a *claim* until a matched A/B benchmark
+    # exists — when bench_ab.py has recorded a measured end_to_end_saving_pct
+    # on the gate, the measurement outranks the Stage-0 estimate
+    ev = parse_evidence(gate.get("evidence"))
+    measured = _num(ev.get("end_to_end_saving_pct"))
+    saving = measured if measured is not None else _num(
+        projection.get("end_to_end_saving_pct"))
+    source = ("measured (bench_ab A/B)" if measured is not None
+              else "projected (Stage 0)")
     scope = gng.get("scope") or []
     if saving is None or not scope:
         return _decision("go_no_go", rule, UNDECIDABLE,
                          "projection/scope not recorded — Stage 0 exit criteria "
                          "unmet; nothing to decide on", [])
     blocking = [d for d in (gng.get("no_equivalent_deps") or []) if d in scope]
-    evidence = [f"end_to_end_saving_pct={saving} (bar >= {bar})",
+    evidence = [f"end_to_end_saving_pct={saving} (bar >= {bar}, {source})",
                 f"scoped_loc={projection.get('scoped_loc')}",
                 f"scope={','.join(scope)}"]
     if blocking:
@@ -286,13 +294,13 @@ def _eval_go_no_go(state, gate, rule, ctx):
                          f"substitute)", evidence + [f"blocking={blocking}"])
     if saving >= bar:
         return _decision("go_no_go", rule, "approved",
-                         f"go — projection meets the bar ({saving}% >= {bar}%); "
-                         f"scope is the recorded minimal tranche", evidence,
-                         go_decision="go")
+                         f"go — {source} saving meets the bar ({saving}% >= "
+                         f"{bar}%); scope is the recorded minimal tranche",
+                         evidence, go_decision="go")
     on_reject = rule.get("on_reject") or {}
     return _decision("go_no_go", rule, "rejected",
                      on_reject.get("note") or
-                     "no-go — projected saving below the bar; keep/optimize the "
+                     f"no-go — {source} saving below the bar; keep/optimize the "
                      f"Python ({saving}% < {bar}%)", evidence,
                      go_decision="no-go", run_status="no_go_measured")
 

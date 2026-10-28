@@ -122,6 +122,24 @@ def test_go_rule_undecidable_without_projection():
     assert d["decision"] == pipeline_tool.UNDECIDABLE
 
 
+def test_go_rule_prefers_measured_evidence_over_the_projection():
+    # issue #34: the ≥50% bar is a claim until a matched A/B benchmark
+    # exists — bench_ab.py records the measurement on the gate, and GO-1
+    # reads it INSTEAD of the Stage-0 projection (honest reporting)
+    state = {"go_no_go": {"decision": "go", "scope": ["demo.parse"],
+                          "projection": {"end_to_end_saving_pct": 80.0},
+                          "no_equivalent_deps": []}}
+    gate = _gate("go_no_go", evidence=["end_to_end_saving_pct=42.5",
+                                       "measured_by=bench_ab"])
+    d = _decide(state, gate)
+    assert d["decision"] == "rejected"
+    assert d["run_status"] == "no_go_measured"
+    assert any("42.5" in e and "measured" in e for e in d["evidence"])
+    # without the measurement the same projection still approves
+    d = _decide(state, _gate("go_no_go"))
+    assert d["decision"] == "approved"
+
+
 def test_substitution_rule_picks_highest_ranked_freshly_verified_crate():
     d = _decide({}, _gate("crate_substitution", evidence=["python=freshlib"]))
     assert d["decision"] == "approved"

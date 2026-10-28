@@ -847,6 +847,17 @@ def _module_from_rust_path(rust_path: str) -> str:
     return ".".join(parts)
 
 
+def fallback_env_var(state: dict, env_prefix: str | None = None) -> str:
+    """The one env var every generated shim reads: <PREFIX>_FALLBACK, the
+    prefix from --env-prefix or the project name (non-alnum -> _). bench_ab
+    imports this so the A/B harness flips the exact var the shims read —
+    the derivation cannot drift between the two tools."""
+    prefix = (env_prefix or
+              re.sub(r"[^0-9A-Za-z]+", "_",
+                     state.get("project", {}).get("name", "migration")).upper())
+    return f"{prefix}_FALLBACK"
+
+
 SHIM_TEMPLATE = '''"""Auto-generated per-unit fallback switch — framework/tools/state.py shim.
 
 Unit:  {unit}  ({python_path} -> {rust_path})
@@ -902,9 +913,7 @@ def cmd_shim(args) -> int:
                         f"switch to yet", args.human, unit=args.unit)
     python_import = args.python_import or module_name_of(unit["python_path"])
     rust_import = args.rust_import or _module_from_rust_path(unit["rust_path"])
-    prefix = (args.env_prefix or
-              re.sub(r"[^0-9A-Za-z]+", "_", state.get("project", {}).get("name", "migration")).upper())
-    env_var = f"{prefix}_FALLBACK"
+    env_var = fallback_env_var(state, args.env_prefix)
     code = SHIM_TEMPLATE.format(
         unit=unit["id"], python_path=unit["python_path"], rust_path=unit["rust_path"],
         status=unit.get("status", "pending"), env_var=env_var,

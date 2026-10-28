@@ -171,9 +171,9 @@ raise its own level mid-run.
 
 | Gate (former human stop) | Rule | Resolution |
 |---|---|---|
-| Stage-0 GO/NO-GO + scope | `GO-1` | decided from the recorded projection: ≥ 50% end-to-end saving and nothing no-equivalent still in scope → **go**; below the bar → **no-go — a successful terminal state** (`no_go_measured`): keep or optimize the Python |
+| Stage-0 GO/NO-GO + scope | `GO-1` | decided from the recorded projection: ≥ 50% end-to-end saving and nothing no-equivalent still in scope → **go**; below the bar → **no-go — a successful terminal state** (`no_go_measured`): keep or optimize the Python. A measured `end_to_end_saving_pct` (recorded by `tools/bench_ab.py` `--gate go_no_go`) outranks the projection — the bar is a claim until a matched A/B benchmark exists |
 | Crate substitution (e.g. `fractions` → `num-rational`) | `SUB-1` | highest-ranked crate in `knowledge/substitutions.json` whose verification is canonical or fresh (≤ N months); no fresh candidate → the module stays Python. Never a crate outside the table |
-| Stage-1 redesign proposals | `RED-1` | approved iff a spike passes the oracle on the golden corpus **and** the matched-corpus benchmark clears the bar; else keep the literal shape (safe default — correctness gates apply either way) |
+| Stage-1 redesign proposals | `RED-1` | approved iff a spike passes the oracle on the golden corpus **and** the matched-corpus benchmark clears the bar (`bench_ab.py --gate redesign_approval` records `bench_improvement_pct`); else keep the literal shape (safe default — correctness gates apply either way) |
 | No-equivalent dependency | `DEP-1` | **descope, don't stop**: the module stays Python (dual-build fallback), dependents drop from the tranche transitively; on the critical path the tranche is dropped and the run continues. "Never improvise a substitute" is unchanged |
 | Escalated unit | `ESC-1` | **defer, don't halt**: mark, keep the Python fallback live, continue the backlog; escalations drain into the end-of-run dossier |
 | Mid-run scope change | `SC-1` | conservative reject — recorded for the report; growing scope re-enters Stage 0 in a fresh run |
