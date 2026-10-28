@@ -11,13 +11,14 @@ Purpose: ship the wheel and move traffic, reversibly.
    Equivalent / Divergent / Incomparable).
 4. Canary: one instance (Discord rollout: load-test → one canary → fleet),
    metrics: latency, memory, error rate, diff rate.
-5. Cutover on clean diff window — resolved at the `cutover` gate:
-   **human approval** at L0/L1; `policy:CUT-1` at L2/L3 (approved only at
-   L3 with `publish_allowed` iff shadow diff rate = 0 over ≥ N samples AND
-   canary green ≥ M minutes AND rollback actually tested; at L2 the gate
-   resolves *rejected* — publish disabled, the run completes on the
-   dual-build). Record the shadow/canary/rollback evidence on the gate
-   either way.
+5. Cutover on clean diff window — resolved at the `cutover` gate by
+   policy `CUT-1` (approved only at L3 with `publish_allowed` iff shadow
+   diff rate = 0 over ≥ N samples AND canary green ≥ M minutes AND
+   rollback actually tested; at L2 — the default — the gate resolves
+   *rejected*: publish disabled, the run completes on the dual-build; at
+   L0/L1 the gate stays open, nothing publishes mid-run, and the operator
+   decides between runs). Record the shadow/canary/rollback evidence on
+   the gate either way.
 6. Keep the dual-build state: per-unit Python fallback remains callable until
    Stage 7 retires it deliberately.
 7. Document the rollback path (previous wheel pin) in the release notes.
@@ -25,8 +26,9 @@ Purpose: ship the wheel and move traffic, reversibly.
 ## Exit criteria
 - [ ] Shadow diff window clean (rate agreed with the operator/policy)
 - [ ] Canary SLOs met; memory and CPU measured, not estimated
-- [ ] Cutover gate resolved (`decided_by: human` at L0/L1,
-      `policy:CUT-1` at L2+, evidence journaled)
+- [ ] Cutover gate resolved (`decided_by: policy:CUT-1` at L2+ with
+      evidence journaled; at L0/L1 the gate stays open and the run ends
+      for operator review — nothing publishes mid-run)
 - [ ] Rollback path tested, not just written
 
 ## Escalate

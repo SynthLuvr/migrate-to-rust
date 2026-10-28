@@ -15,8 +15,10 @@ else happens until this is signed.
    Record negative signals explicitly; porting I/O-bound code buys nothing.
 6. Portability scan (Semgrep/CodeQL, both languages): dynamic dispatch,
    reflection, monkey-patching, C extensions, task queues → risk flags per module.
-7. Map dependencies against `knowledge/substitutions.json`; list any with no
-   maintained Rust equivalent for human decision.
+7. Map dependencies against `knowledge/substitutions.json`; list any with
+   no maintained Rust equivalent — descoped via policy `DEP-1` (the
+   module keeps its Python fallback), never improvised, never queued for
+   a mid-run human decision.
 8. Project the saving: bar = **≥ 50% of end-to-end time** (Google). Estimate
    tokens ≈ $0.17/LOC × scoped LOC + regression tail ≈ 2× migration effort.
 
@@ -28,10 +30,11 @@ GO/NO-GO recommendation.
 ## Exit criteria
 - [ ] Hotspot list backed by profiler output, not intuition
 - [ ] Scope drawn (the minimal tranche meeting the bar) and the go/no-go
-      gate resolved — `decided_by: human` at L0/L1, `policy:GO-1` at L2+
-      (journaled with the projection evidence)
-- [ ] No-equivalent dependencies surfaced (resolved by descope via
-      `policy:DEP-1` at L2+ — descope, don't stop)
+      gate resolved in code — `policy:GO-1` at the default L2+ (journaled
+      with the projection evidence); at L0/L1 the gate stays open and the
+      run ends for operator review (never asked mid-run)
+- [ ] No-equivalent dependencies surfaced and descoped (policy `DEP-1` —
+      the module stays Python; descope, don't stop)
 - [ ] GO recorded, or NO-GO recorded — NO-GO ends the run in the
       `no_go_measured` terminal state: a *successful* outcome, not a failure
 

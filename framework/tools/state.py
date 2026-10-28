@@ -934,9 +934,11 @@ def cmd_migrate(args) -> int:
     ensure(state, "budget_ledger",
            {"tokens_total": 0, "hours_human_total": 0.0, "regression_triage_hours": 0.0},
            "budget_ledger", None)
-    # issue #22 backfills: pre-authorization block (L0 keeps the supervised
-    # meaning), run_status, and decided_by for gates resolved before the
-    # policy layer existed — those were human decisions by definition
+    # issue #22 backfills: the autonomy block, run_status, and decided_by
+    # for gates resolved before the policy layer existed (human decisions
+    # by definition). The autonomy block backfills as L0 — never silently
+    # re-authorize a pre-policy run as autonomous (new runs init at the
+    # never-ask default L2).
     ensure(state, "autonomy", autonomy_block("L0"), "autonomy", None)
     ensure(state, "run_status", "pending", "run_status", None)
     for i, g in enumerate(state.get("human_gates", [])):
@@ -1028,10 +1030,11 @@ def main(argv=None) -> int:
     p.add_argument("--name", required=True)
     p.add_argument("--python-path", required=True)
     p.add_argument("--stage", type=int, default=0)
-    p.add_argument("--autonomy-level", default="L0", choices=sorted(POLICY_LEVELS),
+    p.add_argument("--autonomy-level", default="L2", choices=sorted(POLICY_LEVELS),
                    help="pre-authorized autonomy for the run (issue #22); "
-                        "L0 = supervised human gates, L2+ = policy-resolved, "
-                        "L3 = autopilot incl. cutover")
+                        "default L2 = all gates policy-resolved, never asks "
+                        "(L0/L1 = operator-supervised: gates stay open and the "
+                        "run ends with the dossier; L3 = autopilot incl. cutover)")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init)
 
