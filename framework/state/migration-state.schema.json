@@ -156,7 +156,8 @@
           "$comment": "run-level ceilings enforced by tools/pipeline.py; over either ceiling the run ends in the budget_exhausted terminal state",
           "properties": {
             "max_tokens": { "type": "integer", "minimum": 1 },
-            "max_wall_clock_minutes": { "type": "integer", "minimum": 1 }
+            "max_wall_clock_minutes": { "type": "integer", "minimum": 1 },
+            "max_chain_depth": { "type": "integer", "minimum": 1, "$comment": "issue #25 — the successor-session chain cap: session-level budget_exhausted spawns a successor GLV session automatically (tools/succession.py); this is how many successions may chain before the run ends failed_safely. The run-level ceilings above bound the whole chain (sum over sessions); successors get a fresh session budget, never a fresh run budget. Policy default 10." }
           }
         },
         "publish_allowed": { "type": "boolean", "$comment": "must be true (L3 only) for a policy-approved cutover; state.py rejects the combination otherwise" }
@@ -203,7 +204,44 @@
     },
     "run_status": {
       "enum": ["pending", "running", "complete", "no_go_measured", "budget_exhausted", "failed_safely"],
-      "$comment": "Terminal-state discipline (issue #22): a driver run ALWAYS ends in complete / no_go_measured / budget_exhausted / failed_safely — never 'awaiting input'. Every terminal state emits the same deliverable set (run report incl. the escalation dossier, state file, journal)."
+      "$comment": "Terminal-state discipline (issue #22): a driver run ALWAYS ends in complete / no_go_measured / budget_exhausted / failed_safely — never 'awaiting input'. Every terminal state emits the same deliverable set (run report incl. the escalation dossier, state file, journal). Issue #25: session-level budget_exhausted never survives a successor chain while GLV is reachable — tools/succession.py spawns the successor automatically; budget_exhausted remains a final status only for the run-level ceilings (or in degraded mode, GLV unreachable)."
+    },
+    "session_chain": {
+      "type": "object",
+      "$comment": "Issue #25 — the successor-session chain record, written by tools/succession.py through state.py's validated writer. budget_exhausted at the SESSION level (the orchestrator's context window) is a scheduling event: the harness spawns a successor GLV session with full resume context, journals a stop-notice (operator informed, not involved), and resets run_status to running. Guardrails recorded here: depth cap + per-session progress snapshots powering the monotonic-progress guard (a successor that advances neither stage nor ≥1 decided unit terminates the chain failed_safely — no infinite resume loops). Run-level ceilings (autonomy.budget) bound the entire chain; token spend sums through this one state file.",
+      "properties": {
+        "depth": { "type": "integer", "minimum": 0, "$comment": "successions so far = sessions - 1 (session 1 is the operator's prompt, not a succession)" },
+        "max_depth": { "type": "integer", "minimum": 1, "$comment": "the cap in force for this chain; over it the run ends failed_safely with the dossier" },
+        "wall_clock_minutes": { "type": "number", "$comment": "run-level wall clock summed over every session in the chain (each session adds settled_at - started_at)" },
+        "sessions": {
+          "type": "array",
+          "$comment": "orchestrator sessions, contiguous from index 1, oldest first; named run-<project>-s<n> per tools/glv-subagents.md",
+          "items": {
+            "type": "object",
+            "required": ["index", "id", "name"],
+            "properties": {
+              "index": { "type": "integer", "minimum": 1 },
+              "id": { "type": "string", "$comment": "GLV session id" },
+              "name": { "type": "string", "$comment": "run-<project>-s<index> — the succession surfaces in GLV session listings" },
+              "started_at": { "type": "string", "format": "date-time" },
+              "settled_at": { "type": "string", "format": "date-time" },
+              "glv_status": { "type": "string", "$comment": "GLV run-status vocabulary: queued | running | completed | stopped | error | idle" },
+              "outcome": { "type": ["string", "null"], "$comment": "the run_status the session left in the state file" },
+              "succession_reason": { "type": ["string", "null"], "$comment": "why this session was spawned (null for session 1: the operator's single prompt)" },
+              "progress_snapshot": {
+                "type": "object",
+                "$comment": "observable state at this session's spawn — the bar the session must clear for the chain to continue",
+                "properties": {
+                  "stage": { "type": ["integer", "null"] },
+                  "unit_status": { "type": "object", "additionalProperties": { "type": "integer" } },
+                  "tokens_spent": { "type": "integer" }
+                }
+              }
+            }
+          }
+        },
+        "notices": { "type": "array", "items": { "type": "string" }, "$comment": "stop-notices: one per succession (and any degraded-mode failure) — the operator-informing artifact; the operator stays informed, not involved" }
+      }
     },
     "journal": {
       "type": "array",

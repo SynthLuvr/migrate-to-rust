@@ -83,7 +83,7 @@ not in the repo being migrated.
 | `stages/0..7-*.md` | Per-stage checklists: purpose, steps, **exit criteria**, escalation triggers |
 | `roles/translator.md` | Subagent instructions for mechanical per-unit translation |
 | `roles/reviewer.md` | Subagent instructions for adversarial parity + PyO3-FFI review |
-| `tools/*.py` + `tools/README.md` | The 8 deterministic helpers — implemented, stdlib-only, JSON-in/JSON-out, acceptance-tested in `tools/tests/` — plus `tools/pipeline.py`, the deterministic driver for unattended L2+ runs (issue #22); specs, conventions, and quick reference in `tools/README.md` |
+| `tools/*.py` + `tools/README.md` | The 8 deterministic helpers — implemented, stdlib-only, JSON-in/JSON-out, acceptance-tested in `tools/tests/` — plus `tools/pipeline.py`, the deterministic driver for unattended L2+ runs (issue #22), and `tools/succession.py`, the session-chain harness that auto-spawns successor GLV sessions on session-level budget exhaustion so a run finishes from one prompt (issue #25); specs, conventions, and quick reference in `tools/README.md` |
 | `autonomy/policy.json` | The autonomy policy layer (issue #22): levels L0–L3 and one machine-decidable rule per gate with conservative defaults — evaluated only in code, journaled, never LLM self-approval. Default level L2; the agent never asks a human mid-run at any level (at L0/L1 gates stay open and the run ends with the dossier for between-runs operator review) |
 | `knowledge/substitutions.json` | Machine-readable crate mapping + no-equivalent zones (from `research/5`) |
 | `state/migration-state.schema.json` | The dual-build state manager schema — the resumable, per-unit-reversible record |

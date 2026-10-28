@@ -138,6 +138,54 @@ loop:
   explicit warning (the offline corner); the target root is recorded, so
   re-runs need no flag.
 
+## The session-chain harness — `succession.py` (issue #25)
+
+Also a composition layer, not a ninth gap-tool: it wraps a whole run in a
+**chain of GLV orchestrator sessions** so that `budget_exhausted` at the
+*session* level (the orchestrator's context window — the motivating run
+died at stage 4/7 with ~600k of 5M run tokens spent, and a human had to
+notice and restart by hand) becomes a scheduling event in code instead of
+"awaiting input":
+
+```console
+export GLV_BASE_URL="http://localhost:3000" GLV_API_TOKEN="glv_at_…"
+python framework/tools/succession.py chain \
+  --state runs/<project>/migration-state.json \
+  --prompt-file runs/<project>/first-prompt.md
+```
+
+Per session it: starts the GLV session with the brief (session 1 rides the
+operator's single prompt; successors get a composed resume brief — state
+file path, position, escalation dossier, journal tail, run-budget
+remaining, chain history, hygiene findings), parks on
+`GET /api/sessions/:id/wait` until it settles, and classifies from the
+state file (sessions write it only through `state.py`; GLV only carries
+the sessions). On session-level exhaustion — `run_status=budget_exhausted`
+under the run-level ceilings, or a session that settled without recording
+a terminal state — it runs **resume hygiene** (every unit's recorded
+paths verified against the target root; a mismatch with exactly one
+candidate on disk is repaired through `state.py`, journaled — the
+`crates/<crate>/src/u.rs` vs `src/u.rs` trap of run 20261028_4), spawns
+the successor (`run-<project>-s<n>`), stops the predecessor if still
+live, journals a **stop-notice** (operator informed, not involved), and
+resets `run_status` to `running`. Guardrails: a **depth cap**
+(`budget.max_chain_depth`, policy default 10) and a **monotonic-progress
+guard** (each successor must advance the stage or decide ≥1 unit vs. the
+snapshot taken at its spawn); either violated → `failed_safely` with the
+dossier — never an infinite resume loop. The **run-level ceilings bind
+the whole chain**: token spend sums through the single state file, wall
+clock sums over sessions — successors get a fresh session budget, never a
+fresh run budget. Only genuine terminals (`complete` / `no_go_measured` /
+`failed_safely`) — or the run-level ceilings themselves, the one honest
+`budget_exhausted` — end the chain. GLV unreachable at start → refusal
+with the documented degraded fallback (pre-#25 behavior: `pipeline.py
+run` + manual resume); unreachable mid-chain → the exhausted state stands
+with a notice, exit 0 — a terminal state, never a hang. Restartable
+anywhere: a re-invocation adopts a recorded-but-unsettled session.
+`succession.py hygiene` runs the resume-path check standalone (exit 2
+while unresolved); `succession.py brief` prints the next session's brief
+without side effects.
+
 ## The stage-4 candidate runner — `delegate.py` (issue #33)
 
 Also a composition layer, not a ninth gap-tool: it mechanizes the repair

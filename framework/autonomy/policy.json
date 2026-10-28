@@ -1,6 +1,6 @@
 {
   "$comment": "The autonomy policy layer (issue #22, proposal C): each former human gate becomes a machine-decidable rule with a conservative default, journaled and non-blocking. Evaluated only in code (tools/pipeline.py resolve-gates / tools/state.py resolve-gate) — never by LLM self-approval. Every decision records decided_by='policy:<rule-id>' + policy_version + evidence[] in migration-state.json. Levels: L0 = supervised (gates are hard stops — the agent never asks; it leaves the gate open and ends the run with the dossier for the operator to decide between runs); L1 = agent proposes into the dossier, operator decides between runs; L2 = all gates policy-resolved, publish disabled (the default — never asks); L3 = full autopilot incl. cutover. Operators pre-authorize the level BEFORE the run: there are zero mid-run questions at any level. The dual-build design is what makes autonomy safe — per-unit Python fallback, one-env-var shim, rollback pin; every autonomous decision stays reversible per unit.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "default_level": "L2",
   "levels": {
     "L0": {
@@ -29,10 +29,11 @@
     }
   },
   "budget": {
-    "$comment": "Global ceilings enforced by the driver (tools/pipeline.py run) — the run-level analogue of the per-unit MAX_ROUNDS budget. Copy into state.autonomy.budget at init time; the state block wins once present.",
+    "$comment": "Global ceilings enforced by the driver (tools/pipeline.py run) — the run-level analogue of the per-unit MAX_ROUNDS budget. Copy into state.autonomy.budget at init time; the state block wins once present. max_chain_depth (issue #25): session-level budget_exhausted (the orchestrator session's context window) spawns a successor GLV session automatically via tools/succession.py; the cap bounds how many successions may chain (over it, or if a successor advances no observable state, the run ends failed_safely with the dossier). The ceilings above bound the ENTIRE chain — token spend sums through the single migration-state.json, wall clock sums over sessions — so a fresh session budget never means a fresh run budget.",
     "max_tokens": 5000000,
     "max_wall_clock_minutes": 720,
-    "max_agent_retries_per_stage": 2
+    "max_agent_retries_per_stage": 2,
+    "max_chain_depth": 10
   },
   "rules": [
     {

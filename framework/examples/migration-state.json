@@ -1,5 +1,5 @@
 {
-  "$comment": "Worked example (issue #7): a filled migration-state.json for the fictional project 'duplifind', snapshot mid-Stage 7 of an L3 autopilot run (issue #22), deliberately showing one unit in each of the six statuses. Validates against migration-state.schema.json (CI: framework/state/check_examples.py) and passes the coherence checks of tools/state.py validate. Walkthrough: README.md next to this file.",
+  "$comment": "Worked example (issue #7): a filled migration-state.json for the fictional project 'duplifind', snapshot mid-Stage 7 of an L3 autopilot run (issue #22), deliberately showing one unit in each of the six statuses. The run reached Stage 5 chained: orchestrator session 1 exhausted its session budget mid-Stage-5 and tools/succession.py spawned the successor automatically (issue #25) — see session_chain and the 2026-08-20 run_status journal entries. Validates against migration-state.schema.json (CI: framework/state/check_examples.py) and passes the coherence checks of tools/state.py validate. Walkthrough: README.md next to this file.",
   "project": {
     "name": "duplifind",
     "python_path": "src/duplifind",
@@ -435,6 +435,22 @@
       "actor": "orchestrator"
     },
     {
+      "timestamp": "2026-08-20T09:14:00Z",
+      "unit": null,
+      "field": "run_status",
+      "from": "running",
+      "to": "budget_exhausted",
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-08-20T09:15:00Z",
+      "unit": null,
+      "field": "run_status",
+      "from": "budget_exhausted",
+      "to": "running",
+      "actor": "succession.py"
+    },
+    {
       "timestamp": "2026-09-02T08:30:00Z",
       "unit": null,
       "field": "stage",
@@ -503,6 +519,41 @@
     "tokens_total": 1890000,
     "hours_human_total": 15.5,
     "regression_triage_hours": 31.0
+  },
+  "session_chain": {
+    "depth": 1,
+    "max_depth": 10,
+    "wall_clock_minutes": 5126.5,
+    "sessions": [
+      {
+        "index": 1,
+        "id": "sess_01hy8k3t9d5f",
+        "name": "run-duplifind-s1",
+        "started_at": "2026-06-10T09:00:00Z",
+        "settled_at": "2026-08-20T09:14:00Z",
+        "glv_status": "completed",
+        "outcome": "budget_exhausted",
+        "succession_reason": null
+      },
+      {
+        "index": 2,
+        "id": "sess_01hy8m7w2x8q",
+        "name": "run-duplifind-s2",
+        "started_at": "2026-08-20T09:15:00Z",
+        "settled_at": "2026-09-22T07:45:00Z",
+        "glv_status": "completed",
+        "outcome": "complete",
+        "succession_reason": "session-level budget_exhausted: the orchestrator session's context window spent mid-Stage-5 (run-level budget 1.41M/5.0M tokens, 2140/7200 wall minutes over s1 — run-level ceilings not breached); resume context injected, run_status reset to running",
+        "progress_snapshot": {
+          "stage": 5,
+          "unit_status": {"pending": 1, "ported": 2, "divergent_explained": 1, "escalated": 1},
+          "tokens_spent": 1410000
+        }
+      }
+    ],
+    "notices": [
+      "stop-notice 2026-08-20T09:15:00Z: s1 run-duplifind-s1 (sess_01hy8k3t9d5f) settled 'budget_exhausted' at stage 5 — successor s2 run-duplifind-s2 (sess_01hy8m7w2x8q) spawned automatically with full resume context; run_status reset to running; operator informed, not involved"
+    ]
   },
   "autonomy": {
     "level": "L3",
