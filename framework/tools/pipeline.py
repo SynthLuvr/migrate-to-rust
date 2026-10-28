@@ -949,8 +949,10 @@ def cmd_resolve_gates(args) -> int:
             f"the operator decides between runs — record that decision with "
             f"`state.py resolve-gate --by human` outside the run, or "
             f"pre-authorize L2+ (nothing asks mid-run; --human-override forces "
-            f"evaluation here; the decision is still journaled policy:<rule>)",
-            args.human, file=str(path))
+            f"evaluation here; the decision is still journaled policy:<rule>). "
+            f"For a fresh run, `state.py init --autonomy-level L2` is the "
+            f"documented default; a hand-written state file without an "
+            f"autonomy block reads as L0", args.human, file=str(path))
     ctx = {"today": date.today(), "substitutions": load_substitutions(args.substitutions)}
     # the driver, not the stage worker, surfaces the gates the current stage
     # must decide — same rule the run loop uses

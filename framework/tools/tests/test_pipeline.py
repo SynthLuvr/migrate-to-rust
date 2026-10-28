@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pipeline as pipeline_tool
 import state as state_tool
-from conftest import TOOLS, run_tool
+from conftest import REPO_ROOT, TOOLS, run_tool
 
 TODAY = date(2026, 10, 27)  # pinned: freshness rules are evaluated against a fixed clock
 
@@ -258,7 +258,33 @@ def test_resolve_gates_refuses_supervised_levels(monkeypatch, capsys, tmp_path):
                          ["resolve-gates", str(p)])
     assert code == 2 and "L2" in out["error"]
     assert "nothing asks mid-run" in out["error"]
+    # issue #27: the refusal names the concrete fresh-run remediation
+    assert "state.py init --autonomy-level L2" in out["error"]
     assert _load(p)["human_gates"] == []  # nothing self-approved
+
+
+def test_resolve_gates_refusal_explains_schema_only_state(monkeypatch, capsys,
+                                                          mini_state):
+    """issue #27: autonomy is not schema-required, so a hand-written state
+    file (mini_state has no autonomy block) reads as L0 — the refusal must
+    say so and name the init remediation instead of leaving the operator
+    guessing."""
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["resolve-gates", str(mini_state)])
+    assert code == 2 and out["error"].startswith("autonomy=L0:")
+    assert "state.py init --autonomy-level L2" in out["error"]
+    assert "autonomy block reads as L0" in out["error"]
+
+
+def test_recipe_prompt_inits_state_via_state_py():
+    """issue #27: the recipe used to tell the orchestrator to hand-write the
+    state file from the schema — autonomy is not schema-required, so that
+    file read as L0 and the run's first resolve-gates failed. The prompt
+    must initialize through state.py init (autonomy journaled, default L2)."""
+    recipe = (REPO_ROOT / "framework" / "recipe.yaml").read_text()
+    assert "state.py init framework/state/migration-state.json" in recipe
+    # the hand-init phrasing that produced autonomy-less (L0) state is gone
+    assert "migration-state.json from" not in recipe
 
 
 def test_resolve_gates_dry_run_writes_nothing(monkeypatch, capsys, tmp_path):
