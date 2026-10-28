@@ -31,21 +31,24 @@ is instant and trustworthy.
      `.gitignore`, `.gitattributes`, `scripts/pandoc-md.sh`, the `[lints]`
      tables in `Cargo.toml`, and `AGENTS.md`'s enforced agent workflow
      (extend it with the port's conventions; keep its gate rules).
-   - **Adapt:** crate `name`/`description`/`license`; `deny.toml`'s
-     `[licenses] allow` — the template allows only `Apache-2.0`/`MIT`,
-     so the first `just check` after adding the `pyo3` dependency fails
-     the `deny` gate (`cargo deny check licenses`) on pyo3's two
-     transitive licenses: `Apache-2.0 WITH LLVM-exception`
-     (target-lexicon, via pyo3-build-config) and `Unicode-3.0`
-     (unicode-ident, via proc-macro2 → pyo3-macros) — add both, each
-     with a comment naming the dependency that brought it, per
-     deny.toml's own "add licenses deliberately, as real dependencies
-     bring them" (the same rule covers every dependency Stage 4+ adds);
-     raise `rust-toolchain.toml` and the MSRV (`rust-version`, `just
-     msrv`, the CI `msrv` job) only together; add a workspace only if
-     the port scope splits per component; if the crate is a
-     subdirectory of the target repo, point the CI workflow's
-     checkout/working-directory at it (the template assumes repo root).
+   - **Adapt:**
+     - crate `name`/`description`/`license`
+     - `deny.toml`'s `[licenses] allow`: the template allows only
+       `Apache-2.0`/`MIT`, so the first `just check` after adding the
+       `pyo3` dependency fails the `deny` gate (`cargo deny check
+       licenses`) on pyo3's two transitive licenses — `Apache-2.0 WITH
+       LLVM-exception` (target-lexicon, via pyo3-build-config) and
+       `Unicode-3.0` (unicode-ident, via proc-macro2 → pyo3-macros).
+       Add both, each with a comment naming the dependency that brought
+       it, per deny.toml's own "add licenses deliberately, as real
+       dependencies bring them" — the same rule covers every
+       dependency Stage 4+ adds.
+     - raise `rust-toolchain.toml` and the MSRV (`rust-version`, `just
+       msrv`, the CI `msrv` job) only together
+     - add a workspace only if the port scope splits per component
+     - if the crate is a subdirectory of the target repo, point the CI
+       workflow's checkout/working-directory at it (the template
+       assumes repo root)
    - **Replace:** `src/lib.rs` → PyO3 skeleton (step 2); `src/main.rs` →
      thin wrapper, or drop for a wheel-only crate; `tests/basic.rs` →
      port tests; `README.md` → port README.
