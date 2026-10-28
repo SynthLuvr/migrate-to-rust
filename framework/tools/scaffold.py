@@ -66,14 +66,29 @@ Heuristic mapping (signature annotation -> generator/rebuilder):
   list/set/frozenset/dict/tuple, the    -> recursive generators; the adapter
   Sequence/Mapping/Iterable aliases       rebuilds real list/set/dict/tuple
   Optional[X] / X | None / X | Y         -> optional / union
+  list/tuple series parameters          -> realistic lengths + content
+                                          (issue #49): random-walk series
+                                          of 60-320 elements dominate —
+                                          coherent OHLCV bars (high/low
+                                          bracket the bar, open chains to
+                                          the previous close) for open/
+                                          high/low/close dataclass items,
+                                          walked floats/ints otherwise —
+                                          with a short-length minority
+                                          kept as deliberate error rows;
+                                          0-9 element lists left series
+                                          functions (52+ bars, 63+
+                                          values) erroring on nearly
+                                          every row
   @dataclass in the unit module or any   -> rows carry a {field: value}
   project module it imports                dict; the adapter calls the real
   constructor (nested dataclasses recurse)
-  anything else                           -> flagged for HAND-COMPLETION,
-                                           never guessed: the parameter
-                                           generates None, the reason is in
-                                           the payload's hand_tune[] and in
-                                           a HAND-TUNE block in BOTH adapters
+  anything else — including inside a    -> flagged for HAND-COMPLETION,
+  list or a dataclass field               never guessed: the parameter
+                                          generates None/JSON-any
+                                          stand-ins, the reason is in the
+                                          payload's hand_tune[] and in a
+                                          HAND-TUNE block in BOTH adapters
 
 Symmetry is by construction: both adapters are rendered from one template
 and differ ONLY inside the delimited BACKEND section; the payload records
@@ -82,10 +97,11 @@ the sha256 of the shared remainder as evidence (identical on both sides).
 Self-check before reporting success: the freshly generated corpus is
 dry-run against the reference adapter through oracle.py's own subprocess
 runner, so a corpus that would judge hollow (all-error reference — issue
-#30) or a malformed format (issue #29) is a finding here, in seconds. In
-module mode the dry-run also tallies per-function envelope errors: every
-judged function erroring on every row is a degenerate-corpus finding, and
-a single all-error function is a warning (its parity is unjudged).
+#30), thin (reference ok below min_reference_ok_fraction — issue #49), or
+malformed (issue #29) is a finding here, in seconds. In module mode the
+dry-run also tallies per-function envelope errors: every judged function
+erroring on every row is a degenerate-corpus finding, and a single
+all-error function is a warning (its parity is unjudged).
 
 Exit codes follow tools/README.md: 0 scaffolded clean · 2 findings
 (hand-tune flags, degenerate/thin corpus) · 1 usage/IO · 4 setup.
@@ -110,7 +126,7 @@ from _common import (  # noqa: E402
 from contract_extract import _find_source  # noqa: E402  — same-dir composition
 
 TOOL = "scaffold.py"
-VERSION = 2
+VERSION = 3
 DEFAULT_SEED = 20261028
 DEFAULT_RANDOM_ROWS = 96
 DRY_RUN_TIMEOUT = 120.0
@@ -1077,6 +1093,13 @@ in {"i", "input"} framing; oracle.py adds that envelope itself (issue #29).
 Edge rows cover zero-values and signature boundaries (often the documented
 error path); random rows follow the baked-in specs.
 
+List/tuple parameters draw REALISTIC series lengths (issue #49):
+random-walk series of 60-320 elements dominate — coherent OHLCV bars for
+open/high/low/close dataclass items, walked floats/ints otherwise — with
+a short-length minority kept as deliberate error rows (0-9 element lists
+left min-length functions erroring on nearly every row, far below the
+oracle's min_reference_ok_fraction).
+
 @@INVARIANTS@@Flagged parameters generate None until hand-completed:
 @@FLAGGED@@
 """
@@ -1112,6 +1135,98 @@ _BIG_INTS = [0, 1, -1, 2, -2, 10, 255, 256, 65535, 65536,
 _SPECIAL_FLOATS = [0.0, -0.0, 1e-9, -1e-9, 1e9, -1e9, 1.5, -2.25,
                    3.141592653589793, 1e308, -1e308, 5e-324, 0.1 + 0.2,
                    float("inf"), float("-inf"), float("nan")]
+# series parameters need realistic depth (issue #49): 0-9 element lists
+# left min-length functions (52+ bars, 63+ values) erroring on nearly
+# every row — keep a short minority as deliberate error/boundary rows
+_SHORT_SIZES = [0, 1, 1, 2, 2, 3, 4, 6, 9]
+_SERIES_MIN = 60
+_SERIES_MAX = 320
+
+
+def g_len(rng):
+    """Series length: realistic lengths dominate so min-length functions
+    run on most rows; the short pool stays as deliberate error/boundary
+    coverage (issue #49)."""
+    if rng.random() < 0.2:
+        return rng.choice(_SHORT_SIZES)
+    return rng.randint(_SERIES_MIN, _SERIES_MAX)
+
+
+def g_walk_floats(rng, n):
+    """Coherent random-walk price-like series: finite, positive, JSON-clean
+    (realistic input, not iid noise — issue #49)."""
+    out, x = [], rng.uniform(1.0, 1000.0)
+    for _ in range(n):
+        x = max(round(x + x * rng.uniform(-0.05, 0.05), 6), 0.01)
+        out.append(x)
+    return out
+
+
+def g_walk_ints(rng, n):
+    """Coherent integer random walk (counts/indices, clamped at zero)."""
+    out, x = [], rng.randint(0, 1000)
+    for _ in range(n):
+        x = max(x + rng.randint(-3, 3), 0)
+        out.append(x)
+    return out
+
+
+def _ohlcv_fields(item):
+    """{field name: field} of an OHLCV-shaped dataclass item (open/high/
+    low/close all present — volume and extras optional), else None."""
+    if item.get("kind") != "dataclass":
+        return None
+    fields = {f["name"]: f for f in item["fields"]}
+    return fields if {"open", "high", "low", "close"} <= set(fields) else None
+
+
+def _ohlcv_bar(rng, close, fields):
+    """One bar chained from the previous close: high/low bracket the bar,
+    so the intra-row relationships hold by construction. Volume and extra
+    fields stay generatable per their own specs."""
+    open_ = close
+    close = max(round(open_ * (1.0 + rng.uniform(-0.05, 0.05)), 6), 0.01)
+    high = round(max(open_, close) * (1.0 + rng.uniform(0.0, 0.02)), 6)
+    low = max(round(min(open_, close) * (1.0 - rng.uniform(0.0, 0.02)), 6), 0.01)
+    ohlc = {"open": open_, "high": high, "low": low, "close": close}
+    bar = {}
+    for name, field in fields.items():
+        spec = field["spec"]
+        if name in ohlc and spec["kind"] in ("int", "float"):
+            bar[name] = int(ohlc[name]) if spec["kind"] == "int" else ohlc[name]
+        elif name == "volume" and spec["kind"] == "int":
+            bar[name] = rng.randint(0, 10 ** 6)
+        elif name == "volume" and spec["kind"] == "float":
+            bar[name] = round(rng.uniform(0.0, 10.0 ** 6), 6)
+        elif field.get("has_default") and rng.random() < 0.3:
+            continue  # exercise the dataclass default
+        else:
+            bar[name] = gen(spec, rng)
+    return bar, close
+
+
+def g_ohlcv(rng, n, fields):
+    """Coherent random-walk bars (issue #49): open chains to the previous
+    close, close is walked, high/low bracket the bar."""
+    bars, close = [], rng.uniform(10.0, 500.0)
+    for _ in range(n):
+        bar, close = _ohlcv_bar(rng, close, fields)
+        bars.append(bar)
+    return bars
+
+
+def g_series(item, rng, n, depth):
+    """A realistic n-element series of an item spec (issue #49): coherent
+    OHLCV bars for OHLCV-shaped dataclass items, random-walk floats/ints
+    for scalar items, recursive generation otherwise."""
+    fields = _ohlcv_fields(item)
+    if fields is not None:
+        return g_ohlcv(rng, n, fields)
+    if item["kind"] == "float":
+        return g_walk_floats(rng, n)
+    if item["kind"] == "int":
+        return g_walk_ints(rng, n)
+    return [gen(item, rng, depth + 1) for _ in range(n)]
 
 
 def g_str(rng):
@@ -1178,8 +1293,7 @@ def gen(spec, rng, depth=0):
     if k == "literal":
         return rng.choice(spec["values"]) if spec.get("values") else None
     if k == "list":
-        n = rng.choice([0, 1, 1, 2, 2, 3, 4, 6, 9])
-        return [gen(spec["item"], rng, depth + 1) for _ in range(n)]
+        return g_series(spec["item"], rng, g_len(rng), depth)
     if k == "set":
         n = rng.choice([0, 1, 1, 2, 3, 5])
         items, seen = [], set()
@@ -1203,8 +1317,7 @@ def gen(spec, rng, depth=0):
         return out
     if k == "tuple":
         if spec.get("variadic"):
-            n = rng.choice([0, 1, 2, 3])
-            return [gen(spec["item"], rng, depth + 1) for _ in range(n)]
+            return g_series(spec["item"], rng, g_len(rng), depth)
         return [gen(s, rng, depth + 1) for s in spec["items"]]
     if k == "optional":
         return None if rng.random() < 0.2 else gen(spec["item"], rng, depth + 1)
@@ -1433,10 +1546,45 @@ def _load_contract(path: str, unit_id: str, warnings: list[str]) -> dict | None:
     return read_json(p)
 
 
+def _infeasible_generation_paths(spec: dict) -> list[str]:
+    """Paths at which an ``unknown`` kind sits *inside* a container or
+    dataclass (``list[Frame]`` where Frame is not a @dataclass, an
+    unresolvable dataclass field, ...): only None/JSON-any stand-ins can
+    be generated there, so the realistic rows issue #49 requires are
+    infeasible — flagged for hand-completion like an unexpressible
+    top-level type. A top-level ``unknown`` is flagged by the caller, so
+    it is not re-walked here (one flag per cause, never duplicates)."""
+
+    def walk(s: dict, path: str) -> list[str]:
+        k = s["kind"]
+        if k == "unknown":
+            return [path]
+        if k in ("list", "set", "optional"):
+            return walk(s["item"], f"{path}[item]")
+        if k == "tuple" and s.get("variadic"):
+            return walk(s["item"], f"{path}[item]")
+        if k in ("tuple", "union"):
+            return [p for i, it in enumerate(s["items"])
+                    for p in walk(it, f"{path}[{i}]")]
+        if k == "dict":
+            return (walk(s["key"], f"{path}[key]")
+                    + walk(s["value"], f"{path}[value]"))
+        if k == "dataclass":
+            return [p for f in s["fields"]
+                    for p in walk(f["spec"], f"{path}.{f['name']}")]
+        return []  # JSON scalars / any / literal / none: generatable
+
+    if spec["kind"] == "unknown":
+        return []
+    return walk(spec, "")
+
+
 def _param_specs(params: dict[str, dict], ctx: FileCtx) -> tuple[dict, list[dict]]:
     """({name: {"spec", "has_default"}}, hand-tune flags) — a parameter whose
-    annotation the heuristic cannot express, or whose dict keys cannot
-    round-trip through JSON, is flagged, never guessed."""
+    annotation the heuristic cannot express, whose dict keys cannot
+    round-trip through JSON, or whose containers/dataclasses hold a type it
+    cannot generate (realistic rows infeasible — issue #49), is flagged,
+    never guessed."""
     specs: dict[str, dict] = {}
     hand_tune: list[dict] = []
     for name, info in params.items():
@@ -1445,6 +1593,13 @@ def _param_specs(params: dict[str, dict], ctx: FileCtx) -> tuple[dict, list[dict
         if spec["kind"] == "unknown":
             hand_tune.append({"where": f"param {name}",
                               "reason": spec.get("reason", spec.get("text", "unknown type"))})
+        for path in _infeasible_generation_paths(spec):
+            hand_tune.append({
+                "where": f"param {name}{path}",
+                "reason": "holds a type the heuristic cannot generate — realistic "
+                          "corpus rows are infeasible (issue #49); hand-complete "
+                          "the generator and the adapters",
+            })
         if spec["kind"] == "dict" and spec["key"]["kind"] not in JSON_DICT_KEYS:
             hand_tune.append({"where": f"param {name} (dict keys)",
                               "reason": f"dict keys of kind {spec['key']['kind']!r} "
@@ -1697,6 +1852,7 @@ def _dry_run_corpus(result: dict, out_dir: Path, timeout: float) -> dict:
         # validated; report it as its own finding kind, never as row noise
         return {"setup_error": setup_error, "counts": {}, "rows": [],
                 "reference_ok": 0, "reference_ok_fraction": None,
+                "min_reference_ok_fraction": None,
                 "degenerate": True, "warning": None, "first_errors": [],
                 "functions": {}, "functions_all_error": [],
                 "degenerate_detail": None}
@@ -1721,6 +1877,7 @@ def _dry_run_corpus(result: dict, out_dir: Path, timeout: float) -> dict:
         "rows": rows, "counts": counts,
         "reference_ok": gt["reference_ok"],
         "reference_ok_fraction": gt["reference_ok_fraction"],
+        "min_reference_ok_fraction": gt["min_reference_ok_fraction"],
         "degenerate": degenerate,
         "degenerate_detail": degenerate_detail,
         "warning": gt["warning"],
@@ -1751,11 +1908,13 @@ def _select_units(units: list, chunks: list[str] | None) -> list[dict]:
 
 
 def _classify_dry_run(result: dict, dry: dict, findings: list, warnings: list) -> None:
-    """Turn the dry-run record into findings/warnings per tools/README.md:
-    hand-tune flags and a reference that cannot run (or errors on every
-    row — or, in module mode, every FUNCTION erroring on every row) are
-    findings; a thin-but-alive reference, non-ok rows, and a single
-    all-error function are warnings."""
+    """Turn the dry-run record into findings/warnings per tools/README.md.
+    Findings (exit 2): hand-tune flags; a reference that cannot run or
+    errors on every row (every judged function, in module mode); a
+    reference-ok fraction below min_reference_ok_fraction — a corpus that
+    cannot exercise the unit (issue #49), the same contract as params the
+    heuristic cannot express. Warnings: non-ok rows, and a single
+    all-error function."""
     unit = result["unit"]
     if result["hand_tune"]:
         findings.append({"unit": unit, "kind": "hand_tune",
@@ -1773,6 +1932,17 @@ def _classify_dry_run(result: dict, dry: dict, findings: list, warnings: list) -
                       "run would be hollow/INCOMPARABLE (issue #30); fix the corpus "
                       "or the flagged parameters"})
     else:
+        frac = dry["reference_ok_fraction"]
+        if frac is not None and frac < dry["min_reference_ok_fraction"]:
+            findings.append({
+                "unit": unit, "kind": "thin_ground_truth",
+                "detail": f"reference ok on only {dry['reference_ok']}/"
+                          f"{len(dry['rows'])} dry-run rows ({frac:.1%} < "
+                          f"min_reference_ok_fraction "
+                          f"{dry['min_reference_ok_fraction']}) — the corpus "
+                          "cannot exercise the unit (issue #49); give the series "
+                          "parameters realistic generation or hand-complete the "
+                          "flagged parameters"})
         if dry["warning"]:
             warnings.append(f"unit {unit}: {dry['warning']}")
         for name in dry.get("functions_all_error") or []:

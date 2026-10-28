@@ -90,7 +90,10 @@ name the target project's private code):
   same seed → byte-identical corpus; prints a row-status summary. Edge
   rows (zero values, boundaries, defaults-exercising) come from the
   signature, so the documented error paths (e.g. "empty input raises") are
-  covered by construction.
+  covered by construction. Random rows give list/tuple parameters
+  realistic series lengths — random-walk 60–320 element series, coherent
+  OHLCV bars for open/high/low/close dataclass items (issue #49) — with a
+  short-length minority as further deliberate error rows.
 - `corpora/corpus-<unit>.jsonl` — the corpus itself, in the documented
   format (one raw JSON value per line), emitted by the generator so the
   #29 trap cannot bite.
@@ -106,11 +109,24 @@ containers, `Optional`/unions, `Literal`, and project `@dataclass`es
 mechanically; **everything else is flagged for hand-completion, never
 guessed** — flags land in the payload's `hand_tune[]`, in a HAND-TUNE
 block in both adapters, and in the generator, and make the run exit 2.
+That includes shapes the generator cannot inhabit *realistically*: a list
+of a non-dataclass class, or a container/dataclass holding an ungeneratable
+type, gets a `hand_tune[]` flag naming the item path — lists of JSON-any
+stand-ins that error on every row are never silently emitted (issue #49).
+List/tuple series parameters draw **realistic lengths** (issue #49):
+random-walk series of 60–320 elements dominate — coherent OHLCV bars
+(high/low bracket the bar, open chains to the previous close) for
+open/high/low/close dataclass items, walked floats/ints otherwise — with
+a short-length minority kept as deliberate error rows; the old 0–9
+element lists left min-length series functions erroring on nearly every
+row.
 Before reporting success the scaffold also dry-runs its own fresh corpus
 against the reference adapter through `oracle.py`'s runner, so a corpus
-that would judge hollow or thin is a finding in seconds, not after a
-Stage-4 judge run. Existing output is never overwritten without `--force`
-(hand-tuned edits must not be lost).
+that would judge hollow (degenerate — issue #30), **thin** (reference ok
+below `min_reference_ok_fraction`, a finding since issue #49 — never a
+warned-through exit 0), or malformed (issue #29) is a finding in seconds,
+not after a Stage-4 judge run. Existing output is never overwritten
+without `--force` (hand-tuned edits must not be lost).
 
 ## The deterministic driver — `pipeline.py` (issue #22)
 
