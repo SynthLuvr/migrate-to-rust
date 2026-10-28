@@ -300,7 +300,10 @@ def test_init_creates_valid_journaled_state(monkeypatch, capsys, tmp_path):
     assert st["stage"] == 0 and st["units"] == []
     # project + stage + autonomy + run_status creation entries
     assert len(st["journal"]) == 4
-    assert st["autonomy"]["level"] == "L0" and st["run_status"] == "pending"
+    # the never-ask default: L2 policy-resolved, publish still disabled
+    assert st["autonomy"]["level"] == "L2"
+    assert st["autonomy"]["publish_allowed"] is False
+    assert st["run_status"] == "pending"
     code, _ = run_tool(monkeypatch, capsys, "state.py", ["validate", str(p)])
     assert code == 0
 

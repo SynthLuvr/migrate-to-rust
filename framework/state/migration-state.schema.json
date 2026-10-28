@@ -148,7 +148,7 @@
       "properties": {
         "level": {
           "enum": ["L0", "L1", "L2", "L3"],
-          "$comment": "L0 supervised (human gates are hard stops) · L1 agent proposes, humans decide · L2 all gates policy-resolved, publish disabled · L3 full autopilot incl. cutover"
+          "$comment": "L0 supervised (hard stops: the gate stays open, the run ends with the dossier — the operator decides between runs, nothing asks mid-run) · L1 agent proposes into the dossier, operator decides between runs · L2 all gates policy-resolved (the default), publish disabled · L3 full autopilot incl. cutover"
         },
         "policy_version": { "type": "string", "$comment": "autonomy/policy.json version in force for this run" },
         "budget": {
@@ -184,7 +184,7 @@
     },
     "budget_ledger": {
       "type": "object",
-      "$comment": "running totals vs the Stage 0 projection; deviations reported to human",
+      "$comment": "running totals vs the Stage 0 projection; deviations reported in the end-of-run report (and reviewed by the operator between runs)",
       "properties": {
         "tokens_total": { "type": "integer" },
         "hours_human_total": { "type": "number" },

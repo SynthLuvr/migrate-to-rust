@@ -17,10 +17,11 @@ unit backlog.
 6. **Propose** data-structure redesigns where the Python shape fights Rust
    (dict-of-dicts → typed structs/enums; reference-heavy graphs →
    ownership-friendly designs). Figma: 20% p99 from a data swap alone.
-   Proposals only — resolved at the `redesign_approval` gate (`human` at
-   L0/L1; `policy:RED-1` at L2+: approved only iff a spike passes the
+   Proposals only — resolved at the `redesign_approval` gate
+   (`policy:RED-1` at the default L2+: approved only iff a spike passes the
    oracle on the golden corpus AND the matched-corpus benchmark clears the
-   bar, else keep the literal shape); never improvised in Stage 4.
+   bar, else keep the literal shape; at L0/L1 the proposal waits in the
+   dossier for the operator between runs); never improvised in Stage 4.
 7. Write all units into `state/migration-state.json`: id, paths, deps[],
    order index, contract refs, risk flags, budget, `status: pending`.
 
@@ -28,7 +29,9 @@ unit backlog.
 - [ ] Every unit has deps, order, type signature, covering tests
 - [ ] Cycle check clean; leaf-first order recorded
 - [ ] Redesign proposals written and resolved at the gate (`decided_by:
-      human` at L0/L1, `policy:RED-1` at L2+, evidence journaled)
+      policy:RED-1` at the default L2+ with evidence journaled; at L0/L1
+      the proposal stays open in the dossier for the operator between
+      runs)
 - [ ] No unit contains an unflagged risky construct
 
 ## Escalate

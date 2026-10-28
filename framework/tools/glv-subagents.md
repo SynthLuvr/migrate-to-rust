@@ -120,12 +120,14 @@ Per unit, in leaf-first dependency order:
    candidate + the reported per-run verdicts. On `error`/`stopped`,
    read the transcript tail for the failure, requeue **once** (fresh
    session, `-retry` name), then mark `escalated` per `MIGRATION_PROMPT.md`
-   hard rule 6 — at L0/L1 that opens the human queue; at L2+ policy rule
-   ESC-1 resolves it as *defer* (the Python fallback stays live, the
-   backlog continues, the escalation drains into the end-of-run dossier).
+   hard rule 6 — at L2+ (the default) policy rule ESC-1 resolves it as
+   *defer* (the Python fallback stays live, the backlog continues, the
+   escalation drains into the end-of-run dossier); at L0/L1 it waits in
+   the dossier for the operator between runs — nothing asks mid-run.
 3. Reviewer pass on a different model pin. Verdicts are
    `APPROVE` / `FIX` / `ESCALATE`: `FIX` loops via `/prompt` (counted
-   against `MAX_ROUNDS`); `ESCALATE` goes to the human queue with both
+   against `MAX_ROUNDS`); `ESCALATE` goes to the escalation queue — the
+   end-of-run dossier, deferred via ESC-1 at L2+ — with both
    candidates and the minimal repro attached (deferred via ESC-1 at L2+).
 4. The orchestrator — never the delegate — writes the verdict and the
    session ids into `migration-state.json`, then `state.save()` after

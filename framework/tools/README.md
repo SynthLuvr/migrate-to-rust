@@ -48,9 +48,11 @@ loop:
 ```
 
 - **Autonomy levels** (`--autonomy L0..L3`, pre-authorized before the run):
-  L0/L1 stay with the agent-driven recipe (gates are human stops — the
-  driver refuses to run); L2 resolves every gate by policy, publish
-  disabled; L3 adds cutover/publish. Zero mid-run questions at L2+.
+  L2 (the default for new runs) resolves every gate by policy, publish
+  disabled; L3 adds cutover/publish. L0/L1 stay with the agent-driven
+  recipe, which never asks either: the gate stays open, the run ends with
+  the dossier, and the operator decides between runs (the driver refuses
+  these levels). Zero mid-run questions at any level.
 - **Terminal-state discipline**: a run always ends in `complete` /
   `no_go_measured` / `budget_exhausted` / `failed_safely` — never "awaiting
   input" — and every terminal state emits the same deliverable set (run

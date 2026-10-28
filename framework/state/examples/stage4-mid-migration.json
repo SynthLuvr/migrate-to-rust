@@ -1,5 +1,5 @@
 {
-  "$comment": "Example instance of migration-state.schema.json: a mid-Stage-4 migration at autonomy L1 (agent proposes, humans decide \u2014 the open scope_change and unit_escalation gates await a human; at L2+ the driver would resolve them via policy rules SC-1/ESC-1 instead), exercising the journal[], human_gates.gate=scope_change, and per-unit notes/sessions fields. CI (framework/state/check_examples.py) validates every examples/*.json against the schema.",
+  "$comment": "Example instance of migration-state.schema.json: a mid-Stage-4 migration at autonomy L1 (the operator-supervised mode: the open scope_change and unit_escalation gates await the operator's between-runs decision — the run never asks mid-run; at L2+, the default, the driver resolves them via policy rules SC-1/ESC-1), exercising the journal[], human_gates.gate=scope_change, and per-unit notes/sessions fields. CI (framework/state/check_examples.py) validates every examples/*.json against the schema.",
   "project": {
     "name": "datamill",
     "python_path": "src/datamill",
@@ -191,7 +191,7 @@
     {
       "gate": "scope_change",
       "state": "open",
-      "note": "Post-Stage-4 request to add datamill.io to scope; awaiting human decision"
+      "note": "Post-Stage-4 request to add datamill.io to scope; recorded for the operator's between-runs decision (SC-1 would reject at L2+; the run never pauses to ask)"
     },
     {
       "gate": "unit_escalation",

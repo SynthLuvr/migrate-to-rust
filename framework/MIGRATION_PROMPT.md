@@ -28,7 +28,9 @@ operate a pipeline; the gates decide, not you.
 **Who runs the loop.** Two operating modes (issue #22):
 
 - **Agent-driven (L0/L1)** — you drive stages 0→7 yourself per this prompt
-  and the stage checklists, stopping at every gate for a human.
+  and the stage checklists. You never stop to ask a human: at a gate you
+  leave it open with the evidence recorded and end the run with the
+  dossier; the operator decides *between* runs, never mid-run.
 - **Driver-driven (L2/L3)** — the deterministic driver
   [`tools/pipeline.py`](tools/pipeline.py) owns the loop (stage order,
   exit-criteria verification, gate resolution via
@@ -57,17 +59,19 @@ operate a pipeline; the gates decide, not you.
 5. **The Python API is frozen.** Callers must not change. Ship as a PyO3
    wheel via maturin — "Rust where hot, Python everywhere else."
 6. **Every loop is bounded.** Max fix-rounds and a token/time budget per unit;
-   on exhaustion, classify and record the escalation — at L0/L1 that opens
-   the human queue; at L2+ policy rule ESC-1 resolves it as *defer* (the
-   unit keeps its Python fallback and drains into the end-of-run escalation
-   dossier; the backlog continues). Never silently give up, and never
-   silently descope checks to go green.
+   on exhaustion, classify and record the escalation — the unit keeps its
+   Python fallback and drains into the end-of-run escalation dossier; at
+   L2+ (the default) policy rule ESC-1 resolves it as *defer* immediately
+   and the backlog continues, while at L0/L1 it waits for the operator
+   between runs. Never silently give up, never silently descope checks to
+   go green, and never pause mid-run to ask a human.
 7. **Redesign data structures deliberately.** Figma got 20% p99 from a data
    swap alone; a literal transliteration forfeits the win. Redesigns are
-   *proposals* resolved at the Stage-1 gate — by a human at L0/L1, or by
-   policy rule RED-1 at L2+ (approved only iff a spike passes the oracle on
-   the golden corpus AND the matched-corpus benchmark improves ≥ the bar;
-   otherwise keep the literal shape) — and never improvised mid-loop.
+   *proposals* resolved at the Stage-1 gate — by policy rule RED-1 at L2+
+   (the default; approved only iff a spike passes the oracle on the golden
+   corpus AND the matched-corpus benchmark improves ≥ the bar; otherwise
+   keep the literal shape), or by the operator between runs at L0/L1 —
+   and never improvised mid-loop.
 8. **Ship gates are mandatory:** full-suite parity, property/fuzz tests,
    Miri + clippy, the scaffold's template gates (`just check` + `just msrv`),
    matched-corpus benchmarks with a reproduction script, and attribution
@@ -86,13 +90,13 @@ operate a pipeline; the gates decide, not you.
 
 | Stage | Purpose | Exit criterion (all must hold, recorded in state) |
 |---|---|---|
-| 0 Feasibility | profile + go/no-go | scope + GO/NO-GO resolved at the gate (human at L0/L1; policy:GO-1 at L2+); projection ≥ 50% end-to-end saving |
+| 0 Feasibility | profile + go/no-go | scope + GO/NO-GO resolved in code (`policy:GO-1` at the default L2+; at L0/L1 the gate stays open and the run ends for operator review); projection ≥ 50% end-to-end saving |
 | 1 Plan | dependency-ordered unit backlog | every unit: deps, order, contract, risk flags |
 | 2 Contracts | parity harness validated judge-first | injected bugs caught 5/5; baseline recorded |
 | 3 Scaffold | [rust-template](https://github.com/SynthLuvr/rust-template) scaffold + PyO3; CI green on empty crate | `maturin develop` works; gates red-blocking |
 | 4 Translate | oracle-ranked repair loop per unit | every unit Equivalent, deferred (escalated + fallback live), or descoped |
 | 5 Gates | full suite, property/fuzz, Miri, benchmarks, attribution | green — or divergences classified & explained |
-| 6 Integrate | wheel, shadow/canary with production diffing | cutover gate resolved (human at L0/L1; policy:CUT-1 at L2+); rollback tested |
+| 6 Integrate | wheel, shadow/canary with production diffing | cutover gate resolved in code (`policy:CUT-1`; at L2 *rejected* — publish disabled; at L0/L1 the gate stays open and the run ends for operator review); rollback tested |
 | 7 Maintain | upstream-tracking + regression budget | ongoing — this stage is never "done" |
 
 Detailed checklists: load `stages/<n>-<name>.md` on stage entry.
@@ -114,7 +118,7 @@ for unit in backlog (dependency order, leaf-first):
         rounds += 1
     Equivalent        → state.mark(unit, "ported", fallback = python)
     explained divergence → state.mark(unit, "divergent_explained", note)
-    else              → state.mark(unit, "escalated")   # human queue
+    else              → state.mark(unit, "escalated")   # escalation dossier (deferred via ESC-1 at L2+)
     state.save()   # after EVERY unit — resumable, reversible per unit
 ```
 
@@ -138,16 +142,24 @@ Divergent / Incomparable`; every Divergent carries a written explanation.
 
 ## Gates — autonomy levels and policy resolution (issue #22)
 
+**The agent never asks a human mid-run, at any level — "ask" is not one of
+its moves.** Gates resolve in code (`pipeline.py resolve-gates`), or — at
+L0/L1, the operator-supervised levels — stay open with journaled evidence
+while the run ends with the dossier for the operator to decide *between*
+runs. `decided_by: "human"` is recorded by the operator outside the run,
+never elicited by the agent.
+
 The five former blocking stops are now **machine-decidable, journaled,
 non-blocking policy decisions** at pre-authorized autonomy levels. The level
 is set by the operator *before* the run (`state.py init --autonomy-level`,
-or `pipeline.py run --autonomy`) — there are **zero mid-run questions at
-L2+**, and an agent can never raise its own level mid-run.
+which now defaults to the never-ask L2, or `pipeline.py run --autonomy`) —
+there are **zero mid-run questions at any level**, and an agent can never
+raise its own level mid-run.
 
 | Level | Name | Gates | Publish |
 |---|---|---|---|
-| L0 | supervised | hard human stops (the original behavior) | no |
-| L1 | assisted | agent proposes a resolution per gate; humans decide | no |
+| L0 | supervised | hard stops — the gate stays open and the run ends with a dossier; the operator decides between runs (the pre-policy behavior, minus mid-run questions) | no |
+| L1 | assisted | agent proposes a resolution per gate into the dossier; the operator applies or rejects it between runs | no |
 | L2 | autonomous | all gates resolved by `autonomy/policy.json` rules in code — journaled, conservative defaults | no |
 | L3 | autopilot | as L2, plus Stage-6 cutover once CUT-1's evidence bar is met | yes |
 
@@ -167,8 +179,8 @@ Rules of the rules:
   `tools/state.py resolve-gate`) against `autonomy/policy.json` — never by
   LLM self-approval. Every decision is journaled in the state file with
   `decided_by: "policy:<rule-id>"`, `policy_version`, and the `evidence[]`
-  it evaluated; `decided_by: "human"` remains first-class (a human may
-  still decide any gate at any level).
+  it evaluated; `decided_by: "human"` remains first-class — the operator
+  records it between runs, and the agent never solicits it mid-run.
 - **Terminal-state discipline:** a run always ends in `complete` /
   `no_go_measured` / `budget_exhausted` / `failed_safely` — never "awaiting
   input". Every terminal state emits the same deliverable set (run report
@@ -190,3 +202,5 @@ Rules of the rules:
 | "Tests green, ship it" | regression tail ignored | Stage 7 budget is mandatory, pre-committed |
 | Speed number without a repro script | vendor benchmark rot | every benchmark ships with its corpus + script |
 | Optimized Python matches the port | port wasn't the win | report honestly; keeping Python is a success |
+| Agent pauses to ask a human at a gate | pre-policy gate behavior | gates resolve in code, or the run ends with the dossier for between-runs operator review — "ask" is never an available move |
+| Private project names leak into public artifacts (PRs, issues, commits) | run reports and state files name the target project | `runs/` stays gitignored; anonymize target-project names in anything committed or posted publicly — refer to "a target project", never its name |

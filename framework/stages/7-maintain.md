@@ -26,6 +26,8 @@ budgeted phase, not a surprise.
 
 ## Escalate
 - Upstream change lands in a unit with `escalated`/`divergent_explained`
-  status → human decides: port-forward, re-diverge, or descope.
+  status → the operator decides *between runs*: port-forward, re-diverge,
+  or descope (recorded via `state.py resolve-gate --by human`; the run
+  itself never pauses to ask).
 - A load-bearing crate goes unmaintained → substitution review (Stage 1
   semantics, scoped).

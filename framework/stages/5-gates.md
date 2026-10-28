@@ -32,5 +32,7 @@ documented way to ship a broken port.
 - [ ] Every remaining divergence classified + explained in the state file
 
 ## Escalate
-- Any divergence without a mechanistic explanation → human review before
-  Stage 6. "It's probably fine" is not a classification.
+- Any divergence without a mechanistic explanation → the affected unit
+  stays on its Python fallback (escalated/deferred into the end-of-run
+  dossier) and the operator reviews it between runs — Stage 6 never sees
+  it unexplained. "It's probably fine" is not a classification.

@@ -1,17 +1,17 @@
 {
-  "$comment": "The autonomy policy layer (issue #22, proposal C): each former human gate becomes a machine-decidable rule with a conservative default, journaled and non-blocking. Evaluated only in code (tools/pipeline.py resolve-gates / tools/state.py resolve-gate) — never by LLM self-approval. Every decision records decided_by='policy:<rule-id>' + policy_version + evidence[] in migration-state.json. Levels: L0 = supervised (the pre-policy behavior — gates are hard human stops); L1 = agent proposes, still stops at gates; L2 = all gates policy-resolved, publish disabled; L3 = full autopilot incl. cutover. Operators pre-authorize the level BEFORE the run: there are zero mid-run questions at L2+. The dual-build design is what makes autonomy safe — per-unit Python fallback, one-env-var shim, rollback pin; every autonomous decision stays reversible per unit.",
+  "$comment": "The autonomy policy layer (issue #22, proposal C): each former human gate becomes a machine-decidable rule with a conservative default, journaled and non-blocking. Evaluated only in code (tools/pipeline.py resolve-gates / tools/state.py resolve-gate) — never by LLM self-approval. Every decision records decided_by='policy:<rule-id>' + policy_version + evidence[] in migration-state.json. Levels: L0 = supervised (gates are hard stops — the agent never asks; it leaves the gate open and ends the run with the dossier for the operator to decide between runs); L1 = agent proposes into the dossier, operator decides between runs; L2 = all gates policy-resolved, publish disabled (the default — never asks); L3 = full autopilot incl. cutover. Operators pre-authorize the level BEFORE the run: there are zero mid-run questions at any level. The dual-build design is what makes autonomy safe — per-unit Python fallback, one-env-var shim, rollback pin; every autonomous decision stays reversible per unit.",
   "version": "1.0.0",
-  "default_level": "L0",
+  "default_level": "L2",
   "levels": {
     "L0": {
       "name": "supervised",
-      "gates": "hard human stops — the pre-policy behavior; the agent (recipe.yaml / MIGRATION_PROMPT.md) drives and asks at every gate",
+      "gates": "hard stops, never questions — the agent (recipe.yaml / MIGRATION_PROMPT.md) drives, leaves the gate open with journaled evidence, and ends the run with the dossier; the operator decides between runs",
       "publish_allowed": false,
       "driver": false
     },
     "L1": {
       "name": "assisted",
-      "gates": "agent proposes a resolution per gate but still stops and asks; humans decide",
+      "gates": "agent proposes a resolution per gate into the dossier and ends the run; the operator applies or rejects it between runs — nothing asks mid-run",
       "publish_allowed": false,
       "driver": false
     },
@@ -74,7 +74,7 @@
       "id": "ESC-1",
       "gate": "unit_escalation",
       "title": "escalated units — defer, don't halt",
-      "decides": "deferred: the unit keeps its Python fallback live, stays 'escalated', and drains into the end-of-run escalation dossier; the backlog continues. Escalation is decoupled from progress — 'escalate to human queue' becomes defer, not halt.",
+      "decides": "deferred: the unit keeps its Python fallback live, stays 'escalated', and drains into the end-of-run escalation dossier; the backlog continues. Escalation is decoupled from progress — escalation means defer, not halt, and the operator reviews the dossier between runs.",
       "params": {}
     },
     {

@@ -5,8 +5,12 @@
 #   goose run --recipe framework/recipe.yaml
 # Point at a target project elsewhere via TARGET_PYTHON_PROJECT, not by cd.
 # Enforces: stage order, gate resolution per the pre-authorized autonomy
-# level, state-file discipline, role separation. For unattended runs
-# (autonomy L2/L3) prefer the deterministic driver:
+# level, state-file discipline, role separation. This recipe NEVER asks a
+# human for input — at any stage, at any autonomy level. Gates resolve in
+# code (`python framework/tools/pipeline.py resolve-gates <state.json>`),
+# and at the operator-supervised levels (L0/L1) the run ends with the gate
+# dossier instead of waiting. For unattended runs (autonomy L2/L3) prefer
+# the deterministic driver:
 #   python framework/tools/pipeline.py run <state.json> \
 #     --agent-cmd 'goose run --recipe framework/recipe.yaml' --autonomy L2
 # which owns the loop and invokes an agent per stage as the stage worker.
@@ -26,17 +30,21 @@ instructions: |
      matching framework/stages/<n>-*.md checklist and follow it. Do not enter
      the next stage until every exit criterion is met AND recorded in
      framework/state/migration-state.json.
-  3. Gates resolve per the run's pre-authorized autonomy level
-     (framework/autonomy/policy.json; issue #22). Default L0: gates are
-     hard stops — Stage 0 go/no-go + scope, Stage 1 data-structure
-     redesigns, any escalated unit, Stage 6 cutover. Ask; never
-     self-approve. At L2+ the deterministic driver (framework/tools/
-     pipeline.py) resolves gates by policy rules in code, journaled with
-     decided_by=policy:<rule-id> + evidence; as the stage worker you record
-     data through tools/state.py and never touch gates, stage, or
-     run_status. NO-GO is a successful terminal state, escalations defer
-     (python fallback stays live), and no-equivalent dependencies descope
-     instead of halting.
+  3. NEVER ask for human input — not once, at no stage, at no autonomy
+     level; "ask" is not one of your moves. Gates resolve in code: at a
+     gate, run `python framework/tools/pipeline.py resolve-gates
+     <state.json>`, which evaluates framework/autonomy/policy.json
+     (issue #22) and journals each decision with
+     decided_by=policy:<rule-id> + evidence. New runs default to L2
+     (all gates policy-resolved, publish disabled). If the evaluator
+     refuses because the state is L0/L1 (operator-supervised levels),
+     leave the gate open with the evidence recorded and end the run with
+     the dossier for operator review — never wait, never ask, and never
+     self-approve (an LLM never decides a gate). NO-GO is a successful
+     terminal state, escalations defer (python fallback stays live), and
+     no-equivalent dependencies descope instead of halting. As a stage
+     worker under the driver, record data through tools/state.py and
+     never touch gates, stage, or run_status — those are the driver's.
   4. In Stage 4, delegate per-unit translation to subagents using
      framework/roles/translator.md as their instructions. Never assign the
      same file to two delegates. Review every unit with
@@ -47,13 +55,17 @@ instructions: |
      per-unit-reversible record; the Python implementation remains the live
      fallback for any unit not marked "ported".
   6. From Stage 1 onward, consult framework/knowledge/substitutions.json for
-     crate choices; flag any dependency with no maintained equivalent for a
-     human decision instead of improvising.
+     crate choices; a dependency with no maintained equivalent descopes via
+     policy rule DEP-1 (the module keeps its Python fallback) — never
+     improvised, never queued for a mid-run human decision.
   7. Stage 3 instantiates the crate from SynthLuvr/rust-template per
      framework/stages/3-scaffold.md — never hand-roll the gate stack.
 prompt: |
-  Begin Stage 0 (Feasibility) on {{ TARGET_PYTHON_PROJECT }}. If no target was
-  given, ask for it before profiling anything. Initialize
+  Begin Stage 0 (Feasibility) on {{ TARGET_PYTHON_PROJECT }}. If the target
+  path is empty or "UNSET", do not ask for it: record the missing-target
+  reason in the run report, set run_status to failed_safely in
+  framework/state/migration-state.json (a run never sits "awaiting input"),
+  and stop. Initialize
   framework/state/migration-state.json from
   framework/state/migration-state.schema.json and keep it current through
   every stage. Read the background files from disk as needed: SUMMARY.md,
@@ -63,8 +75,12 @@ prompt: |
 parameters:
   - key: TARGET_PYTHON_PROJECT
     input_type: string
-    requirement: user_prompt
-    description: Path to the Python project under migration.
+    requirement: optional
+    default: "UNSET"
+    description: Path to the Python project under migration. Optional so the
+      recipe never prompts for input; pass it via --params
+      TARGET_PYTHON_PROJECT=<path> (or record it in the state file when
+      resuming). UNSET ends the run as failed_safely instead of asking.
 activities:
   - Profile the target project and produce the go/no-go report
   - Resume an in-progress migration from the state file

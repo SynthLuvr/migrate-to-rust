@@ -34,6 +34,8 @@ is the spec; the judge is what makes "correct" decidable.
       (CETBench: LLM judges unreliable)
 
 ## Escalate
-- Suite too weak to serve as spec on the scoped units → STOP. Write
-  characterization tests with the human before Stage 4. ScanCode was only
+- Suite too weak to serve as spec on the scoped units → STOP. Record the
+  gap, keep the affected units on their Python fallback (deferred into the
+  escalation dossier), and let the operator strengthen the suite *between
+  runs* — never pause mid-run to co-write tests. ScanCode was only
   portable because 90k tests existed; a thin suite means no oracle.

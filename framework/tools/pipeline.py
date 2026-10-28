@@ -25,11 +25,12 @@ report incl. the escalation dossier, state file, journal). Safety rests on
 the existing dual-build design: per-unit Python fallback, one-env-var shim,
 rollback pin — every autonomous decision stays reversible per unit.
 
-Autonomy levels (pre-authorized BEFORE the run; zero mid-run questions):
-L0 supervised (human gates are hard stops — the pre-policy behavior; the
-agent-driven recipe covers it, this driver refuses to run) · L1 agent
-proposes, humans decide (also refused here) · L2 all gates policy-resolved,
-publish disabled · L3 full autopilot incl. cutover.
+Autonomy levels (pre-authorized BEFORE the run; zero mid-run questions at
+any level — the agent never asks): L0 supervised (gates are hard stops: the
+agent-driven recipe leaves the gate open and ends the run with the dossier
+for the operator; this driver refuses to run it) · L1 agent proposes into
+the dossier, operator decides between runs (also refused here) · L2 all
+gates policy-resolved, publish disabled · L3 full autopilot incl. cutover.
 
 Subcommands
 -----------
@@ -817,10 +818,12 @@ def cmd_run(args) -> int:
     level = state_tool.autonomy_level(state)
     if level not in state_tool.DRIVER_LEVELS:
         return _emit_refusal(
-            f"autonomy={level}: the deterministic driver runs L2+ only. L0/L1 "
-            f"stay with the agent-driven recipe (gates are human stops there). "
-            f"Pre-authorize autonomy BEFORE the run: --autonomy L2|L3 here, or "
-            f"state.py init --autonomy-level.", args.human, file=str(path))
+            f"autonomy={level}: the deterministic driver runs L2+ only. At "
+            f"L0/L1 the agent-driven recipe never asks either — it leaves the "
+            f"gate open and ends the run with the dossier for the operator "
+            f"(decided between runs). Pre-authorize autonomy BEFORE the run: "
+            f"--autonomy L2|L3 here, or state.py init --autonomy-level "
+            f"(default L2).", args.human, file=str(path))
     run_status = state.get("run_status")
     if run_status in ("complete", "no_go_measured"):
         return _emit_refusal(
@@ -942,9 +945,10 @@ def cmd_resolve_gates(args) -> int:
     level = state_tool.autonomy_level(state)
     if level not in state_tool.DRIVER_LEVELS and not args.human_override:
         return _emit_refusal(
-            f"autonomy={level}: gates resolve by policy at L2+ only. At L0/L1 a "
-            f"human decides — ask, then record with "
-            f"`state.py resolve-gate --by human` (--human-override forces "
+            f"autonomy={level}: gates resolve by policy at L2+ only. At L0/L1 "
+            f"the operator decides between runs — record that decision with "
+            f"`state.py resolve-gate --by human` outside the run, or "
+            f"pre-authorize L2+ (nothing asks mid-run; --human-override forces "
             f"evaluation here; the decision is still journaled policy:<rule>)",
             args.human, file=str(path))
     ctx = {"today": date.today(), "substitutions": load_substitutions(args.substitutions)}

@@ -1,3 +1,5 @@
 .pytest_cache/
 __pycache__/
 *.pyc
+# Run artifacts (runs/<project>/) name the target project — never commit them
+runs/
