@@ -43,11 +43,16 @@ def _port_file(port) -> None:
         "\npub fn parse(s: &str) -> Vec<&str> { s.split(',').collect() }\n")
 
 
+def _run(monkeypatch, capsys, orig, port, state, *extra):
+    return run_tool(monkeypatch, capsys, "attribution.py", [
+        "check", "--original", str(orig), "--port", str(port), "--state", str(state),
+        *extra])
+
+
 def test_clean_port_passes(monkeypatch, capsys, tmp_path):
     orig, port, state = _scaffold(tmp_path)
     _port_file(port)
-    code, out = run_tool(monkeypatch, capsys, "attribution.py", [
-        "check", "--original", str(orig), "--port", str(port), "--state", str(state)])
+    code, out = _run(monkeypatch, capsys, orig, port, state)
     assert code == 0
     assert out["ok"] is True
     assert out["notices"][0]["status"] == "identical"
@@ -59,8 +64,7 @@ def test_notice_byte_drift_fails(monkeypatch, capsys, tmp_path):
     orig, port, state = _scaffold(tmp_path)
     _port_file(port)
     (port / "NOTICE").write_text(NOTICE_TEXT.replace("third-party", "3rd party"))
-    code, out = run_tool(monkeypatch, capsys, "attribution.py", [
-        "check", "--original", str(orig), "--port", str(port), "--state", str(state)])
+    code, out = _run(monkeypatch, capsys, orig, port, state)
     assert code == 2
     assert any(f["check"] == "notice" for f in out["failures"])
 
@@ -69,8 +73,7 @@ def test_missing_notice_fails(monkeypatch, capsys, tmp_path):
     orig, port, state = _scaffold(tmp_path)
     _port_file(port)
     (port / "NOTICE").unlink()
-    code, out = run_tool(monkeypatch, capsys, "attribution.py", [
-        "check", "--original", str(orig), "--port", str(port), "--state", str(state)])
+    code, out = _run(monkeypatch, capsys, orig, port, state)
     assert code == 2
     assert any(f["check"] == "notice" and f["status"] == "missing"
                for f in out["failures"])
@@ -82,8 +85,7 @@ def test_missing_provenance_fails(monkeypatch, capsys, tmp_path):
         "// Copyright (c) 2020 Example Corp\n"
         "// SPDX-License-Identifier: Apache-2.0\n"
         "pub fn parse(s: &str) -> Vec<&str> { s.split(',').collect() }\n")
-    code, out = run_tool(monkeypatch, capsys, "attribution.py", [
-        "check", "--original", str(orig), "--port", str(port), "--state", str(state)])
+    code, out = _run(monkeypatch, capsys, orig, port, state)
     assert code == 2
     assert any(f["check"] == "provenance" and f["status"] == "missing-provenance"
                for f in out["failures"])
@@ -94,8 +96,7 @@ def test_wrong_provenance_fails(monkeypatch, capsys, tmp_path):
     _port_file(port)
     p = port / "crates" / "pkg" / "src" / "u1" / "u1.rs"
     p.write_text(p.read_text().replace("src/pkg/parse.py", "src/pkg/other.py"))
-    code, out = run_tool(monkeypatch, capsys, "attribution.py", [
-        "check", "--original", str(orig), "--port", str(port), "--state", str(state)])
+    code, out = _run(monkeypatch, capsys, orig, port, state)
     assert code == 2
     assert any(f["check"] == "provenance" and f["status"] == "wrong-provenance"
                for f in out["failures"])
@@ -106,8 +107,7 @@ def test_stripped_header_fails(monkeypatch, capsys, tmp_path):
     (port / "crates" / "pkg" / "src" / "u1" / "u1.rs").write_text(
         "// Ported from src/pkg/parse.py (Apache-2.0)\n"
         "pub fn parse(s: &str) -> Vec<&str> { s.split(',').collect() }\n")
-    code, out = run_tool(monkeypatch, capsys, "attribution.py", [
-        "check", "--original", str(orig), "--port", str(port), "--state", str(state)])
+    code, out = _run(monkeypatch, capsys, orig, port, state)
     assert code == 2
     assert any(f["check"] == "header" for f in out["failures"])
 
@@ -118,17 +118,15 @@ def test_unattributed_stray_file_fails_but_allowlist_excuses(
     _port_file(port)
     stray = port / "crates" / "pkg" / "src" / "u1" / "generated.rs"
     stray.write_text("// template scaffold\nfn x() {}\n")
-    code, out = run_tool(monkeypatch, capsys, "attribution.py", [
-        "check", "--original", str(orig), "--port", str(port), "--state", str(state)])
+    code, out = _run(monkeypatch, capsys, orig, port, state)
     assert code == 2
     assert any(f["check"] == "unattributed-file" for f in out["failures"])
 
     allow = tmp_path / "allow.json"
     allow.write_text(json.dumps(
         {"crates/pkg/src/u1/generated.rs": "rust-template scaffold, not derived"}))
-    code, out = run_tool(monkeypatch, capsys, "attribution.py", [
-        "check", "--original", str(orig), "--port", str(port), "--state", str(state),
-        "--allowlist", str(allow)])
+    code, out = _run(monkeypatch, capsys, orig, port, state,
+                     "--allowlist", str(allow))
     assert code == 0
     assert out["unattributed_files"] == []
 
@@ -138,17 +136,10 @@ def test_original_without_header_trivially_passes(monkeypatch, capsys, tmp_path)
     (orig / "src" / "pkg" / "parse.py").write_text("def parse(s):\n    return s\n")
     (port / "crates" / "pkg" / "src" / "u1" / "u1.rs").write_text(
         "// Ported from src/pkg/parse.py (MIT)\npub fn parse(s: &str) -> &str { s }\n")
-    code, out = run_tool(monkeypatch, capsys, "attribution.py", [
-        "check", "--original", str(orig), "--port", str(port), "--state", str(state)])
+    code, out = _run(monkeypatch, capsys, orig, port, state)
     assert code == 0
     row = out["provenance"][0]
     assert row["header_preserved"] is True  # nothing to preserve — noted, not failed
-
-
-def _run(monkeypatch, capsys, orig, port, state, *extra):
-    return run_tool(monkeypatch, capsys, "attribution.py", [
-        "check", "--original", str(orig), "--port", str(port), "--state", str(state),
-        *extra])
 
 
 # ---- issue #54: provenance grammar accepts `<path> @ <sha>` ----------------
