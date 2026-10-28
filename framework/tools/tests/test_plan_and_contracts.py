@@ -326,6 +326,11 @@ def test_contracts_flag_uncovered_and_dangling(monkeypatch, capsys, tmp_path):
     assert out["coverage_pct"] == 50.0
     by_unit = {c["unit"]: c for c in out["contracts"]}
     assert by_unit["u-parse"]["covering_tests"] == ["tests/test_parse.py::test_roundtrip"]
+    # the orphan test (imports os, claims no scoped module) is out-of-scope
+    # noise, not a within-scope dangling finding (issue #57)
+    assert out["dangling_tests"] == []
+    assert [d["nodeid"] for d in out["out_of_scope_tests"]] == \
+        ["tests/test_orphan.py::test_env"]
 
 
 def test_full_coverage_passes_when_no_dangling(monkeypatch, capsys, tmp_path):
@@ -340,15 +345,29 @@ def test_full_coverage_passes_when_no_dangling(monkeypatch, capsys, tmp_path):
     assert code == 0
     assert out["coverage_pct"] == 100.0
     assert out["uncovered_units"] == [] and out["dangling_tests"] == []
+    assert out["out_of_scope_tests"] == []
 
 
-def test_dangling_tests_always_flagged(monkeypatch, capsys, tmp_path):
+def test_within_scope_dangling_always_fails(monkeypatch, capsys, tmp_path):
+    """A test file NAMED for a scoped unit module that imports none of them
+    is a real mapping failure and fails even with --allow-uncovered; a test
+    that merely lives outside the approved tranche is informational only
+    (issue #57)."""
     proj, state, collect = _cproj(tmp_path)
+    (proj / "tests" / "test_rank.py").write_text(
+        "import os\n\n\ndef test_env2():\n    assert os.name\n")
+    collect.write_text("tests/test_parse.py::test_roundtrip\n"
+                       "tests/test_orphan.py::test_env\n"
+                       "tests/test_rank.py::test_env2\n\n3 tests collected\n")
     code, out = run_tool(monkeypatch, capsys, "contract_extract.py", [
         "extract", "--state", str(state), "--root", str(proj),
         "--pytest-collect", str(collect), "--allow-uncovered"])
-    assert any(d["nodeid"] == "tests/test_orphan.py::test_env" for d in out["dangling_tests"])
-    assert code == 2  # dangling still fails even with allow-uncovered
+    assert code == 2  # name-claim dangling fails even with allow-uncovered
+    assert [d["nodeid"] for d in out["dangling_tests"]] == \
+        ["tests/test_rank.py::test_env2"]
+    assert "named for scoped unit module 'rank'" in out["dangling_tests"][0]["reason"]
+    assert [d["nodeid"] for d in out["out_of_scope_tests"]] == \
+        ["tests/test_orphan.py::test_env"]
 
 
 def test_invariants_and_signatures_extracted(monkeypatch, capsys, tmp_path):
@@ -426,9 +445,9 @@ def test_src_layout_imports_cover_units(monkeypatch, capsys, tmp_path):
     assert out["layout_mismatch_suspected"] is False
 
 
-def test_src_layout_still_flags_true_uncovered_and_dangling(monkeypatch, capsys, tmp_path):
+def test_src_layout_still_flags_true_uncovered_and_out_of_scope(monkeypatch, capsys, tmp_path):
     """The fix must not over-match: a genuinely untested unit stays uncovered
-    and an out-of-scope engine test stays dangling."""
+    and an unrelated engine test is reported as out-of-scope noise."""
     proj, state = _srcpkg(tmp_path)
     (proj / "tests" / "test_parse.py").write_text(
         "from src.parse import tokenize\n\n\ndef test_roundtrip():\n"
@@ -444,7 +463,11 @@ def test_src_layout_still_flags_true_uncovered_and_dangling(monkeypatch, capsys,
     assert code == 2
     assert out["uncovered_units"] == ["u-rank"]  # no test imports src.rank
     assert out["coverage_pct"] == 50.0
-    assert [d["nodeid"] for d in out["dangling_tests"]] == ["tests/test_engine.py::test_engine"]
+    # the zlib test claims no scoped module and touches no project code:
+    # informational out-of-scope, not a within-scope dangling finding
+    assert out["dangling_tests"] == []
+    assert [d["nodeid"] for d in out["out_of_scope_tests"]] == \
+        ["tests/test_engine.py::test_engine"]
     by_unit = {c["unit"]: c for c in out["contracts"]}
     assert by_unit["u-parse"]["covering_tests"] == ["tests/test_parse.py::test_roundtrip"]
     assert out["layout_mismatch_suspected"] is False  # partial coverage: not a mismatch
@@ -467,3 +490,119 @@ def test_all_uncovered_plus_import_mismatch_hints_layout(monkeypatch, capsys, tm
     assert out["coverage_pct"] == 0.0
     assert out["layout_mismatch_suspected"] is True
     assert "likely layout mismatch" in out["summary"]["human"]
+
+
+# ---------------------------------- issue #57: transitive coverage + scope -
+
+def _hproj(tmp_path, deps):
+    """Shared-helper project: helper <- engine (deps given per test), with a
+    single consumer test suite that never imports the helper directly."""
+    proj = tmp_path / "hproj"
+    (proj / "src" / "pkg").mkdir(parents=True)
+    (proj / "tests").mkdir(parents=True)
+    (proj / "src" / "pkg" / "helper.py").write_text(
+        '"""Shared envelope builder.\n\n'
+        'Invariant: envelope carries "ok"\n"""\n\n\n'
+        "def build(x):\n    return {'ok': x}\n")
+    (proj / "src" / "pkg" / "engine.py").write_text(
+        "from pkg.helper import build\n\n\ndef run(x):\n    return build(x)\n")
+    (proj / "tests" / "test_engine.py").write_text(
+        "from pkg.engine import run\n\n\ndef test_run():\n"
+        "    assert run(1) == {'ok': 1}\n")
+    state = tmp_path / "hstate.json"
+    state.write_text(json.dumps({
+        "project": {"name": "pkg", "python_path": "src/pkg"}, "stage": 2,
+        "units": [
+            {"id": "u-helper", "python_path": "src/pkg/helper.py", "rust_path": None,
+             "deps": deps.get("u-helper", []), "order": 1, "status": "pending"},
+            {"id": "u-engine", "python_path": "src/pkg/engine.py", "rust_path": None,
+             "deps": deps.get("u-engine", []), "order": 2, "status": "pending"},
+        ]}))
+    collect = tmp_path / "hcollect.txt"
+    collect.write_text("tests/test_engine.py::test_run\n\n1 test collected\n")
+    return proj, state, collect
+
+
+def test_consumer_suites_cover_helper_transitively(monkeypatch, capsys, tmp_path):
+    """The issue #57 scenario: a shared helper with no directly-importing
+    test file is exercised by its consumers' suites — a test covering unit A
+    covers A's deps[] closure, reported distinctly from direct coverage."""
+    proj, state, collect = _hproj(tmp_path, {"u-engine": ["u-helper"]})
+    code, out = run_tool(monkeypatch, capsys, "contract_extract.py", [
+        "extract", "--state", str(state), "--root", str(proj),
+        "--pytest-collect", str(collect)])
+    assert code == 0, out["summary"]["human"]
+    assert out["coverage_pct"] == 100.0
+    assert out["uncovered_units"] == [] and out["dangling_tests"] == []
+    assert out["covered_transitively"] == ["u-helper"]
+    by_unit = {c["unit"]: c for c in out["contracts"]}
+    # direct vs transitive reported distinctly
+    assert by_unit["u-helper"]["covering_tests"] == []
+    assert by_unit["u-helper"]["transitive_covering_tests"] == \
+        ["tests/test_engine.py::test_run"]
+    assert by_unit["u-helper"]["covered_via"] == ["u-engine"]
+    assert by_unit["u-engine"]["covering_tests"] == ["tests/test_engine.py::test_run"]
+    # a transitively-covered unit keeps its OWN module invariants (consumer
+    # tests assert the consumer's contract, not the helper's tags)
+    assert 'Invariant: envelope carries "ok"' in by_unit["u-helper"]["invariants"]
+
+
+def test_missing_deps_graph_keeps_helper_uncovered(monkeypatch, capsys, tmp_path):
+    """Without the deps edge the helper is genuinely uncovered — transitive
+    coverage must follow the state graph, not the source imports."""
+    proj, state, collect = _hproj(tmp_path, {})  # no deps recorded
+    code, out = run_tool(monkeypatch, capsys, "contract_extract.py", [
+        "extract", "--state", str(state), "--root", str(proj),
+        "--pytest-collect", str(collect)])
+    assert code == 2
+    assert out["uncovered_units"] == ["u-helper"]
+    assert out["coverage_pct"] == 50.0
+    by_unit = {c["unit"]: c for c in out["contracts"]}
+    assert by_unit["u-helper"]["transitive_covering_tests"] == []
+    assert by_unit["u-helper"]["covered_via"] == []
+
+
+def test_transitive_coverage_survives_dep_cycles(monkeypatch, capsys, tmp_path):
+    """A deps[] cycle must not wedge the closure walk: the consumer's test
+    still covers everything it reaches."""
+    proj, state, collect = _hproj(tmp_path, {"u-helper": ["u-engine"],
+                                             "u-engine": ["u-helper"]})
+    code, out = run_tool(monkeypatch, capsys, "contract_extract.py", [
+        "extract", "--state", str(state), "--root", str(proj),
+        "--pytest-collect", str(collect)])
+    assert code == 0, out["summary"]["human"]
+    assert out["coverage_pct"] == 100.0
+    assert out["uncovered_units"] == []
+    assert out["covered_transitively"] == ["u-helper"]
+
+
+def test_out_of_scope_tests_are_informational_not_findings(monkeypatch, capsys, tmp_path):
+    """Full-suite capture (issue #57): tests of modules outside the approved
+    tranche are summarized informationally and never drive the exit code —
+    Stage 0/1 approved a tranche, not the repo."""
+    proj, state, collect = _cproj(tmp_path)
+    (proj / "src" / "pkg" / "other.py").write_text("def o():\n    return 1\n")
+    (proj / "tests" / "test_rank.py").write_text(
+        "from pkg.rank import rank\n\n\ndef test_sorted():\n"
+        "    assert rank([2, 1]) == [1, 2]\n")
+    (proj / "tests" / "test_other.py").write_text(
+        "from pkg.other import o\n\n\ndef test_o():\n    assert o() == 1\n")
+    (proj / "tests" / "test_zlib.py").write_text(
+        "import zlib\n\n\ndef test_z():\n    assert zlib.compress(b'x')\n")
+    collect.write_text("tests/test_parse.py::test_roundtrip\n"
+                       "tests/test_rank.py::test_sorted\n"
+                       "tests/test_other.py::test_o\n"
+                       "tests/test_zlib.py::test_z\n\n4 tests collected\n")
+    code, out = run_tool(monkeypatch, capsys, "contract_extract.py", [
+        "extract", "--state", str(state), "--root", str(proj),
+        "--pytest-collect", str(collect)])
+    # both scoped units covered, no within-scope dangling -> PASS despite
+    # the two out-of-scope tests in the same capture
+    assert code == 0, out["summary"]["human"]
+    assert out["coverage_pct"] == 100.0
+    assert out["uncovered_units"] == [] and out["dangling_tests"] == []
+    assert out["findings"] == []
+    reasons = {d["nodeid"]: d["reason"] for d in out["out_of_scope_tests"]}
+    assert set(reasons) == {"tests/test_other.py::test_o", "tests/test_zlib.py::test_z"}
+    assert "pkg.other" in reasons["tests/test_other.py::test_o"]
+    assert "out-of-scope tests skipped: 2 (informational)" in out["summary"]["human"]
