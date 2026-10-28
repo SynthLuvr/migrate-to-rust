@@ -193,6 +193,104 @@ def test_parse_error_is_tooling_note_not_risk_flag(monkeypatch, capsys, tmp_path
     assert "1 regex-fallback scan(s)" in out["summary"]["human"]
 
 
+# ------------------------------------- issue #51: system time, not units --
+# Stdlib files that appear in the profile (copy.py, csv, statistics, ...)
+# exist on disk, so the issue #28 "path not found" guard never fired and
+# they became units — inflating the backlog and adding risk-flag noise to
+# Stage-1 exit criteria. Only code under --project-root is a port unit.
+
+def test_plan_skips_stdlib_hotspots_outside_root(monkeypatch, capsys, tmp_path):
+    """Hotspot files that exist but live outside --project-root (stdlib,
+    site-packages, the interpreter) are system time, never port units —
+    the crate replaces them with Rust idioms, SUB-1 doesn't apply (issue
+    #51). Their time must stay visible as signal, not backlog."""
+    import copy
+    import csv
+    from pathlib import Path
+    proj = _quiet_project(tmp_path)
+    stdlib_copy = str(Path(copy.__file__).resolve())
+    stdlib_csv = str(Path(csv.__file__).resolve())
+    hotspots = tmp_path / "sys.json"
+    hotspots.write_text(json.dumps([
+        {"path": stdlib_copy, "self_cpu_s": 9.0, "calls": 400},  # deepcopy cost
+        {"path": stdlib_csv, "self_cpu_s": 3.5, "calls": 90},
+        {"path": "src/pkg/hot.py", "self_cpu_s": 5.0, "calls": 7},
+        {"path": "src/pkg/leaf.py", "self_cpu_s": 1.0, "calls": 3},
+    ]))
+    code, out = run_tool(monkeypatch, capsys, "port_plan.py", [
+        "plan", "--hotspots", str(hotspots), "--project-root", str(proj)])
+    assert code == 0, out["summary"]["human"]
+    assert sorted(u["id"] for u in out["units"]) == ["u-pkg-hot", "u-pkg-leaf"], \
+        "stdlib hotspots must not become units"
+    sys_warnings = [w for w in out["warnings"] if "outside the project root" in w]
+    assert len(sys_warnings) == 1, "one summarized warning, not one per file"
+    assert "system time" in sys_warnings[0]
+    assert "copy.py" in sys_warnings[0] and "csv.py" in sys_warnings[0]
+    st = out["system_time"]
+    assert st["self_cpu_s"] == 12.5  # 9.0 + 3.5 kept as Stage-0 signal
+    assert [m["module"] for m in st["modules"]] == ["copy", "csv"]  # cpu-desc
+    assert st["modules"][0]["self_cpu_s"] == 9.0
+    assert "2 system-time file(s)" in out["summary"]["human"]
+    assert "12.500s self-CPU" in out["summary"]["human"]
+
+
+def test_plan_absolute_paths_inside_root_still_units(monkeypatch, capsys, tmp_path):
+    """The root-containment rule must not over-match: a profiler recording
+    ABSOLUTE paths inside the project still yields units for them."""
+    proj = _quiet_project(tmp_path)
+    hotspots = tmp_path / "abs.json"
+    hotspots.write_text(json.dumps([
+        {"path": str(proj / "src" / "pkg" / "hot.py"), "self_cpu_s": 5.0, "calls": 7},
+        {"path": str(proj / "src" / "pkg" / "leaf.py"), "self_cpu_s": 1.0, "calls": 3},
+    ]))
+    code, out = run_tool(monkeypatch, capsys, "port_plan.py", [
+        "plan", "--hotspots", str(hotspots), "--project-root", str(proj)])
+    assert code == 0
+    assert sorted(u["id"] for u in out["units"]) == ["u-pkg-hot", "u-pkg-leaf"]
+    assert "system_time" not in out
+    assert not any("outside the project root" in w for w in out["warnings"])
+
+
+def test_plan_vendored_venv_inside_root_is_system_time(monkeypatch, capsys, tmp_path):
+    """A venv checked into the repo sits under the project root but the
+    project doesn't own its code: site-packages/venv hotspot files are
+    system time too (issue #51 names site-packages explicitly)."""
+    proj = _quiet_project(tmp_path)
+    dep = proj / ".venv" / "lib" / "python3.12" / "site-packages" / "dep.py"
+    dep.parent.mkdir(parents=True)
+    dep.write_text("def f():\n    return 1\n")
+    hotspots = tmp_path / "venv.json"
+    hotspots.write_text(json.dumps([
+        {"path": str(dep), "self_cpu_s": 7.0, "calls": 50},
+        {"path": "src/pkg/hot.py", "self_cpu_s": 5.0, "calls": 7},
+    ]))
+    code, out = run_tool(monkeypatch, capsys, "port_plan.py", [
+        "plan", "--hotspots", str(hotspots), "--project-root", str(proj)])
+    assert code == 0
+    assert [u["id"] for u in out["units"]] == ["u-pkg-hot"]
+    assert [m["module"] for m in out["system_time"]["modules"]] == ["dep"]
+    assert out["system_time"]["self_cpu_s"] == 7.0
+
+
+def test_plan_refuses_when_only_system_time_resolves(monkeypatch, capsys, tmp_path):
+    """Every hotspot being outside the root (or unresolvable noise) still
+    refuses: there is nothing under the project root to port."""
+    import copy
+    from pathlib import Path
+    proj = _quiet_project(tmp_path)
+    hotspots = tmp_path / "onlysys.json"
+    hotspots.write_text(json.dumps([
+        {"path": str(Path(copy.__file__).resolve()), "self_cpu_s": 9.0, "calls": 1},
+        {"path": "~", "self_cpu_s": 0.9, "calls": 99},
+    ]))
+    code, out = run_tool(monkeypatch, capsys, "port_plan.py", [
+        "plan", "--hotspots", str(hotspots), "--project-root", str(proj)])
+    assert code == 1 and out["error"]["kind"] == "usage"
+    assert "no hotspot path resolved" in out["error"]["detail"]
+    assert "system time" in out["error"]["detail"]
+    assert "copy.py" in out["error"]["detail"] and "~" in out["error"]["detail"]
+
+
 # ------------------------------------------------------ contract_extract ---
 
 def _cproj(tmp_path):

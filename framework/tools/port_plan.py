@@ -23,6 +23,16 @@ launchers recorded as ``~``, unexpanded ``~/`` paths, deleted files) are
 skipped with a warning — a measurement of a file that isn't a project
 module is not a port unit; the run refuses only when nothing resolves.
 
+Only files under ``--project-root`` become units. Hotspot files that
+exist but live outside the root — the stdlib (copy.py, csv, statistics,
+...), site-packages, the interpreter — are *system time*, never port
+units: the crate replaces them with Rust idioms, so SUB-1 does not apply
+to code the project doesn't own. They are skipped into a summarized
+``system_time`` block (total + per-module self-CPU) instead of inflating
+the backlog and adding risk-flag noise to Stage-1 exit criteria; the
+time itself is still Stage-0 signal (e.g. deepcopy cost surfacing in
+copy.py argues for eliminating deepcopy, not porting copy.py) (issue #51).
+
 A file that fails to parse under the *tool's* interpreter (e.g. syntax
 newer than the tool's Python) gets a regex-fallback scan and a
 ``parse_note`` instead of a `parse-error` risk flag: the profiled code ran
@@ -282,12 +292,18 @@ def cmd_plan(args) -> int:
             kind="usage")
     project_root = Path(args.project_root or ".").resolve()
 
-    # keep the original hotspot dict around for metrics lookup; hotspot
-    # paths that resolve to no file are profiler noise, not port units —
-    # skip them, and refuse only when nothing resolves (issue #28)
+    # keep the original hotspot dict around for metrics lookup. Two kinds
+    # of hotspot entry are not port units and are skipped with warnings:
+    # paths that resolve to no file (profiler noise: console-script
+    # launchers, unexpanded/stale paths — issue #28), and files that
+    # exist OUTSIDE the project root (stdlib, site-packages, the
+    # interpreter — system time, issue #51: the crate replaces them with
+    # Rust idioms, SUB-1 doesn't apply to code the project doesn't own).
+    # The run refuses only when nothing under the root resolves.
     resolved: dict[str, Path] = {}
     hotspot_of: dict[str, dict] = {}
     skipped: list[str] = []
+    system: list[dict] = []
     for h in hotspots:
         p = Path(h["path"])
         if not p.is_absolute():
@@ -297,12 +313,20 @@ def cmd_plan(args) -> int:
         if p is None or not p.exists():
             skipped.append(str(h["path"]))
             continue
+        if not _is_unit_candidate(p, project_root):
+            system.append({"path": str(h["path"]), "module": p.stem,
+                           "self_cpu_s": float(h.get("self_cpu_s", 0.0) or 0.0)})
+            continue
         resolved[str(p)] = p
         hotspot_of[str(p)] = h
     if not resolved:
-        raise ToolError(
-            "no hotspot path resolved under the project root (skipped: "
-            f"{', '.join(skipped)})", kind="usage")
+        detail = "no hotspot path resolved under the project root"
+        if skipped:
+            detail += f" (not found: {', '.join(skipped)})"
+        if system:
+            detail += (" (outside the project root — system time: "
+                       + ", ".join(s["path"] for s in system) + ")")
+        raise ToolError(detail, kind="usage")
 
     measured = rank(hotspots)
     scans = {path_str: scan_module(p) for path_str, p in resolved.items()}
@@ -395,6 +419,25 @@ def cmd_plan(args) -> int:
             f"skipped {len(skipped)} hotspot path(s) not found under the project "
             f"root (profiler noise — console-script launchers, unexpanded/stale "
             f"paths — not port units): {', '.join(skipped)}")
+    system.sort(key=lambda s: (-s["self_cpu_s"], s["path"]))
+    system_cpu = sum(s["self_cpu_s"] for s in system)
+    system_time = None
+    if system:
+        top = ", ".join(f"{s['module']} {s['self_cpu_s']:.3f}s" for s in system[:5])
+        warnings.append(
+            f"skipped {len(system)} hotspot file(s) outside the project root — "
+            f"system time (stdlib / site-packages / interpreter; the crate "
+            f"replaces them with Rust idioms, so SUB-1 does not apply), "
+            f"{system_cpu:.3f}s self-CPU total, top: {top} — Stage-0 signal, "
+            f"not port units: {', '.join(s['path'] for s in system)}")
+        system_time = {
+            "self_cpu_s": round(system_cpu, 6),
+            "modules": [{"path": s["path"], "module": s["module"],
+                         "self_cpu_s": round(s["self_cpu_s"], 6)} for s in system],
+            "note": "hotspot files outside the project root (stdlib / "
+                    "site-packages / interpreter) — profiling signal for "
+                    "Stage-0 decisions, never port units (issue #51)",
+        }
     parse_failed = [u for u in units if u.get("parse_note")]
     if parse_failed:
         warnings.append(
@@ -410,9 +453,11 @@ def cmd_plan(args) -> int:
     human = (f"plan: {len(units)} unit(s), priority-ranked; {len(portable)} portable, "
              f"{n_io} I/O-bound (NO-GO, ranked last)"
              + (f"; skipped {len(skipped)} unresolvable hotspot path(s)" if skipped else "")
+             + (f"; {len(system)} system-time file(s) outside the root "
+                f"({system_cpu:.3f}s self-CPU)" if system else "")
              + (f"; {len(parse_failed)} regex-fallback scan(s)" if parse_failed else "")
              + (f"; {len(errors)} ERROR(S)" if errors else ""))
-    emit({
+    plan = {
         "tool": TOOL, "version": VERSION,
         "project_root": str(project_root),
         "units": ranked_units,
@@ -423,7 +468,10 @@ def cmd_plan(args) -> int:
                     "portability": "100 - 10 * len(risk_flags) (floor 0)",
                     "priority": "self_cpu_s * (1 - io_share) * portability / 100"},
         "summary": {"exit_code": code, "human": human},
-    }, human_flag=args.human)
+    }
+    if system_time is not None:
+        plan["system_time"] = system_time
+    emit(plan, human_flag=args.human)
     return code
 
 
@@ -433,6 +481,26 @@ def _rel(path_str: str, project_root: Path) -> str:
         return str(p.resolve().relative_to(project_root))
     except ValueError:
         return str(p)
+
+
+# vendored interpreter/dependency machinery: profiling time spent here is
+# system time even when it physically sits under the project root (a venv
+# checked into the repo) — the project doesn't own the code (issue #51)
+_VENDOR_PARTS = {"site-packages", "dist-packages", ".venv", "venv"}
+
+
+def _is_unit_candidate(path: Path, project_root: Path) -> bool:
+    """A port unit must be code the migration owns: a file under the
+    project root that is not vendored interpreter/dependency machinery.
+    Stdlib files that show up in the profile (copy.py, csv, statistics,
+    ...) can never be port units — the crate replaces them with Rust
+    idioms and SUB-1 doesn't apply — so they are classified as system
+    time, not backlog entries (issue #51)."""
+    try:
+        rel = path.resolve().relative_to(project_root)
+    except ValueError:
+        return False
+    return not any(part in _VENDOR_PARTS for part in rel.parts)
 
 
 def _find_by_suffix(path: str, root: Path) -> Path | None:
@@ -456,7 +524,11 @@ def main(argv=None) -> int:
     p.add_argument("--hotspots", required=True,
                    help="canonical hotspots JSON: bare list, or from-cprofile's "
                         "envelope (its 'hotspots' member is unwrapped)")
-    p.add_argument("--project-root", help="root the hotspot paths resolve against (default: cwd)")
+    p.add_argument("--project-root",
+                   help="root the hotspot paths resolve against (default: cwd); "
+                        "only files under it become units — hotspot files "
+                        "outside it (stdlib/site-packages/interpreter) are "
+                        "summarized as system time")
     p.add_argument("--mypy", help="optional mypy JSON list for type-quality risk flags")
     p.set_defaults(func=cmd_plan)
 
