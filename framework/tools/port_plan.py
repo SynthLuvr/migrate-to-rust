@@ -7,7 +7,9 @@ checklist demands: nothing enters the plan without profiler evidence (hard
 rule 1: profile before porting; I/O-bound code is a NO-GO signal).
 
 Input format (canonical "hotspots JSON" — see from-cprofile for generating
-it from a cProfile dump):
+it from a cProfile dump): either the bare canonical list or, for direct
+composition, ``from-cprofile``'s tool envelope (its ``hotspots`` member is
+unwrapped automatically — issue #28):
 
     [{"path": "src/pkg/parse.py", "self_cpu_s": 12.4, "io_wait_s": 3.1,
       "alloc_mb": 210, "calls": 54000}, ...]
@@ -15,6 +17,18 @@ it from a cProfile dump):
 Static analysis uses the stdlib ``ast`` module (deterministic, no
 tree-sitter dependency). Unit granularity = module; a module with multiple
 independently testable top-level classes can be split later by hand.
+
+Hotspot paths that resolve to no file (profiler noise: console-script
+launchers recorded as ``~``, unexpanded ``~/`` paths, deleted files) are
+SKIPPED with a warning — a measurement of a file that isn't a project
+module is not a port unit. The run only refuses when nothing resolves.
+
+Files that fail to parse under the *tool's* interpreter are NOT given a
+parse-error risk flag: hotspots come from code that already ran under the
+target interpreter, so a parse failure here is a tooling artifact (tool
+Python older than the target's syntax), not a portability risk. The scan
+falls back to regex (imports + risk patterns) and the unit carries a
+``parse_note`` instead of a scored flag (issue #28).
 
 Scoring (deterministic, documented):
   io_share      = io_wait_s / (io_wait_s + self_cpu_s + epsilon)
@@ -31,8 +45,10 @@ risk flags.
 Output: plan JSON whose ``units`` conform to migration-state.schema.json's
 unit shape (feed to state.py via --field units=[...]).
 
-Exit codes: 0 plan produced (warnings possible) · 2 cycles found or no
-usable hotspots · 1 usage/IO.
+Exit codes: 0 plan produced (skipped noise paths and parse fallbacks are
+warnings, not errors) · 2 cycles found or every scoped hotspot I/O-bound ·
+1 usage/IO (bad hotspots JSON, or no hotspot path resolves under the
+project root).
 """
 
 from __future__ import annotations
@@ -46,7 +62,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     EXIT_FINDINGS, EXIT_OK, ToolError, emit, module_name_of,
-    read_json, run_cli,
+    python_version_string, read_json, run_cli,
 )
 
 TOOL = "port_plan.py"
@@ -85,17 +101,38 @@ def unit_id_of(python_path: str, taken: set[str]) -> str:
 
 # ------------------------------------------------------------ AST scan -----
 
+_IMPORT_RE = re.compile(r"^[ \t]*(?:from[ \t]+([\w.]+)|import[ \t]+([\w.]+))",
+                         re.MULTILINE)
+
+
+def _regex_imports(source: str) -> set[str]:
+    """Best-effort import extraction for the no-AST fallback path (parse
+    error under the tool's interpreter): line-leading ``from x.y ...`` /
+    ``import z`` statements. Enough to keep dep edges for ordering."""
+    imports = set()
+    for m in _IMPORT_RE.finditer(source):
+        imports.add(m.group(1) or m.group(2))
+    return imports
+
+
 def scan_module(path: Path) -> dict:
     """Deterministic single-pass scan: imports (dep edges), risk flags,
-    def/class counts, docstring invariants count."""
+    def/class counts. On a parse error (tool Python older than the target
+    syntax — the file ran under the target interpreter) records the detail
+    in ``parse_error`` and regex-scans instead of flagging a risk."""
     out = {"imports": set(), "risk_flags": [], "functions": 0, "classes": 0}
     source = path.read_text(encoding="utf-8", errors="replace")
     try:
         tree = ast.parse(source)
     except SyntaxError as e:
-        out["risk_flags"].append("parse-error")
+        # NOT a risk flag (issue #28): hotspot files already ran under the
+        # target interpreter (that's where the measurements came from), so
+        # a parse failure here means the *tool's* Python is older than the
+        # target's syntax — a tooling artifact, not a portability risk.
+        # Keep the detail for the unit's parse_note and fall back to a
+        # regex scan (imports for dep edges + risk patterns).
         out["parse_error"] = str(e)
-        # fall back to regex scan of the raw text for risk patterns
+        out["imports"] = _regex_imports(source)
         for flag, pats in RISK_PATTERNS.items():
             if any(re.search(p, source) for p in pats):
                 out["risk_flags"].append(flag)
@@ -222,16 +259,27 @@ def cmd_from_cprofile(args) -> int:
 
 def cmd_plan(args) -> int:
     hotspots = read_json(args.hotspots)
+    # accept the bare canonical list OR the standard tool envelope emitted
+    # by `from-cprofile` ({"tool": ..., "hotspots": [...]}) so the two
+    # subcommands compose without a manual extract step (issue #28)
+    if isinstance(hotspots, dict):
+        hotspots = hotspots.get("hotspots")
     if not isinstance(hotspots, list) or not hotspots:
         raise ToolError(
-            "hotspots JSON must be a non-empty list of per-module measurements",
+            "hotspots JSON must be a non-empty list of per-module measurements "
+            "(or a tool envelope with a non-empty 'hotspots' list — e.g. "
+            "from-cprofile output)",
             kind="usage")
     project_root = Path(args.project_root or ".").resolve()
 
     # resolve each hotspot path against the project root; keep the original
-    # hotspot dict around for metrics lookup
+    # hotspot dict around for metrics lookup. Paths that resolve to no file
+    # are profiler noise (console-script launchers recorded as "~", stale
+    # files, out-of-tree entries), not port units: skip them with a warning
+    # instead of refusing the whole plan (issue #28).
     resolved: dict[str, Path] = {}
     hotspot_of: dict[str, dict] = {}
+    skipped: list[str] = []
     for h in hotspots:
         p = Path(h["path"])
         if not p.is_absolute():
@@ -239,9 +287,14 @@ def cmd_plan(args) -> int:
         if not p.exists():
             p = _find_by_suffix(h["path"], project_root)
         if p is None or not p.exists():
-            raise ToolError(f"hotspot path not found: {h['path']}")
+            skipped.append(str(h["path"]))
+            continue
         resolved[str(p)] = p
         hotspot_of[str(p)] = h
+    if not resolved:
+        raise ToolError(
+            "no hotspot path resolved under the project root (skipped: "
+            f"{', '.join(skipped)})", kind="usage")
 
     measured = rank(hotspots)
     scans = {path_str: scan_module(p) for path_str, p in resolved.items()}
@@ -299,6 +352,13 @@ def cmd_plan(args) -> int:
             "priority": round(priority, 6),
             "no_go": h["io_bound"],
         }
+        if scan.get("parse_error"):
+            # tooling artifact, deliberately NOT a risk flag (issue #28):
+            # the file already ran under the target interpreter
+            unit["parse_note"] = (
+                f"parse-error under tool Python {python_version_string()} "
+                f"({scan['parse_error']}) — likely newer-than-tool syntax; "
+                f"regex-fallback scan used, not counted as a portability risk")
         units.append(unit)
 
     # convert dep paths to unit ids
@@ -326,10 +386,28 @@ def cmd_plan(args) -> int:
         errors.append("every scoped hotspot is I/O-bound — nothing worth porting "
                       "(Stage 0: recommend NO-GO)")
 
+    warnings: list[str] = []
+    if skipped:
+        warnings.append(
+            f"skipped {len(skipped)} hotspot path(s) not found under the project "
+            f"root (profiler noise — console-script launchers, unexpanded/stale "
+            f"paths — not port units): {', '.join(skipped)}")
+    parse_failed = [u for u in units if u.get("parse_note")]
+    if parse_failed:
+        warnings.append(
+            f"{len(parse_failed)} unit(s) failed to parse under tool Python "
+            f"{python_version_string()} — tooling artifact (the profiled code ran "
+            f"under the target interpreter), regex-fallback scan used, no "
+            f"portability penalty: {', '.join(sorted(u['id'] for u in parse_failed))}")
+    warnings.extend(f"{u['id']}: io-bound (io_share={u['metrics']['io_share']}) — "
+                    f"NO-GO signal, ranked last" for u in io_bound)
+
     code = EXIT_FINDINGS if errors else EXIT_OK
     n_io = len(io_bound)
     human = (f"plan: {len(units)} unit(s), priority-ranked; {len(portable)} portable, "
              f"{n_io} I/O-bound (NO-GO, ranked last)"
+             + (f"; skipped {len(skipped)} unresolvable hotspot path(s)" if skipped else "")
+             + (f"; {len(parse_failed)} regex-fallback scan(s)" if parse_failed else "")
              + (f"; {len(errors)} ERROR(S)" if errors else ""))
     emit({
         "tool": TOOL, "version": VERSION,
@@ -337,8 +415,7 @@ def cmd_plan(args) -> int:
         "units": ranked_units,
         "cycles": cycles,
         "errors": errors,
-        "warnings": [f"{u['id']}: io-bound (io_share={u['metrics']['io_share']}) — "
-                     f"NO-GO signal, ranked last" for u in io_bound],
+        "warnings": warnings,
         "scoring": {"io_bound": "io_share >= 0.5 -> no_go, ranked last",
                     "portability": "100 - 10 * len(risk_flags) (floor 0)",
                     "priority": "self_cpu_s * (1 - io_share) * portability / 100"},
@@ -373,7 +450,9 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_from_cprofile)
 
     p = sub.add_parser("plan", help="hotspots JSON -> ranked dependency-ordered backlog")
-    p.add_argument("--hotspots", required=True)
+    p.add_argument("--hotspots", required=True,
+                   help="canonical hotspots JSON: bare list, or from-cprofile's "
+                        "envelope (its 'hotspots' member is unwrapped)")
     p.add_argument("--project-root", help="root the hotspot paths resolve against (default: cwd)")
     p.add_argument("--mypy", help="optional mypy JSON list for type-quality risk flags")
     p.set_defaults(func=cmd_plan)
