@@ -68,13 +68,13 @@ prompt: |
   and stop. Initialize framework/state/migration-state.json with
   `python framework/tools/state.py init framework/state/migration-state.json
   --name <project> --python-path <package>` — never hand-write it from
-  framework/state/migration-state.schema.json alone: state.py init also
-  records the pre-authorized autonomy (default L2, all gates
-  policy-resolved; a state file without an autonomy block reads as the
-  supervised L0 and fails its first resolve-gates, issue #27) — then
-  validate against the schema and keep the file current through every
-  stage. Read the background files from disk as needed: SUMMARY.md,
-  TOOLCHAIN.md, and research/5-idioms-and-ecosystem-mapping.md.
+  framework/state/migration-state.schema.json alone. Autonomy is not
+  schema-required: a state file without an autonomy block reads as the
+  supervised L0 and fails its first resolve-gates (issue #27); state.py
+  init records the pre-authorized autonomy (default L2). Keep the state
+  file schema-valid and current through every stage. Read the background
+  files from disk as needed: SUMMARY.md, TOOLCHAIN.md, and
+  research/5-idioms-and-ecosystem-mapping.md.
 # goose 1.53+ recipes have no `context` field (unknown keys are silently
 # ignored); background files are named in the prompt instead.
 parameters:

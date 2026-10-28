@@ -951,7 +951,7 @@ def cmd_resolve_gates(args) -> int:
             f"pre-authorize L2+ (nothing asks mid-run; --human-override forces "
             f"evaluation here; the decision is still journaled policy:<rule>). "
             f"For a fresh run, `state.py init --autonomy-level L2` is the "
-            f"documented default — note a hand-written state file without an "
+            f"documented default; a hand-written state file without an "
             f"autonomy block reads as L0", args.human, file=str(path))
     ctx = {"today": date.today(), "substitutions": load_substitutions(args.substitutions)}
     # the driver, not the stage worker, surfaces the gates the current stage

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pipeline as pipeline_tool
 import state as state_tool
-from conftest import TOOLS, run_tool
+from conftest import REPO_ROOT, TOOLS, run_tool
 
 TODAY = date(2026, 10, 27)  # pinned: freshness rules are evaluated against a fixed clock
 
@@ -264,17 +264,13 @@ def test_resolve_gates_refuses_supervised_levels(monkeypatch, capsys, tmp_path):
 
 
 def test_resolve_gates_refusal_explains_schema_only_state(monkeypatch, capsys,
-                                                          tmp_path):
-    """issue #27: a state file hand-written from the schema alone (autonomy
-    is not schema-required) reads as L0 — the refusal must say so and name
-    the same init remediation instead of leaving the operator guessing."""
-    p = tmp_path / "state.json"
-    p.write_text(json.dumps({"project": {"name": "demo",
-                                         "python_path": "src/demo"},
-                             "stage": 0, "units": [], "human_gates": [],
-                             "journal": []}))
+                                                          mini_state):
+    """issue #27: autonomy is not schema-required, so a hand-written state
+    file (mini_state has no autonomy block) reads as L0 — the refusal must
+    say so and name the init remediation instead of leaving the operator
+    guessing."""
     code, out = run_tool(monkeypatch, capsys, "pipeline.py",
-                         ["resolve-gates", str(p)])
+                         ["resolve-gates", str(mini_state)])
     assert code == 2 and out["error"].startswith("autonomy=L0:")
     assert "state.py init --autonomy-level L2" in out["error"]
     assert "autonomy block reads as L0" in out["error"]
@@ -282,16 +278,13 @@ def test_resolve_gates_refusal_explains_schema_only_state(monkeypatch, capsys,
 
 def test_recipe_prompt_inits_state_via_state_py():
     """issue #27: the recipe used to tell the orchestrator to hand-write the
-    state file 'from the schema' — autonomy is not schema-required, so that
+    state file from the schema — autonomy is not schema-required, so that
     file read as L0 and the run's first resolve-gates failed. The prompt
     must initialize through state.py init (autonomy journaled, default L2)."""
-    import yaml
-    from conftest import REPO_ROOT
-    recipe = yaml.safe_load((REPO_ROOT / "framework" / "recipe.yaml").read_text())
-    prompt = recipe["prompt"]
-    assert "state.py init framework/state/migration-state.json" in prompt
+    recipe = (REPO_ROOT / "framework" / "recipe.yaml").read_text()
+    assert "state.py init framework/state/migration-state.json" in recipe
     # the hand-init phrasing that produced autonomy-less (L0) state is gone
-    assert "from\n  framework/state/migration-state.schema.json" not in prompt
+    assert "migration-state.json from" not in recipe
 
 
 def test_resolve_gates_dry_run_writes_nothing(monkeypatch, capsys, tmp_path):
