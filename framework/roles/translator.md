@@ -14,8 +14,12 @@ knowledge-pack excerpt.
 4. All errors become `PyErr` at the FFI boundary. No `unwrap()`/`expect()` in
    exported functions; panics caught and converted.
 5. Provenance in every generated file: license header of the source file +
-   `// Ported from <python_path> (<license>)`. Never present output as an
-   independent rewrite.
+   `// Ported from <python_path> (<license>)` — a `@ <git sha>` pin after
+   the path is encouraged (``// Ported from src/x.py @ 3e5a348
+   (Apache-2.0)``); the checker compares the path token. Files you write
+   that are NOT derived from a unit (crate skeleton, shims) carry
+   `// Scaffold provenance: <what they came from>` instead. Never present
+   output as an independent rewrite.
 6. Before finishing: `cargo build` + the unit's parity tests must pass.
    Report the oracle verdict per run: Equivalent / Divergent / Incomparable,
    with diffs for divergences.

@@ -4,6 +4,7 @@ check, provenance comment required per generated file, fail on loss."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from conftest import run_tool
 
@@ -142,3 +143,140 @@ def test_original_without_header_trivially_passes(monkeypatch, capsys, tmp_path)
     assert code == 0
     row = out["provenance"][0]
     assert row["header_preserved"] is True  # nothing to preserve — noted, not failed
+
+
+def _run(monkeypatch, capsys, orig, port, state, *extra):
+    return run_tool(monkeypatch, capsys, "attribution.py", [
+        "check", "--original", str(orig), "--port", str(port), "--state", str(state),
+        *extra])
+
+
+# ---- issue #54: provenance grammar accepts `<path> @ <sha>` ----------------
+
+def test_sha_pinned_provenance_passes(monkeypatch, capsys, tmp_path):
+    orig, port, state = _scaffold(tmp_path)
+    (port / "crates" / "pkg" / "src" / "u1" / "u1.rs").write_text(
+        "// Copyright (c) 2020 Example Corp\n"
+        "// SPDX-License-Identifier: Apache-2.0\n"
+        "// Ported from src/pkg/parse.py @ 3e5a348 (no LICENSE file at port time)\n"
+        "\npub fn parse(s: &str) -> Vec<&str> { s.split(',').collect() }\n")
+    code, out = _run(monkeypatch, capsys, orig, port, state)
+    assert code == 0
+    row = out["provenance"][0]
+    assert row["declared_ok"] is True
+    assert row["declared_paths"] == ["src/pkg/parse.py"]
+    assert row["header_preserved"] is True
+
+
+def test_sha_pin_without_parenthetical_passes(monkeypatch, capsys, tmp_path):
+    orig, port, state = _scaffold(tmp_path)
+    (port / "crates" / "pkg" / "src" / "u1" / "u1.rs").write_text(
+        "// Copyright (c) 2020 Example Corp\n"
+        "// SPDX-License-Identifier: Apache-2.0\n"
+        "// Ported from src/pkg/parse.py @ 3e5a348\n"
+        "\npub fn parse(s: &str) -> Vec<&str> { s.split(',').collect() }\n")
+    code, out = _run(monkeypatch, capsys, orig, port, state)
+    assert code == 0
+    assert out["provenance"][0]["declared_paths"] == ["src/pkg/parse.py"]
+
+
+def test_quoted_provenance_path_with_spaces_passes(monkeypatch, capsys, tmp_path):
+    orig, port, state = _scaffold(tmp_path)
+    (orig / "src" / "pkg" / "odd name.py").write_text("# header line\n")
+    data = json.loads(state.read_text())
+    data["units"][0]["python_path"] = "src/pkg/odd name.py"
+    state.write_text(json.dumps(data))
+    (port / "crates" / "pkg" / "src" / "u1" / "u1.rs").write_text(
+        '// Ported from "src/pkg/odd name.py" @ 3e5a348 (Apache-2.0)\n'
+        "// header line\nfn x() {}\n")
+    code, out = _run(monkeypatch, capsys, orig, port, state)
+    assert code == 0
+    assert out["provenance"][0]["declared_paths"] == ["src/pkg/odd name.py"]
+
+
+# ---- issue #54: --original resolution --------------------------------------
+
+def test_original_defaults_to_preflight_target_root(monkeypatch, capsys, tmp_path):
+    orig, port, state = _scaffold(tmp_path)
+    _port_file(port)
+    data = json.loads(state.read_text())
+    data["preflight"] = {"target": {"root": str(orig)}}
+    state.write_text(json.dumps(data))
+    code, out = run_tool(monkeypatch, capsys, "attribution.py", [
+        "check", "--port", str(port), "--state", str(state)])
+    assert code == 0
+    assert Path(out["original"]) == orig.resolve()
+    assert out["ok"] is True
+
+
+def test_original_package_dir_still_runs_header_checks(monkeypatch, capsys, tmp_path):
+    # the natural-but-wrong spelling `--original <repo>/src` must resolve
+    # units and run header checks, not silently skip them (issue #54)
+    orig, port, state = _scaffold(tmp_path)
+    _port_file(port)
+    code, out = _run(monkeypatch, capsys, orig / "src", port, state)
+    assert code == 0
+    row = out["provenance"][0]
+    assert row["header_preserved"] is True
+    assert not [w for w in out["warnings"] if w["check"] == "original-missing"]
+
+
+def test_missing_original_and_no_preflight_root_is_usage_error(
+        monkeypatch, capsys, tmp_path):
+    orig, port, state = _scaffold(tmp_path)
+    _port_file(port)
+    code, out = run_tool(monkeypatch, capsys, "attribution.py", [
+        "check", "--port", str(port), "--state", str(state)])
+    assert code == 1
+    assert out["error"]["kind"] == "usage"
+    assert "preflight.target.root" in out["error"]["detail"]
+
+
+def test_preflight_root_wins_only_when_flag_absent(monkeypatch, capsys, tmp_path):
+    orig, port, state = _scaffold(tmp_path)
+    _port_file(port)
+    data = json.loads(state.read_text())
+    data["preflight"] = {"target": {"root": str(tmp_path / "nowhere")}}
+    state.write_text(json.dumps(data))
+    code, out = _run(monkeypatch, capsys, orig, port, state)  # flag overrides state
+    assert code == 0
+    assert Path(out["original"]) == orig.resolve()
+
+
+# ---- issue #54: scaffold-owned files ---------------------------------------
+
+def test_scaffold_provenance_header_excuses_stray(monkeypatch, capsys, tmp_path):
+    orig, port, state = _scaffold(tmp_path)
+    _port_file(port)
+    (port / "crates" / "pkg" / "src" / "lib.rs").write_text(
+        "// Scaffold provenance: rust-template @ b19c502b16df\npub fn x() {}\n")
+    # '#' marker form (python shim, justfile-style comments)
+    (port / "crates" / "pkg" / "src" / "u1" / "shim.py").write_text(
+        "# Scaffold provenance: state.py shim, not a unit\nx = 1\n")
+    code, out = _run(monkeypatch, capsys, orig, port, state)
+    assert code == 0
+    assert out["unattributed_files"] == []
+    assert sorted(s["path"] for s in out["scaffold_files"]) == [
+        "crates/pkg/src/lib.rs", "crates/pkg/src/u1/shim.py"]
+    assert out["counts"]["scaffold_files"] == 2
+
+
+def test_scaffold_files_report_their_provenance(monkeypatch, capsys, tmp_path):
+    orig, port, state = _scaffold(tmp_path)
+    _port_file(port)
+    (port / "crates" / "pkg" / "src" / "lib.rs").write_text(
+        "// Scaffold provenance: rust-template @ b19c502b16df\npub fn x() {}\n")
+    code, out = _run(monkeypatch, capsys, orig, port, state)
+    assert out["scaffold_files"][0]["provenance"] == \
+        ["rust-template @ b19c502b16df"]  # visible, never silently skipped
+
+
+def test_empty_scaffold_header_still_fails(monkeypatch, capsys, tmp_path):
+    orig, port, state = _scaffold(tmp_path)
+    _port_file(port)
+    (port / "crates" / "pkg" / "src" / "lib.rs").write_text(
+        "// Scaffold provenance:\npub fn x() {}\n")  # cites nothing -> not attribution
+    code, out = _run(monkeypatch, capsys, orig, port, state)
+    assert code == 2
+    assert any(f["check"] == "unattributed-file" and f["path"] == "crates/pkg/src/lib.rs"
+               for f in out["failures"])

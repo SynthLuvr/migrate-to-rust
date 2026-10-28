@@ -551,11 +551,21 @@ Design decisions worth knowing before you extend:
   can't express: dangling deps, cycles, order inversions, unexplained
   divergences, and out-of-band edits detected via journal coherence.
 - **attribution.py** scopes the port to the state file's units: each unit
-  file must carry `// Ported from <python_path> (<license>)` naming exactly
-  the unit's python_path, the original's leading comment block must appear
-  in the port file's header region, and NOTICE files must match
-  byte-for-byte (sha256). Files claimed by no unit fail unless allowlisted
-  with a reason — "independent rewrite" claims are surfaced, not trusted.
+  file must carry `// Ported from <python_path> [<@ sha>] [(<license>)]`
+  naming exactly the unit's python_path — the path is the first
+  whitespace-delimited token, so an `@ <sha>` pin after it is accepted
+  provenance, not a spelling error (issue #54). The original's leading
+  comment block must appear in the port file's header region, and NOTICE
+  files must match byte-for-byte (sha256). Files claimed by no unit fail
+  unless allowlisted with a reason or carrying
+  `// Scaffold provenance: <detail>` (scaffold-owned rust-template files
+  such as `lib.rs` — reported under `scaffold_files`, never silently
+  skipped) — "independent rewrite" claims are surfaced, not trusted.
+  `--original` is the target REPO root and may be omitted when the state
+  file records `preflight.target.root`; a deeper `--original` (or the
+  package dir, `<repo>/src`) still resolves units via suffix and
+  prefix-stripped unique matches instead of silently skipping header
+  checks.
 - **pyo3_review.py** file mode tracks `#[pyfunction]`/`#[pymethods]` spans
   with a comment/string/lifetime-aware lexer, so exported-function rules
   apply to real bodies; diff mode applies line rules to added lines with
