@@ -14,10 +14,24 @@ Test → unit mapping (deterministic, in priority order):
      (issue #26) — authoritative;
   2. filename convention ``test_<module>.py`` / ``<module>_test.py`` when the
      test file has no scoped imports at all.
-Tests matching no scoped unit are DANGLING and reported (never dropped
-silently). Units with zero covering tests are uncovered — the acceptance
-criterion is 100% of scoped units covered, so uncovered units fail the run
-unless --allow-uncovered.
+
+Coverage is TRANSITIVE over the state file's ``deps[]`` graph (issue #57): a
+test covering unit A also exercises everything A (transitively) imports, so a
+shared helper with no directly-importing test file is covered via its
+consumers' suites. Direct and transitive coverage are reported distinctly —
+``covering_tests`` stays direct-only; ``transitive_covering_tests`` /
+``covered_via`` record the consumer provenance — and both count toward the
+acceptance criterion: 100% of scoped units covered, so units with neither
+fail the run unless --allow-uncovered.
+
+Tests matching no scoped unit split by SCOPE (issue #57). Dangling-within-
+scope — the collected test file is missing from the project, or the test
+file is named for a scoped unit module yet imports none of them — is the
+real signal and always fails the run (never dropped silently). Tests that
+exercise modules outside the approved tranche (their own units are not in
+the state file), or nothing project-related at all, are out-of-scope and
+reported informationally (``out_of_scope_tests``) — they never drive the
+exit code, because Stage 0/1 approved a tranche, not the repo.
 
 Invariants are taken from docstring lines tagged ``Invariant:`` /
 ``Postcondition:`` / ``Property:`` in the unit module and its covering tests.
@@ -45,10 +59,12 @@ from _common import (  # noqa: E402
 )
 
 TOOL = "contract_extract.py"
-VERSION = 1
+VERSION = 2
 INVARIANT_TAGS = ("Invariant:", "Postcondition:", "Property:")
 NODEID_RE = re.compile(r"^(\S+\.py)::(\S+)$")
+TEST_STEM_RE = re.compile(r"^(?:test_)?(\w+?)(?:_test)?$")
 NO_UNIT_MATCH = "imports no scoped unit and matches no unit module name"
+NAMED_FOR_SCOPED_UNIT = "named for scoped unit module '{tail}' but imports no scoped unit"
 
 
 # ---------------------------------------------------------------- pytest ---
@@ -78,6 +94,39 @@ def parse_collect_file(path: Path) -> list[str]:
         if NODEID_RE.match(line):
             out.append(line)
     return out
+
+
+def stem_tail_of(test_file: str) -> str | None:
+    """Module-name tail a test FILENAME claims by convention:
+    ``tests/test_parse.py`` / ``tests/parse_test.py`` -> ``parse``."""
+    m = TEST_STEM_RE.match(Path(test_file).stem)
+    return m.group(1) if m else None
+
+
+def module_resides_in(mod: str, bases: list[Path]) -> bool:
+    """True when an imported dotted name resolves to project source under one
+    of the bases (unit directories, the project root, and their src//lib/
+    layout variants) — i.e. it is project code, scoped or not. Imports of
+    stdlib/third-party modules (``os``, ``zlib``, ...) do not resolve."""
+    rel = Path(*mod.split("."))
+    for base in bases:
+        if (base / rel).with_suffix(".py").is_file() or (base / rel / "__init__.py").is_file():
+            return True
+    return False
+
+
+def dep_closure_of(uid: str, deps_of: dict[str, list[str]]) -> set[str]:
+    """Transitive dependency closure over the state file's ``deps[]`` unit-id
+    graph, cycle-safe: back-edges and unknown ids are not expanded."""
+    seen: set[str] = set()
+    work = list(deps_of.get(uid, ()))
+    while work:
+        d = work.pop()
+        if d in seen or d not in deps_of:
+            continue
+        seen.add(d)
+        work.extend(deps_of[d])
+    return seen
 
 
 # ------------------------------------------------------------------ AST ----
@@ -194,7 +243,17 @@ def cmd_extract(args) -> int:
                           for u in units}
 
     covering: dict[str, list[str]] = {uid: [] for uid in unit_files}
-    dangling: list[dict] = []
+    dangling: list[dict] = []      # within scope — the real signal (exit 2)
+    out_of_scope: list[dict] = []  # informational; never drives the exit code
+    unit_tails = {module_of_unit[uid].split(".")[-1] for uid in unit_files}
+    # bases an imported module may resolve under and still count as project
+    # code: the unit files' own directories, the roots, + src//lib/ variants
+    project_bases: list[Path] = []
+    for base in [root, project_root, *(unit_files[uid].parent for uid in unit_files)]:
+        for b in (base, base / "src", base / "lib"):
+            if b not in project_bases:
+                project_bases.append(b)
+
     for nodeid in nodeids:
         tf = nodeid.split("::", 1)[0]
         tree = test_trees.get(tf)
@@ -202,20 +261,46 @@ def cmd_extract(args) -> int:
             dangling.append({"nodeid": nodeid, "reason": "test file not found in project"})
             continue
         tmods = imports_of(tree)
+        tail = stem_tail_of(tf)
         matched = [uid for uid, cands in candidates_of_unit.items()
                    if imports_any_of(tmods, cands)]
-        if not matched and not tmods:
+        if not matched and not tmods and tail:
             # filename convention fallback: tests/test_parse.py -> *.parse
-            stem = Path(tf).stem
-            m = re.match(r"^(?:test_)?(\w+?)(?:_test)?$", stem)
-            if m:
-                tail = m.group(1)
-                matched = [uid for uid, umod in module_of_unit.items()
-                           if umod.split(".")[-1] == tail]
-        if not matched:
-            dangling.append({"nodeid": nodeid, "reason": NO_UNIT_MATCH})
-        for uid in matched:
-            covering[uid].append(nodeid)
+            matched = [uid for uid, umod in module_of_unit.items()
+                       if umod.split(".")[-1] == tail]
+        if matched:
+            for uid in matched:
+                covering[uid].append(nodeid)
+            continue
+        # no scoped unit matched — split by scope (issue #57)
+        if tail and tail in unit_tails:
+            # the test file NAMES a scoped unit module yet imports none of
+            # them: a mapping failure worth a human look, not scope noise
+            dangling.append({"nodeid": nodeid,
+                             "reason": NAMED_FOR_SCOPED_UNIT.format(tail=tail)})
+            continue
+        resident = sorted(m for m in tmods if module_resides_in(m, project_bases))
+        if resident:
+            out_of_scope.append({"nodeid": nodeid,
+                                 "reason": "tests unscoped project module(s): "
+                                           + ", ".join(resident)})
+        else:
+            out_of_scope.append({"nodeid": nodeid, "reason": NO_UNIT_MATCH})
+
+    # transitive coverage over the state deps[] graph (issue #57): a test
+    # covering unit A exercises A's whole dependency closure, so consumer
+    # suites cover a shared helper that has no directly-importing test file
+    deps_of = {u["id"]: [d for d in (u.get("deps") or []) if isinstance(d, str)]
+               for u in units}
+    transitive_tests: dict[str, set[str]] = {uid: set() for uid in unit_files}
+    covered_via: dict[str, set[str]] = {uid: set() for uid in unit_files}
+    for uid, tests in covering.items():
+        if not tests:
+            continue
+        for dep in dep_closure_of(uid, deps_of):
+            if dep != uid and dep in transitive_tests:
+                transitive_tests[dep].update(tests)
+                covered_via[dep].add(uid)
 
     # mypy rows (optional): {"path": ..., "line": ..., "symbol": ..., "signature": ...}
     mypy_rows = read_json(args.mypy) if args.mypy else []
@@ -242,6 +327,8 @@ def cmd_extract(args) -> int:
             "python_path": u["python_path"],
             "module": module_of_unit[uid],
             "covering_tests": sorted(set(covering[uid])),
+            "transitive_covering_tests": sorted(transitive_tests[uid]),
+            "covered_via": sorted(covered_via[uid]),
             "type_signatures": sigs,
             "invariants": sorted(set(invariants)),
             "golden_corpus": (u.get("contract") or {}).get("golden_corpus"),
@@ -256,36 +343,45 @@ def cmd_extract(args) -> int:
         if out_dir:
             write_json_atomic(out_dir / f"{uid}.contract.json", contract)
 
-    uncovered = [uid for uid in unit_files if not covering[uid]]
+    uncovered = [uid for uid in unit_files
+                 if not covering[uid] and not transitive_tests[uid]]
+    covered_transitively = [uid for uid in unit_files
+                            if not covering[uid] and transitive_tests[uid]]
     coverage_pct = round(100.0 * (len(unit_files) - len(uncovered)) / len(unit_files), 1)
 
     findings = []
     for uid in uncovered:
-        findings.append(f"unit {uid} ({module_of_unit[uid]}) has NO covering tests")
+        findings.append(f"unit {uid} ({module_of_unit[uid]}) has NO covering tests "
+                        f"(direct or via consumers)")
     for d in dangling:
         findings.append(f"dangling test {d['nodeid']}: {d['reason']}")
-    # dangling tests always fail (acceptance: "dangling tests flagged");
-    # uncovered units fail unless explicitly tolerated (still reported)
+    # within-scope dangling always fails (acceptance: "dangling tests
+    # flagged"); uncovered units fail unless explicitly tolerated (still
+    # reported); tests of modules outside the approved tranche are
+    # informational only and never drive the exit code (issue #57)
     hard = dangling + ([] if args.allow_uncovered else uncovered)
     code = EXIT_FINDINGS if hard else EXIT_OK
-    # every unit uncovered while dangling tests match no unit module name is
+    # every unit uncovered while a within-scope test still went unmatched is
     # far more likely a layout/import-root mismatch than a useless suite —
     # hint at it instead of printing a bare wall of nodeids (issue #26)
     all_uncovered = bool(unit_files) and len(uncovered) == len(unit_files)
-    layout_mismatch_suspected = all_uncovered and any(
-        d["reason"] == NO_UNIT_MATCH for d in dangling)
+    layout_mismatch_suspected = all_uncovered and bool(dangling)
     mismatch_hint = (" — likely layout mismatch: no test import matched any "
                      "unit module name; check the units' python_path import "
                      "root" if layout_mismatch_suspected else "")
     human = (f"contracts: {len(contracts)} unit(s), coverage {coverage_pct}% "
-             f"({len(uncovered)} uncovered), {len(dangling)} dangling test(s)"
+             f"({len(uncovered)} uncovered, {len(covered_transitively)} via consumers), "
+             f"dangling-within-scope: {len(dangling)}, "
+             f"out-of-scope tests skipped: {len(out_of_scope)} (informational)"
              + ("; FAIL" if code == EXIT_FINDINGS else "") + mismatch_hint)
     payload = {
         "tool": TOOL, "version": VERSION,
         "contracts": contracts,
         "coverage_pct": coverage_pct,
+        "covered_transitively": covered_transitively,
         "uncovered_units": uncovered,
         "dangling_tests": dangling,
+        "out_of_scope_tests": out_of_scope,
         "layout_mismatch_suspected": layout_mismatch_suspected,
         "findings": findings,
         "written_to": str(out_dir) if out_dir else None,
