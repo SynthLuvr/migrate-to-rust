@@ -82,6 +82,75 @@ def test_policy_validation_rejects_an_uncovered_gate(tmp_path):
         raise AssertionError("uncovered gate must be rejected")
 
 
+def test_policy_candidates_block_is_required_and_validated(tmp_path):
+    """Issue #59: the K schedule lives in policy.json like every other loop
+    parameter — a policy without it (or with garbage params) must not load,
+    or K silently falls back to orchestrator judgment again."""
+    policy = pipeline_tool.load_policy()
+    assert policy["candidates"]["id"] == "CAND-1"
+    assert policy["candidates"]["k_small_unit"] > \
+        policy["candidates"]["k_large_unit"] >= 1
+
+    def expect_error(mutate, needle):
+        p = json.loads(json.dumps(policy))
+        mutate(p)
+        f = tmp_path / "policy.json"
+        f.write_text(json.dumps(p))
+        try:
+            pipeline_tool.load_policy(f)
+        except state_tool.ToolError as e:
+            assert needle in str(e)
+        else:
+            raise AssertionError(f"{needle} must be rejected")
+
+    expect_error(lambda p: p.pop("candidates"), "candidates: object required")
+    expect_error(lambda p: p["candidates"].pop("id"), "candidates.id")
+    expect_error(lambda p: p["candidates"].update(id="cand"), "candidates.id")
+    expect_error(lambda p: p["candidates"].update(k_small_unit=0),
+                 "k_small_unit")
+    expect_error(lambda p: p["candidates"].update(k_large_unit="one"),
+                 "k_large_unit")
+    expect_error(lambda p: p["candidates"].update(size_threshold_loc=0),
+                 "size_threshold_loc")
+    expect_error(lambda p: p["candidates"].update(budget_floor_fraction=1.5),
+                 "budget_floor_fraction")
+    expect_error(lambda p: p["candidates"].update(budget_floor_fraction=0),
+                 "budget_floor_fraction")
+
+
+def test_resolve_k_is_pure_policy_size_and_budget_driven():
+    """The schedule, as code: small unit -> K=3; large unit -> K=1 with
+    repair rounds as the candidate pool; the run-budget floor outranks
+    size; unknown size is the journaled small-unit default, not a guess."""
+    policy = pipeline_tool.load_policy()
+    unit = {"id": "u-x", "python_path": "src/x.py"}
+    fresh = {"units": [dict(unit, budget={"tokens_spent": 0})]}
+
+    small = pipeline_tool.resolve_k(fresh, unit, policy, unit_loc=10)
+    assert small["k"] == 3 and small["rounds_as_candidates"] is False
+    assert any("<= size_threshold_loc" in b for b in small["basis"])
+
+    large = pipeline_tool.resolve_k(fresh, unit, policy, unit_loc=10_000)
+    assert large["k"] == 1 and large["rounds_as_candidates"] is True
+    assert any("> size_threshold_loc" in b for b in large["basis"])
+
+    unknown = pipeline_tool.resolve_k(fresh, unit, policy, unit_loc=None)
+    assert unknown["k"] == 3 and unknown["inputs"]["unit_loc"] is None
+    assert any("unknown" in b for b in unknown["basis"])
+
+    spent = {"units": [dict(unit, budget={"tokens_spent": 900})],
+             "autonomy": {"budget": {"max_tokens": 1000}}}
+    floored = pipeline_tool.resolve_k(spent, unit, policy, unit_loc=10)
+    assert floored["k"] == 1            # a 10-LOC unit still drops under the floor
+    assert floored["inputs"]["remaining_fraction"] == 0.1
+    assert floored["inputs"]["budget_floor_fraction"] == 0.25
+    assert any("< floor" in b for b in floored["basis"])
+
+    for d in (small, large, unknown, floored):
+        assert d["citation"] == "policy:CAND-1"
+        assert d["policy_version"]          # journaled with every decision
+
+
 # --------------------------------------------------- pure rule evaluation --
 
 def _decide(state, gate, policy=None):

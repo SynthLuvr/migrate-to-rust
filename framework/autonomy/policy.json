@@ -1,6 +1,6 @@
 {
   "$comment": "The autonomy policy layer (issue #22, proposal C): each former human gate becomes a machine-decidable rule with a conservative default, journaled and non-blocking. Evaluated only in code (tools/pipeline.py resolve-gates / tools/state.py resolve-gate) — never by LLM self-approval. Every decision records decided_by='policy:<rule-id>' + policy_version + evidence[] in migration-state.json. Levels: L0 = supervised (gates are hard stops — the agent never asks; it leaves the gate open and ends the run with the dossier for the operator to decide between runs); L1 = agent proposes into the dossier, operator decides between runs; L2 = all gates policy-resolved, publish disabled (the default — never asks); L3 = full autopilot incl. cutover. Operators pre-authorize the level BEFORE the run: there are zero mid-run questions at any level. The dual-build design is what makes autonomy safe — per-unit Python fallback, one-env-var shim, rollback pin; every autonomous decision stays reversible per unit.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "default_level": "L2",
   "levels": {
     "L0": {
@@ -34,6 +34,14 @@
     "max_wall_clock_minutes": 720,
     "max_agent_retries_per_stage": 2,
     "max_chain_depth": 10
+  },
+  "candidates": {
+    "$comment": "Issue #59 — K (MIGRATION_PROMPT.md hard rule 4) is policy, not judgment. The fixed 'K=3 for every unit' made the loop shape an improvisation under real budgets (a run used K=1 + oracle-ranked repair rounds and journaled a prose 'budget-driven deviation' note — a tradeoff every future run would re-make by hand). The schedule: K=k_small_unit below size_threshold_loc (cheap to parallelize, big variance payoff); K=k_large_unit + the unit's bounded MAX_ROUNDS repair rounds above it, or whenever run-level token budget remaining < budget_floor_fraction of the ceiling. Repair rounds count as candidates for the oracle ranking, so rule 4's 'the oracle ranks, not the model' holds by construction at any K. delegate.py run-candidates resolves and ENFORCES this schedule as its default (an explicit --k is an operator override journaled in the verdict pack as a deviation from this decision — never an orchestrator's judgment call); the decision is cited by id, policy:CAND-1, wherever a note used to carry prose.",
+    "id": "CAND-1",
+    "k_small_unit": 3,
+    "k_large_unit": 1,
+    "size_threshold_loc": 150,
+    "budget_floor_fraction": 0.25
   },
   "rules": [
     {

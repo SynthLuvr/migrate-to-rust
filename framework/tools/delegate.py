@@ -24,10 +24,19 @@ custom gates that cannot tolerate a copy.
 
     python framework/tools/delegate.py run-candidates \
         --state runs/<project>/migration-state.json --unit u-foo \
-        --k 3 --agent-cmd 'goose session run {brief_file} {feedback_file}'
+        --agent-cmd 'goose session run {brief_file} {feedback_file}'
+
+(K comes from autonomy/policy.json 'candidates' — issue #59; --k overrides
+and is journaled as a deviation)
 
 Per unit it:
 
+  0. resolves K from the policy schedule (issue #59): K=3 below the size
+     threshold, K=1 + bounded repair rounds (MAX_ROUNDS) above it or when
+     run-level token budget remaining < the floor fraction — enforced here
+     by default, journaled in the verdict pack as ``policy:CAND-1`` with
+     its inputs, never left to the orchestrator's restraint (``--k`` is an
+     operator override, recorded as a deviation from the policy decision);
   1. derives per-candidate target paths (``src/u_<unit>_c1.rs`` … ``_cK``,
      under the unit's ``rust_path`` directory when recorded) and writes each
      delegate an assignment brief: its own file + the contract + the Python
@@ -90,6 +99,7 @@ from _common import (  # noqa: E402
     EXIT_FINDINGS, EXIT_INCOMPARABLE, EXIT_OK, EXIT_SETUP, ToolError,
     emit, read_json, run_child, run_cli, write_json_atomic,
 )
+import pipeline as pipeline_tool  # noqa: E402  — K is policy, not judgment (issue #59)
 
 TOOL = "delegate.py"
 VERSION = 2
@@ -98,7 +108,6 @@ ROLE_FILE = FRAMEWORK / "roles" / "translator.md"
 SUBSTITUTIONS = FRAMEWORK / "knowledge" / "substitutions.json"
 ORACLE = Path(__file__).resolve().parent / "oracle.py"
 
-K_DEFAULT = 3                       # the loop spec's K (MIGRATION_PROMPT.md rule 4)
 MAX_ROUNDS_DEFAULT = 5              # units[].budget.max_rounds default (schema)
 DEFAULT_GATES = ["cargo fmt --check",
                  "cargo clippy --all-targets -- -D warnings",
@@ -196,6 +205,54 @@ def _resolve_max_rounds(flag_value: int | None, budget: dict) -> int:
     if flag_value is not None:
         return flag_value
     return int(budget.get("max_rounds", MAX_ROUNDS_DEFAULT) or MAX_ROUNDS_DEFAULT)
+
+
+def _unit_loc(unit: dict, target_root: Path) -> int | None:
+    """The unit's size in non-blank Python LOC — the input the K schedule's
+    size threshold reads (issue #59). None when unmeasurable; the policy
+    then applies its small-unit default and says so, never a guess."""
+    rel = unit.get("python_path")
+    if not rel:
+        return None
+    try:
+        text = (target_root / rel).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return sum(1 for line in text.splitlines() if line.strip())
+
+
+def _resolve_k(args, state: dict, unit: dict, target_root: Path,
+               only: list[str] | None) -> tuple[int, dict]:
+    """K is policy, not judgment (issue #59). Default: the schedule in
+    autonomy/policy.json 'candidates' (id CAND-1) — K=3 below the size
+    threshold, K=1 + bounded repair rounds above it / under the run-budget
+    floor — resolved here so the schedule is enforced by the runner, not
+    trusted to each orchestrator's restraint. An explicit --k is an
+    operator override journaled in the pack as a deviation from the policy
+    decision. --only restarts (issue #25) may widen a policy K back to the
+    prior run's candidate count; that widening is recorded, not silent."""
+    policy = pipeline_tool.load_policy()
+    decision = pipeline_tool.resolve_k(state, unit, policy,
+                                       unit_loc=_unit_loc(unit, target_root))
+    k, source = decision["k"], "policy"
+    if args.k is not None:
+        source = "flag override"
+        if args.k != k:
+            decision["deviation"] = (
+                f"--k {args.k} overrides {decision['citation']} "
+                f"(policy said K={k}: {'; '.join(decision['basis'])}) — "
+                f"operator override, journaled here")
+        k = args.k
+    elif only:
+        need = max(int(c[1:]) for c in only if c.startswith("c") and c[1:].isdigit())
+        if need > k:
+            decision["restart_widening"] = (
+                f"--only restart covers c1..c{need} from the prior run's "
+                f"schedule; policy K={k} widened to {need} — recorded, "
+                f"not silent")
+            k = need
+    decision |= {"k_used": k, "source": source}
+    return k, decision
 
 
 def _sanitize_stem(uid: str) -> str:
@@ -789,9 +846,21 @@ def _rank(cands: list[dict]) -> list[dict]:
     return ranked
 
 
-def _table(unit_id: str, ranked: list[dict], winner: dict | None) -> str:
+def _table(unit_id: str, ranked: list[dict], winner: dict | None,
+           k_policy: dict | None = None) -> str:
     lines = [f"{unit_id}: {len(ranked)} candidate(s) — compile gates, then "
              f"oracle ranking (the oracle ranks, not the model)"]
+    if k_policy is not None:
+        head = f"K={k_policy['k_used']} per {k_policy['citation']}: " + \
+            "; ".join(k_policy["basis"])
+        if k_policy.get("rounds_as_candidates"):
+            head += ("; repair rounds count as candidates — the oracle ranks "
+                     "the round outputs, not the model")
+        if k_policy.get("deviation"):
+            head += f" | DEVIATION: {k_policy['deviation']}"
+        if k_policy.get("restart_widening"):
+            head += f" | restart: {k_policy['restart_widening']}"
+        lines.insert(0, head)
     for c in ranked:
         j = c.get("judge") or {}
         if not c["gate_green"]:
@@ -820,7 +889,7 @@ def _table(unit_id: str, ranked: list[dict], winner: dict | None) -> str:
 
 
 def _state_commands(unit_id: str, winner: dict | None,
-                    state_path: Path) -> list[str]:
+                    state_path: Path, k_policy: dict | None = None) -> list[str]:
     """The exact commands the orchestrator runs to record the pack (this
     tool stays read-only on the state file — role separation)."""
 
@@ -833,13 +902,28 @@ def _state_commands(unit_id: str, winner: dict | None,
                 f"--unit {unit_id} --status {status} "
                 f"--note {shlex.quote(note)}")
 
+    k_note = ""
+    if k_policy is not None:
+        # issue #59: the K decision rides the journal as a policy id, never
+        # as prose ("budget-driven deviation") the next run re-improvises
+        k_note = (f" [K={k_policy['k_used']} per {k_policy['citation']}: "
+                  f"{'; '.join(k_policy['basis'])}]")
+        if k_policy.get("deviation"):
+            k_note += f" [{k_policy['deviation']}]"
+
     if winner is None:
-        return [mark_cmd("escalated",
-                         "delegate.py: no gate-green candidate after bounded "
-                         "rounds")]
+        cmds = []
+        if k_policy is not None:
+            cmds.append(set_cmd(f"units[{unit_id}].k={k_policy['k_used']}"))
+        cmds.append(mark_cmd("escalated",
+                             "delegate.py: no gate-green candidate after "
+                             f"bounded rounds{k_note}"))
+        return cmds
     j = winner.get("judge") or {}
     counts = j.get("counts") or {}
     cmds = []
+    if k_policy is not None:
+        cmds.append(set_cmd(f"units[{unit_id}].k={k_policy['k_used']}"))
     if counts:
         parity = {"runs": j.get("total", 0),
                   "equivalent": counts.get("equivalent", 0),
@@ -853,7 +937,7 @@ def _state_commands(unit_id: str, winner: dict | None,
     note = (f"delegate.py: winner {winner['candidate']} "
             f"({j.get('verdict', 'unjudged')}, "
             f"{counts.get('equivalent', 0)}/{j.get('total', 0)} equivalent, "
-            f"{winner['rounds_used']} repair round(s))")
+            f"{winner['rounds_used']} repair round(s)){k_note}")
     if j.get("verdict") == "equivalent":
         cmds.append(mark_cmd("ported", note))
     else:
@@ -894,13 +978,15 @@ def _resolve_manifest(args, state_path: Path) -> Path | None:
 def _emit_dry_run(args, plan: list[dict], gates: list[str],
                   contract: Path | None, contract_note: str,
                   target_root: Path, import_allow: set[str],
-                  cargo_note: str | None) -> int:
-    human = (f"dry-run: {args.unit} k={args.k} max_rounds={args.max_rounds} "
+                  cargo_note: str | None, k_policy: dict | None = None) -> int:
+    human = (f"dry-run: {args.unit} k={args.k} ({k_policy['citation'] if k_policy else '?'}) "
+             f"max_rounds={args.max_rounds} "
              f"gates={len(gates) + 1} target={target_root} — no agent, "
              f"no writes")
     emit({
         "tool": TOOL, "version": VERSION, "unit": args.unit,
-        "dry_run": True, "k": args.k, "max_rounds": args.max_rounds,
+        "dry_run": True, "k": args.k, "k_policy": k_policy,
+        "max_rounds": args.max_rounds,
         "gates": ["<mechanical import gate>", *gates],
         "build_cmd": None if args.no_build else args.build_cmd,
         "candidate_module": args.candidate_module,
@@ -1024,7 +1110,9 @@ def cmd_run_candidates(args) -> int:
     target_root = _resolve_target_root(args.target_root, state)
     args.max_rounds = _resolve_max_rounds(args.max_rounds, budget)
     only = [c.strip() for c in args.only.split(",")] if args.only else None
+    args.k, k_policy = _resolve_k(args, state, unit, target_root, only)
     plan = _candidate_plan(state_path, unit, target_root, args.k, only)
+
     contract, contract_note = _contract_path(args, state_path)
     gates = args.gate or DEFAULT_GATES
     _validate_usage(args)
@@ -1034,7 +1122,8 @@ def cmd_run_candidates(args) -> int:
 
     if args.dry_run:
         return _emit_dry_run(args, plan, gates, contract, contract_note,
-                             target_root, import_allow, cargo_note)
+                             target_root, import_allow, cargo_note,
+                             k_policy=k_policy)
 
     delegates_dir = state_path.parent / "delegates" / args.unit
     isolation = _build_isolation(args, delegates_dir, plan)
@@ -1067,15 +1156,16 @@ def cmd_run_candidates(args) -> int:
 
     ranked = _rank(results)
     winner = ranked[0] if ranked and ranked[0]["gate_green"] else None
-    table = _table(args.unit, ranked, winner)
-    state_cmds = _state_commands(args.unit, winner, state_path)
+    table = _table(args.unit, ranked, winner, k_policy=k_policy)
+    state_cmds = _state_commands(args.unit, winner, state_path,
+                                 k_policy=k_policy)
     sessions = _session_entries(args.unit, results)
     code = _exit_code(winner, build, judged_any)
 
     pack = {
         "tool": TOOL, "version": VERSION, "unit": args.unit,
         "unit_status_before": unit.get("status"),
-        "k": args.k, "max_rounds": args.max_rounds,
+        "k": args.k, "k_policy": k_policy, "max_rounds": args.max_rounds,
         "gates": ["<mechanical import gate>", *gates],
         "build": build, "target_root": str(target_root),
         "build_isolation": _isolation_summary(isolation),
@@ -1115,8 +1205,14 @@ def main(argv=None) -> int:
                    help="migration-state.json (READ-ONLY here: the "
                         "orchestrator records the verdict pack via state.py)")
     p.add_argument("--unit", required=True)
-    p.add_argument("--k", type=int, default=K_DEFAULT,
-                   help="candidate count (default 3, the loop spec's K)")
+    p.add_argument("--k", type=int, default=None,
+                   help="candidate count; DEFAULT: the K schedule in "
+                        "autonomy/policy.json 'candidates' (issue #59, "
+                        "policy:CAND-1) — K=3 below the size threshold, K=1 + "
+                        "bounded repair rounds above it or when run-budget "
+                        "remaining < the floor fraction. An explicit --k is "
+                        "an operator override journaled in the verdict pack "
+                        "as a deviation from the policy decision")
     p.add_argument("--agent-cmd",
                    help="CLI agent template invoked per candidate per round; "
                         "placeholders {unit} {k} {candidate} {rust_file} "

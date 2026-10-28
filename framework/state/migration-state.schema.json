@@ -82,6 +82,7 @@
             }
           },
           "attempts": { "type": "integer", "minimum": 0 },
+          "k": { "type": "integer", "minimum": 1, "$comment": "issue #59 — the K actually used for this unit, resolved by delegate.py from autonomy/policy.json 'candidates' (cited policy:CAND-1 in the verdict pack / journal note; repair rounds count as candidates when K=1) and recorded here by the orchestrator" },
           "budget": {
             "type": "object",
             "properties": {

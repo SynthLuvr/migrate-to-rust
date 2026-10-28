@@ -6,7 +6,13 @@ the agent spends most of its budget. Loop spec: `MIGRATION_PROMPT.md`.
 ## Steps
 1. Pop the next unit in leaf-first order; load its contract + Python source.
 2. Delegate translation to **translator** subagents (`roles/translator.md`),
-   K = 3 candidates. Strict file partitioning: a delegate touches only its
+   K candidates — K resolved from **policy**, not judgment
+   (`autonomy/policy.json` `candidates` block, `policy:CAND-1`, issue #59):
+   K=3 below the unit size threshold (cheap to parallelize, big variance
+   payoff), K=1 + bounded repair rounds (MAX_ROUNDS) above it or when
+   run-level budget remaining < the floor fraction; repair rounds count as
+   candidates for the oracle ranking, so rule 4 holds by construction at
+   any K. Strict file partitioning: a delegate touches only its
    assigned files and never the state file. Units on **separate crates**
    may proceed in parallel; shared parents wait for all children. Units on
    **one shared crate** do not — see *Build contention* below (issue #55).
@@ -15,6 +21,7 @@ the agent spends most of its budget. Loop spec: `MIGRATION_PROMPT.md`.
    files, briefs, the bounded verbatim-feedback repair rounds,
    gate-then-oracle ranking, and the verdict pack for `state.py` — with
    one command: `tools/delegate.py run-candidates` (issue #33), which
+   resolves K from the policy schedule by default (pass no `--k`) and
    serializes the unit's K candidates and isolates every gate/build in a
    per-candidate sandbox; the state file stays orchestrator-only either
    way.
