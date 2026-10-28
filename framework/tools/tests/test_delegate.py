@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import shlex
 import sys
+from pathlib import Path
 
 from conftest import TOOLS, run_tool
 
@@ -444,3 +445,213 @@ def test_state_sessions_follow_the_naming_convention(monkeypatch, capsys,
          "name": f"unit-u-foo-translator-c{i}",
          "role": "translator",
          "outcome": "gate_green=True rounds=0"} for i in (1, 2, 3)]
+
+
+# -------------------------------------------------- build isolation (#55) --
+
+ISO_GATE_SCRIPT = """\
+import os
+import sys
+from pathlib import Path
+
+rust = Path(sys.argv[1]).resolve()
+root = Path(sys.argv[2]).resolve()
+assert Path.cwd().resolve() == root, "gate cwd != the crate root handed in"
+lib_lines = [l.strip() for l in
+             (rust.parent / "lib.rs").read_text().splitlines()]
+if os.environ.get("FAIL_FOR") and rust.name.startswith(
+        "u_foo_" + os.environ["FAIL_FOR"]):
+    print("error[E0555]: injected failure for " + rust.name)
+    print("  --> {}:1:1".format(rust.name))
+    sys.exit(1)
+if os.environ.get("ISO_EXPECT") == "1":
+    assert os.environ.get("CARGO_TARGET_DIR"), \\
+        "isolated gate lost its CARGO_TARGET_DIR"
+    siblings = sorted(p.name for p in rust.parent.glob("u_foo_c*.rs")
+                      if p != rust)
+    assert not siblings, "sibling candidates leaked into the sandbox: %r" % siblings
+    own = "mod {};".format(rust.stem)
+    assert own in lib_lines, "kept candidate's wiring was stripped"
+    leftover = [l for l in lib_lines
+                if "mod u_foo_c" in l and l != own]
+    assert not leftover, "sibling mod lines leaked: %r" % leftover
+else:
+    assert not os.environ.get("CARGO_TARGET_DIR"), \\
+        "shared mode must not set CARGO_TARGET_DIR"
+    siblings = sorted(p.name for p in rust.parent.glob("u_foo_c*.rs")
+                      if p != rust)
+    assert siblings == ["u_foo_c2.rs", "u_foo_c3.rs"], \
+        "shared mode must see the real crate as-is: %r" % siblings
+    assert "mod u_foo_c2" in " ".join(lib_lines)
+    assert "mod u_foo_c3" in " ".join(lib_lines)
+print("iso-gate ok")
+"""
+
+ISO_BUILD_SCRIPT = """\
+import json
+import os
+import sys
+from pathlib import Path
+
+src = Path.cwd() / "src"
+Path(sys.argv[1]).write_text(json.dumps({
+    "cwd": str(Path.cwd().resolve()),
+    "cargo_target_dir": os.environ.get("CARGO_TARGET_DIR"),
+    "candidates": sorted(p.name for p in src.glob("u_foo_c*.rs")),
+    "lib_rs": (src / "lib.rs").read_text(),
+}))
+"""
+
+
+def _contended_world(tmp_path):
+    """A crate whose wiring already declares all K candidates, with two
+    STALLED siblings left behind by an earlier run (half-written files) —
+    the issue #55 contention state isolation must hide from the gates."""
+    proj, state, runs = _world(tmp_path)
+    (proj / "src" / "lib.rs").write_text(
+        "mod u_foo_c1;\nmod u_foo_c2;\nmod u_foo_c3;\n")
+    (proj / "src" / "u_foo_c2.rs").write_text("pub fn broken( {  // stalled\n")
+    (proj / "src" / "u_foo_c3.rs").write_text("stalled sibling, not even rust\n")
+    (proj / "target" / "debug").mkdir(parents=True)
+    (proj / "target" / "debug" / "leak.bin").write_bytes(b"x")
+    return proj, state, runs
+
+
+def test_gates_run_in_a_per_candidate_sandbox(monkeypatch, capsys, tmp_path):
+    """The default: each candidate's gates run in a sandbox copy of the
+    crate carrying ONLY that candidate's module (file + mod line), under
+    the unit's own CARGO_TARGET_DIR — a stalled sibling's half-written
+    file cannot fail this candidate's verify loop, and the REAL crate is
+    never mutated (it stays the delegates' authoritative tree)."""
+    proj, state, runs = _contended_world(tmp_path)
+    agent = tmp_path / "agent.py"
+    agent.write_text(AGENT_SCRIPT)
+    gate = tmp_path / "iso_gate.py"
+    gate.write_text(ISO_GATE_SCRIPT)
+    agent_cmd = f"{sys.executable} {agent} always {{candidate}} " \
+                f"{{rust_file}} {{feedback_file}} {{round}}"
+    gate_cmd = f"{sys.executable} {gate} {{rust_file}} {{target_root}}"
+    monkeypatch.setenv("ISO_EXPECT", "1")
+
+    code, out = _run(monkeypatch, capsys, state, proj, agent_cmd, gate_cmd,
+                     None, "--only", "c1", mode="always")
+    assert code == 2 and out["winner"] == "c1"   # green but unjudged
+    c1 = out["candidates"][0]
+    assert c1["gate_green"] and c1["rounds_used"] == 0
+    assert out["build_isolation"]["mode"] == "sandbox"
+
+    # the sandbox: outside the crate, siblings + their mod lines stripped,
+    # the kept candidate's wiring intact, heavy dirs (target/) not copied
+    sandbox = Path(c1["sandbox"]["root"])
+    assert proj not in sandbox.parents and sandbox.exists()
+    assert c1["sandbox"]["kept"] == ["c1"]
+    assert c1["sandbox"]["stripped"] == ["c2", "c3"]
+    assert sorted(p.name for p in (sandbox / "src").glob("u_foo_c*.rs")) \
+        == ["u_foo_c1.rs"]
+    assert not (sandbox / "target").exists()
+    lib = (sandbox / "src" / "lib.rs").read_text()
+    assert "mod u_foo_c1;" in lib
+    assert "mod u_foo_c2" not in lib and "mod u_foo_c3" not in lib
+    cargo_target = Path(out["build_isolation"]["cargo_target_dir"])
+    assert cargo_target.is_dir() and proj not in cargo_target.parents
+
+    # the REAL crate is untouched: stalled siblings and their wiring remain
+    assert "mod u_foo_c2;" in (proj / "src" / "lib.rs").read_text()
+    assert (proj / "src" / "u_foo_c2.rs").exists()
+    assert (proj / "target" / "debug" / "leak.bin").exists()
+    # the sandbox belongs to the round record (evidence in the pack)
+    assert c1["rounds"][0]["sandbox"]["root"] == c1["sandbox"]["root"]
+
+
+def test_wheel_build_sandbox_carries_only_green_candidates(
+        monkeypatch, capsys, tmp_path):
+    """The wheel build gets its own sandbox: only this run's gate-green
+    candidates ride it — a stalled candidate's half-written module cannot
+    fail the winners' wheel build."""
+    proj, state, runs = _contended_world(tmp_path)
+    agent = tmp_path / "agent.py"
+    agent.write_text(AGENT_SCRIPT)
+    gate = tmp_path / "iso_gate.py"
+    gate.write_text(ISO_GATE_SCRIPT)
+    build_rec = tmp_path / "build-rec.json"
+    build = tmp_path / "iso_build.py"
+    build.write_text(ISO_BUILD_SCRIPT)
+    agent_cmd = f"{sys.executable} {agent} always {{candidate}} " \
+                f"{{rust_file}} {{feedback_file}} {{round}}"
+    gate_cmd = f"{sys.executable} {gate} {{rust_file}} {{target_root}}"
+    build_cmd = f"{sys.executable} {build} {build_rec}"
+    monkeypatch.setenv("ISO_EXPECT", "1")
+    monkeypatch.setenv("FAIL_FOR", "c2")        # c2 stalls red, c1/c3 green
+
+    code, out = _run(monkeypatch, capsys, state, proj, agent_cmd, gate_cmd,
+                     None, "--build-cmd", build_cmd, "--build-timeout", "30",
+                     mode="always", no_build=False)
+    assert code == 2 and out["winner"] == "c1"
+    assert not out["build"]["failed"]
+    sandbox = out["build"]["sandbox"]
+    assert sandbox["kept"] == ["c1", "c3"] and sandbox["stripped"] == ["c2"]
+    rec = json.loads(build_rec.read_text())
+    assert rec["cwd"] == sandbox["root"]        # build ran IN the sandbox
+    assert rec["candidates"] == ["u_foo_c1.rs", "u_foo_c3.rs"]
+    assert "mod u_foo_c2" not in rec["lib_rs"]
+    assert "mod u_foo_c1;" in rec["lib_rs"] and "mod u_foo_c3;" in rec["lib_rs"]
+    assert rec["cargo_target_dir"] == out["build"]["cargo_target_dir"]
+    # and the real crate keeps every candidate exactly as the delegates
+    # left them — isolation is read-only over the authoritative tree
+    assert "mod u_foo_c2;" in (proj / "src" / "lib.rs").read_text()
+    assert (proj / "src" / "u_foo_c2.rs").exists()
+
+
+def test_no_isolate_builds_shares_the_real_crate(monkeypatch, capsys,
+                                                 tmp_path):
+    """--no-isolate-builds restores the pre-#55 behavior: gates run in the
+    REAL crate with the ambient target dir — siblings and all."""
+    proj, state, runs = _contended_world(tmp_path)
+    agent = tmp_path / "agent.py"
+    agent.write_text(AGENT_SCRIPT)
+    gate = tmp_path / "iso_gate.py"
+    gate.write_text(ISO_GATE_SCRIPT)
+    agent_cmd = f"{sys.executable} {agent} always {{candidate}} " \
+                f"{{rust_file}} {{feedback_file}} {{round}}"
+    gate_cmd = f"{sys.executable} {gate} {{rust_file}} {{target_root}}"
+    monkeypatch.delenv("ISO_EXPECT", raising=False)
+
+    code, out = _run(monkeypatch, capsys, state, proj, agent_cmd, gate_cmd,
+                     None, "--only", "c1", "--no-isolate-builds",
+                     mode="always")
+    assert code == 2 and out["winner"] == "c1"
+    assert out["build_isolation"] == {"mode": "shared"}
+    assert "sandbox" not in out["candidates"][0]   # nothing was copied
+    assert not (tmp_path / "delegates" / "u-foo" / "sandboxes").exists()
+
+
+def test_briefs_and_feedback_carry_the_not_yours_rule(monkeypatch, capsys,
+                                                      tmp_path):
+    """The issue #55 ask, captured in the artifacts: the brief documents
+    sandboxed gates, and repair feedback repeats translator rule 9 —
+    compile errors in files that are not yours are not yours to fix."""
+    proj, state, runs = _contended_world(tmp_path)
+    agent_cmd, gate_cmd = _scripts(tmp_path)
+    code, out = _run(monkeypatch, capsys, state, proj, agent_cmd, gate_cmd,
+                     None, mode="repair")
+    assert code == 2
+    brief = (tmp_path / "delegates" / "u-foo" / "brief-c1.md").read_text()
+    assert "Rules 1-9" in brief
+    assert "sandbox" in brief and "CARGO_TARGET_DIR" in brief
+    fb = (tmp_path / "delegates" / "u-foo" / "feedback-c1.txt").read_text()
+    assert "not yours to fix" in fb and "report and wait" in fb
+
+
+def test_strip_mod_lines_variants():
+    """The sandbox's mod-line stripper: any visibility spelling, indented,
+    with attributes above (a dangling #[..] is itself an error), and it
+    must NOT touch other modules' lines or attribute-less kept code."""
+    import delegate
+    text = ("use x;\n"
+            "#[cfg(feature = \"c2\")]\n"
+            "pub(crate) mod u_foo_c2;\n"
+            "pub mod u_foo_c3;\n"
+            "mod u_foo_c1;\n"
+            "fn main() {}\n")
+    out = delegate._strip_mod_lines(text, {"u_foo_c2", "u_foo_c3"})
+    assert out == "use x;\nmod u_foo_c1;\nfn main() {}\n"

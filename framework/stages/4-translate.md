@@ -7,14 +7,17 @@ the agent spends most of its budget. Loop spec: `MIGRATION_PROMPT.md`.
 1. Pop the next unit in leaf-first order; load its contract + Python source.
 2. Delegate translation to **translator** subagents (`roles/translator.md`),
    K = 3 candidates. Strict file partitioning: a delegate touches only its
-   assigned files and never the state file. Different units may proceed in
-   parallel; shared parents wait for all children. With a reachable GLV
-   server, run each delegate as a GLV session per `tools/glv-subagents.md`.
-   Mechanize the whole per-unit loop — candidate files, briefs, the bounded
-   verbatim-feedback repair rounds, gate-then-oracle ranking, and the
-   verdict pack for `state.py` — with one command:
-   `tools/delegate.py run-candidates` (issue #33); the state file stays
-   orchestrator-only either way.
+   assigned files and never the state file. Units on **separate crates**
+   may proceed in parallel; shared parents wait for all children. Units on
+   **one shared crate** do not — see *Build contention* below (issue #55).
+   With a reachable GLV server, run each delegate as a GLV session per
+   `tools/glv-subagents.md`. Mechanize the whole per-unit loop — candidate
+   files, briefs, the bounded verbatim-feedback repair rounds,
+   gate-then-oracle ranking, and the verdict pack for `state.py` — with
+   one command: `tools/delegate.py run-candidates` (issue #33), which
+   serializes the unit's K candidates and isolates every gate/build in a
+   per-candidate sandbox; the state file stays orchestrator-only either
+   way.
 3. Run the mechanical import fixer first — most compile failures are
    mis-imported *real* modules, not hallucinated crates (>50% per
    arXiv:2606.08444).
@@ -33,6 +36,33 @@ the agent spends most of its budget. Loop spec: `MIGRATION_PROMPT.md`.
    corpus-fresh.jsonl` (issue #32) — never re-judge the translator's own
    corpus.
 9. Update state after every unit; Python fallback stays live for unported units.
+
+## Build contention — one crate, one verify loop at a time (issue #55)
+
+File partitioning does not partition *feedback*: every delegate's
+`cargo build` / `clippy` / `maturin develop` compiles the whole shared
+crate, so a sibling's half-written module fails everyone's gates. In a
+real 5-delegate run, one delegate exhausted its entire budget triaging
+other units' compile errors and never wrote its own file. Therefore:
+
+- Delegates on one crate run **sequentially** — or one tranche at a time,
+  with the crate green between tranches. Parallelism stays available
+  across *separate crates* and (within a unit) inside
+  `delegate.py run-candidates`, which serializes the K candidates itself.
+- `tools/delegate.py run-candidates` owns build isolation (default,
+  `--no-isolate-builds` to disable): each candidate's gates and the wheel
+  build run in a per-candidate **sandbox copy** of the crate — every
+  other candidate's module stripped (file deleted, its `mod` line
+  removed) — under the unit's own `CARGO_TARGET_DIR`, so compiler
+  feedback cites only the candidate's own file. The real crate stays the
+  authoritative tree the delegates write into.
+- Stage 3's pre-wired placeholder modules (see `3-scaffold.md` step 2)
+  keep the crate green with *missing* units — they do not help with
+  half-written ones, so the serialization/isolation rules above still
+  apply even with placeholders in place.
+- Delegate briefs and `roles/translator.md` (rule 9) carry the rule
+  verbatim: compile errors in files that are not yours are not yours to
+  fix — report and wait.
 
 ## Exit criteria
 - [ ] Every unit: `ported` / `divergent_explained` / `escalated` — none left
