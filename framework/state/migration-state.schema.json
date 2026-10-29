@@ -88,6 +88,7 @@
             "properties": {
               "max_rounds": { "type": "integer", "default": 5 },
               "tokens_spent": { "type": "integer" },
+              "max_rss_mb": { "type": "integer", "minimum": 1, "$comment": "issue #76 — the per-child memory ceiling (MB) in force for this unit's children, resolved from autonomy/policy.json 'memory' (delegate.py records gate_child_mb here, cited policy:MEM-1) the way K is recorded; a cgroup scope breach (child exit 137) is journaled like token exhaustion — actor, unit, observed peak, limit — and resolves as ESC-1 defer, never a service crash" },
               "exhausted": { "type": "boolean" }
             }
           },

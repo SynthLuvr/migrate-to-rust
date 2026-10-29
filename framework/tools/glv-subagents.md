@@ -98,15 +98,26 @@ sibling sessions, and the parent tool keep running. cgroup v2
 address space and breaks rustc/LLVM's large reservations). When
 `systemd-run` is unavailable or the scope cannot start (container CI),
 `run_child` falls back to unscoped with a `[run_child]` stderr warning —
-the harness stays portable and never hard-fails the tool. Opt in per
-command: `oracle.py judge --mem-limit-mb`, `delegate.py run-candidates
---mem-limit-mb` (agent + gates + build + judge children), `pipeline.py
-run --agent-mem-limit-mb`. Policy-owned defaults (what N should be) are
-issue #76.
+the harness stays portable and never hard-fails the tool. The ceilings
+are **policy** (issue #76): the `memory` block of
+`autonomy/policy.json` (`policy:MEM-1`) — `judge_child_mb` (2048 MB)
+bounds each judge/corpus REPL child, `gate_child_mb` (4096 MB) bounds
+the delegate agent, compile gates, wheel build, and driver stage
+workers — and it is the DEFAULT of every flag (`oracle.py judge
+--mem-limit-mb`, `delegate.py run-candidates --mem-limit-mb`, which
+also forwards the tighter judge ceiling to the oracle's children,
+`pipeline.py run --agent-mem-limit-mb`); `pipeline.py resolve-memory`
+emits the decision (decided_by + evidence), an explicit flag value is
+an operator override journaled as a deviation, and `0` disables
+scoping. A breach is journaled the way token exhaustion is — actor,
+unit, observed peak, limit — into `units[].budget.max_rss_mb` + the
+journal, resolving as ESC-1 defer; per-side peak RSS rides the verdict
+payload's `resources.peak_rss_mb`.
 
 **Run-level slice (the launch path).** Per-child scopes bound each child;
 a whole unattended run (driver, chain, or recipe) is bounded independently
-of the session server by launching it inside a dedicated user slice.
+of the session server by launching it inside a dedicated user slice — the
+ceiling is policy too: `memory.run_scope_mb` (`policy:MEM-1`, 8192 MB).
 Install the shipped slice once:
 
 ```bash
@@ -127,6 +138,9 @@ systemd-run --user --slice=migration.slice --scope \
 systemd-run --user --slice=migration.slice --scope ... --unit=migration-<project> \
   python framework/tools/succession.py chain framework/state/migration-state.json
 ```
+
+`MemoryMax=8G` mirrors policy `memory.run_scope_mb` (8192 MB, issue #76);
+`MemoryHigh=6G` is the reclaim throttle below it.
 
 A scope-killed run is attributable (`journalctl --user-unit
 migration-<project>.scope`) and the session continues: the chain
@@ -270,11 +284,19 @@ Per unit, in leaf-first dependency order:
   delegation, now enforced by process boundaries.
 - **Contained runs.** Every GLV run spawns in its own process group,
   signalled once when the run settles, so a delegate's background jobs
-  cannot outlive it and leak into the service's cgroup. Launch freely,
-  but still `stop` anything left running when you escalate: the
-  six-slot queue is pipeline throughput. Memory is contained the same
-  way — per-child cgroup scopes at the `run_child` choke point plus the
-  run-level `migration.slice` (§ *Memory containment*, issue #74).
+  cannot outlive it and leak into the service's cgroup. Memory is
+  contained the same way and stronger — a runaway child must not cost
+  the *service* its unit (#73): every child the harness spawns is
+  bounded by a per-child cgroup scope at the `run_child` choke point
+  (ceilings are policy, `autonomy/policy.json` `memory` /
+  `policy:MEM-1`, issue #76 — judge children 2048 MB, toolchain
+  children 4096 MB), and a whole unattended run launches inside the
+  run-level `migration.slice` (`run_scope_mb` 8192 MB — the exact
+  launch command is in § *Memory containment*). A breach dies alone
+  (exit 137 → ESC-1 unit escalation, journaled with observed peak +
+  limit), never a host-wide OOM. Launch freely, but still `stop`
+  anything left running when you escalate: the six-slot queue is
+  pipeline throughput.
 - **Attribution survives the hop.** Code reaches the repo only through
   the orchestrator's commit discipline (provenance headers, checked by
   `attribution.py`).

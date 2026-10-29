@@ -27,7 +27,9 @@ custom gates that cannot tolerate a copy.
         --agent-cmd 'goose session run {brief_file} {feedback_file}'
 
 (K comes from autonomy/policy.json 'candidates' — issue #59; --k overrides
-and is journaled as a deviation)
+and is journaled as a deviation. Memory ceilings come from its 'memory'
+block — issue #76, ``policy:MEM-1``; ``--mem-limit-mb`` overrides and is
+journaled as a deviation)
 
 Per unit it:
 
@@ -37,6 +39,14 @@ Per unit it:
      by default, journaled in the verdict pack as ``policy:CAND-1`` with
      its inputs, never left to the orchestrator's restraint (``--k`` is an
      operator override, recorded as a deviation from the policy decision);
+  0b. resolves the memory ceilings from the policy block (issue #76): the
+     agent, compile gates, and wheel build take ``memory.gate_child_mb``,
+     the oracle judge children take ``memory.judge_child_mb`` — cited
+     ``policy:MEM-1`` in the verdict pack; a cgroup scope breach (child
+     exit 137) is journaled the way token exhaustion is (actor, unit,
+     observed peak, limit) and resolves as ESC-1 defer, never a service
+     crash (``--mem-limit-mb`` is an operator override, recorded as a
+     deviation);
   1. derives per-candidate target paths (``src/u_<unit>_c1.rs`` … ``_cK``,
      under the unit's ``rust_path`` directory when recorded) and writes each
      delegate an assignment brief: its own file + the contract + the Python
@@ -254,6 +264,90 @@ def _resolve_k(args, state: dict, unit: dict, target_root: Path,
     decision["k_used"] = k
     decision["source"] = source
     return k, decision
+
+
+def _resolve_memory(args) -> tuple[int | None, int | None, dict]:
+    """Memory is a first-class policy budget (issue #76), not an improvised
+    flag: by default the agent / compile gates / wheel build take
+    policy.json memory.gate_child_mb and the oracle judge children take
+    memory.judge_child_mb (both cited policy:MEM-1 in the verdict pack).
+    An explicit --mem-limit-mb is an operator override journaled as a
+    deviation from that decision (it pins EVERY child this command
+    spawns); 0 disables scoping entirely. Returns (judge_mb, gate_mb,
+    decision) — None = that class of children runs unscoped."""
+    flag = args.mem_limit_mb
+    policy = pipeline_tool.load_policy()
+    decision = pipeline_tool.resolve_memory(policy)
+    limits = decision["limits"]
+    if flag is None:
+        return (limits["judge_child_mb"], limits["gate_child_mb"], decision)
+    if flag == 0:
+        decision.setdefault("deviations", []).append(
+            "operator override: --mem-limit-mb 0 — all children unscoped "
+            "(the run-level migration.slice still bounds the run)")
+        return None, None, decision
+    decision.setdefault("deviations", []).append(
+        f"operator override: --mem-limit-mb {flag} pins every child "
+        f"(policy said judge {limits['judge_child_mb']} / gate "
+        f"{limits['gate_child_mb']} MB) — journaled, never an "
+        f"orchestrator's judgment call")
+    return flag, flag, decision
+
+
+def _breaches(results: list[dict], gate_mb: int | None,
+              judge_mb: int | None) -> list[dict]:
+    """Scope-breach events from a run's candidate records (issue #76): a
+    child the memcg SIGKILLed (exit 137 / 'Killed' / the oracle's
+    setup_error for it). Each breach is journaled the way token exhaustion
+    is — actor, unit, observed peak, limit — so ESC-1's defer decision
+    carries the evidence, and the artifact (not the kernel log) names the
+    ballooning side."""
+    breaches: list[dict] = []
+    for r in results:
+        for g in (r.get("rounds") or []):
+            for gate in (g.get("gates") or []):
+                if _looks_like_memcg_kill(gate.get("exit_code"),
+                                          gate.get("output")):
+                    breaches.append({
+                        "candidate": r.get("candidate"), "child": "gate",
+                        "observed_peak_mb": None, "limit_mb": gate_mb,
+                        "evidence": f"exit {gate.get('exit_code')} — "
+                                    f"{(gate.get('output') or '')[:160]}"})
+        j = r.get("judge") or {}
+        res = j.get("resources") or {}
+        limit = res.get("mem_limit_mb", judge_mb)
+        killed = [side for side, err in (res.get("side_terminal_errors")
+                                         or {}).items()
+                  if err and _looks_like_memcg_kill(None, err)]
+        killed = killed or (["judge"] if _looks_like_memcg_kill(
+            j.get("oracle_exit"), j.get("setup_error")) else [])
+        if killed:
+            peaks = res.get("peak_rss_mb") or {}
+            observed = next((peaks.get(s) for s in peaks if peaks.get(s)),
+                            None)
+            sides = (res.get("side_terminal_errors") or {})
+            breaches.append({
+                "candidate": r.get("candidate"),
+                "child": ("judge" if killed == ["judge"]
+                          else f"judge ({'+'.join(killed)})"),
+                "observed_peak_mb": observed, "limit_mb": limit,
+                "evidence": (
+                    f"oracle exit {j.get('oracle_exit')}: "
+                    f"{(j.get('setup_error') or '')[:160]}"
+                    if killed == ["judge"] else
+                    "; ".join(f"{s}: {(sides.get(s) or '')[:160]}"
+                              for s in killed))})
+    return breaches
+
+
+def _looks_like_memcg_kill(exit_code: int | None, output: str | None) -> bool:
+    """A cgroup-v2 MemoryMax breach SIGKILLs the child: exit 137 (128+9),
+    or the harness's own scope markers in captured output."""
+    if exit_code in (137, -9):
+        return True
+    text = output or ""
+    return ("Killed" in text or "memory scope" in text
+            or "exit 137" in text or "setup_error: child killed" in text)
 
 
 def _sanitize_stem(uid: str) -> str:
@@ -701,16 +795,17 @@ def _judge_candidate(derived_manifest: Path, timeout: float,
                      mem_limit_mb: int | None = None) -> dict:
     """Run oracle.py judge over the derived manifest as a real subprocess —
     no verdict is ever produced in here: the oracle ranks, not the model
-    and not this tool. With mem_limit_mb set (issue #74) the flag is
-    forwarded to the oracle, which scopes each judge child (the #73
-    victim) to MemoryMax — the oracle PARENT stays unscoped from here on
-    purpose: it must survive a breach to record setup_error and return
-    the incomparable verdict (the run-level migration.slice bounds the
-    parent; see tools/glv-subagents.md)."""
+    and not this tool. mem_limit_mb (issue #76: resolved from policy
+    memory.judge_child_mb, policy:MEM-1, unless --mem-limit-mb overrode
+    it) is forwarded to the oracle, which scopes each judge child (the
+    #73 victim) to MemoryMax; an explicit 0 keeps the oracle's own policy
+    default from re-scoping children this run disabled. The oracle PARENT
+    stays unscoped from here on purpose: it must survive a breach to
+    record setup_error and return the incomparable verdict (the run-level
+    migration.slice bounds the parent; see tools/glv-subagents.md)."""
     cmd = [sys.executable, str(ORACLE), "judge",
-           "--manifest", str(derived_manifest), "--timeout", str(timeout)]
-    if mem_limit_mb is not None:
-        cmd += ["--mem-limit-mb", str(mem_limit_mb)]
+           "--manifest", str(derived_manifest), "--timeout", str(timeout),
+           "--mem-limit-mb", str(mem_limit_mb) if mem_limit_mb else "0"]
     try:
         rc, out, err = run_child(cmd, cwd=str(derived_manifest.parent),
                                  timeout=timeout * 2 + 60)
@@ -732,7 +827,8 @@ def _judge_candidate(derived_manifest: Path, timeout: float,
            "diff_kind_histogram": payload.get("diff_kind_histogram", {}),
            "verdicts_digest": payload.get("verdicts_digest"),
            "ground_truth_warning": ((payload.get("ground_truth") or {})
-                                    .get("warning"))}
+                                    .get("warning")),
+           "resources": payload.get("resources")}
     if rc == EXIT_SETUP:
         rec["setup_error"] = ((payload.get("summary") or {}).get("human")
                               or "oracle setup failure — check the manifest "
@@ -907,7 +1003,10 @@ def _table(unit_id: str, ranked: list[dict], winner: dict | None,
 
 
 def _state_commands(unit_id: str, winner: dict | None,
-                    state_path: Path, k_policy: dict) -> list[str]:
+                    state_path: Path, k_policy: dict, *,
+                    gate_mb: int | None = None,
+                    breaches: list[dict] | None = None,
+                    decided_by: str = "policy:MEM-1") -> list[str]:
     """The exact commands the orchestrator runs to record the pack (this
     tool stays read-only on the state file — role separation)."""
 
@@ -928,11 +1027,29 @@ def _state_commands(unit_id: str, winner: dict | None,
     if k_policy.get("deviation"):
         k_note += f" [{k_policy['deviation']}]"
 
+    # issue #76: journal the memory ceiling in force for this unit's
+    # children, like K — and a scope breach the way token exhaustion is
+    # journaled (actor, unit, observed peak, limit), resolving as ESC-1
     cmds = [set_cmd(f"units[{unit_id}].k={k_policy['k_used']}")]
+    if gate_mb is not None:
+        cmds.append(set_cmd(f"units[{unit_id}].budget.max_rss_mb={gate_mb}"))
+    breach_note = ""
+    if breaches:
+        parts = []
+        for b in breaches:
+            peak = (f"peak {b['observed_peak_mb']:g} MB"
+                    if b.get("observed_peak_mb") is not None
+                    else "peak unobserved (child died before self-report)")
+            parts.append(f"{b['child']} child ({b['candidate']}): {peak} "
+                         f"> limit {b['limit_mb']} MB")
+        breach_note = (f" [MEMORY SCOPE BREACH per {decided_by}: "
+                       + "; ".join(parts)
+                       + " — ESC-1 defer, Python fallback stays live; "
+                       "never a service crash]")
     if winner is None:
         cmds.append(mark_cmd("escalated",
                              "delegate.py: no gate-green candidate after "
-                             f"bounded rounds{k_note}"))
+                             f"bounded rounds{k_note}{breach_note}"))
         return cmds
     j = winner.get("judge") or {}
     counts = j.get("counts") or {}
@@ -954,7 +1071,8 @@ def _state_commands(unit_id: str, winner: dict | None,
         cmds.append(mark_cmd("ported", note))
     else:
         cmds.append(mark_cmd("escalated",
-                             note + " — rounds exhausted / divergence unexplained"))
+                             note + " — rounds exhausted / divergence "
+                             "unexplained" + breach_note))
     return cmds
 
 
@@ -990,14 +1108,19 @@ def _resolve_manifest(args, state_path: Path) -> Path | None:
 def _emit_dry_run(args, plan: list[dict], gates: list[str],
                   contract: Path | None, contract_note: str,
                   target_root: Path, import_allow: set[str],
-                  cargo_note: str | None, k_policy: dict) -> int:
+                  cargo_note: str | None, k_policy: dict,
+                  memory_policy: dict) -> int:
     human = (f"dry-run: {args.unit} k={args.k} ({k_policy['citation']}) "
              f"max_rounds={args.max_rounds} "
+             f"memory: gate {memory_policy['limits']['gate_child_mb']} MB / "
+             f"judge {memory_policy['limits']['judge_child_mb']} MB "
+             f"({memory_policy['decided_by']}) "
              f"gates={len(gates) + 1} target={target_root} — no agent, "
              f"no writes")
     emit({
         "tool": TOOL, "version": VERSION, "unit": args.unit,
         "dry_run": True, "k": args.k, "k_policy": k_policy,
+        "memory": memory_policy,
         "max_rounds": args.max_rounds,
         "gates": ["<mechanical import gate>", *gates],
         "build_cmd": None if args.no_build else args.build_cmd,
@@ -1053,7 +1176,8 @@ def _skip_judging(results: list[dict], reason: str) -> None:
 
 
 def _judge_green_candidates(plan: list[dict], green: list[dict], args,
-                            state_path: Path) -> bool:
+                            state_path: Path,
+                            mem_judge_mb: int | None = None) -> bool:
     """One real oracle.py judge run per gate-green candidate (via a derived
     manifest — see _derive_judge_files). Returns whether the last judged
     candidate was actually judged."""
@@ -1081,7 +1205,7 @@ def _judge_green_candidates(plan: list[dict], green: list[dict], args,
                                "cannot retarget per candidate")
             continue
         r["judge"] = _judge_candidate(derived, args.judge_timeout,
-                                      mem_limit_mb=args.mem_limit_mb)
+                                      mem_limit_mb=mem_judge_mb)
         r["judge"]["manifest"] = str(derived)
         r["judge"]["wheel_module"] = wheel_module
         judged_any = bool(r["judge"].get("judged"))
@@ -1125,6 +1249,12 @@ def cmd_run_candidates(args) -> int:
     args.max_rounds = _resolve_max_rounds(args.max_rounds, budget)
     only = [c.strip() for c in args.only.split(",")] if args.only else None
     args.k, k_policy = _resolve_k(args, state, unit, target_root, only)
+    mem_judge_mb, mem_gate_mb, memory_policy = _resolve_memory(args)
+    # the toolchain children (agent, compile gates, wheel build) take the
+    # gate ceiling; the oracle judge children take the tighter judge
+    # ceiling (policy:MEM-1, issue #76) — recorded per child class in the
+    # pack's memory decision, never improvised per invocation
+    args.mem_limit_mb = mem_gate_mb
     plan = _candidate_plan(state_path, unit, target_root, args.k, only)
     contract, contract_note = _contract_path(args, state_path)
     gates = args.gate or DEFAULT_GATES
@@ -1136,7 +1266,7 @@ def cmd_run_candidates(args) -> int:
     if args.dry_run:
         return _emit_dry_run(args, plan, gates, contract, contract_note,
                              target_root, import_allow, cargo_note,
-                             k_policy=k_policy)
+                             k_policy=k_policy, memory_policy=memory_policy)
 
     delegates_dir = state_path.parent / "delegates" / args.unit
     isolation = _build_isolation(args, delegates_dir, plan)
@@ -1165,13 +1295,21 @@ def cmd_run_candidates(args) -> int:
              if green and not args.no_build else {"attempted": False})
     judged_any = False
     if green and not build.get("failed"):
-        judged_any = _judge_green_candidates(plan, green, args, state_path)
+        judged_any = _judge_green_candidates(plan, green, args, state_path,
+                                             mem_judge_mb=mem_judge_mb)
 
     ranked = _rank(results)
     winner = ranked[0] if ranked and ranked[0]["gate_green"] else None
+    breaches = _breaches(results, mem_gate_mb, mem_judge_mb)
+    if breaches:
+        # issue #76: a scope breach is journaled like token exhaustion —
+        # actor, unit, observed peak, limit — and resolves as ESC-1 defer
+        memory_policy["breaches"] = breaches
     table = _table(args.unit, ranked, winner, k_policy=k_policy)
     state_cmds = _state_commands(args.unit, winner, state_path,
-                                 k_policy=k_policy)
+                                 k_policy=k_policy, gate_mb=mem_gate_mb,
+                                 breaches=breaches,
+                                 decided_by=memory_policy["decided_by"])
     sessions = _session_entries(args.unit, results)
     code = _exit_code(winner, build, judged_any)
 
@@ -1179,6 +1317,7 @@ def cmd_run_candidates(args) -> int:
         "tool": TOOL, "version": VERSION, "unit": args.unit,
         "unit_status_before": unit.get("status"),
         "k": args.k, "k_policy": k_policy, "max_rounds": args.max_rounds,
+        "memory": memory_policy,
         "gates": ["<mechanical import gate>", *gates],
         "build": build, "target_root": str(target_root),
         "build_isolation": _isolation_summary(isolation),
@@ -1289,19 +1428,24 @@ def main(argv=None) -> int:
     p.add_argument("--build-timeout", type=float, default=BUILD_TIMEOUT)
     p.add_argument("--judge-timeout", type=float, default=JUDGE_TIMEOUT)
     p.add_argument("--mem-limit-mb", type=int, default=None,
-                   help="per-child cgroup memory ceiling (MB, issue #74): "
-                        "every child this command spawns — the agent, each "
-                        "gate, the wheel build, and the oracle judge's "
-                        "children — runs in its own systemd-run user scope "
-                        "(cgroup-v2 MemoryMax, MemorySwapMax=0). A breach "
+                   help="per-child cgroup memory ceiling (MB): every child "
+                        "this command spawns runs in its own systemd-run "
+                        "user scope (cgroup-v2 MemoryMax, MemorySwapMax=0). "
+                        "DEFAULT (issue #76): the 'memory' block of "
+                        "autonomy/policy.json (policy:MEM-1) — the agent, "
+                        "compile gates, and wheel build take gate_child_mb, "
+                        "the oracle judge's children take the tighter "
+                        "judge_child_mb (judged code is untrusted). A breach "
                         "dies alone (SIGKILL -> exit 137 -> setup_error -> "
-                        "incomparable -> ESC-1 defers) instead of OOM-killing "
-                        "the session server (#73). None (default) leaves "
-                        "children unscoped (the oracle judge's own REPL "
-                        "children remain bounded by oracle.py's "
-                        "--mem-limit-mb default, issue #73); policy defaults "
-                        "are issue #76. Falls back to unscoped with a stderr "
-                        "warning when systemd-run is unavailable")
+                        "incomparable -> ESC-1 defers, journaled like token "
+                        "exhaustion with observed peak + limit) instead of "
+                        "OOM-killing the session server (#73). An explicit "
+                        "value pins EVERY child and is journaled in the "
+                        "verdict pack as a deviation from the policy "
+                        "decision; 0 disables scoping (the run-level "
+                        "migration.slice still bounds the run). Falls back "
+                        "to unscoped with a stderr warning when systemd-run "
+                        "is unavailable")
     p.add_argument("--dry-run", action="store_true",
                    help="print the derived plan (paths, briefs, gates) — no "
                         "agent, no writes")

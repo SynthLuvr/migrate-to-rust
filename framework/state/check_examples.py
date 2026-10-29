@@ -119,6 +119,34 @@ def require_autonomy_exercised(instances: list[dict]) -> None:
           "L2+ autonomy block, and a terminal run_status")
 
 
+def require_memory_budget_exercised(instances: list[dict]) -> None:
+    """Issue #76 — memory is a first-class budget: some unit must record
+    budget.max_rss_mb, and some journal entry must demonstrate the
+    scope-breach journaling shape (actor, unit, observed peak, limit),
+    or those fields stop being guarded."""
+    ceiling = any(
+        isinstance(u.get("budget"), dict) and u["budget"].get("max_rss_mb")
+        for inst in instances for u in inst.get("units", [])
+    )
+    breach = any(
+        e.get("actor") and e.get("unit")
+        and "max_rss_mb" in str(e.get("field", ""))
+        for inst in instances for e in inst.get("journal", [])
+    ) and any(
+        "peak" in str(e.get("to", "")) and "limit" in str(e.get("to", ""))
+        and "MEM-1" in str(e.get("to", ""))
+        for inst in instances for e in inst.get("journal", [])
+    )
+    if not (ceiling and breach):
+        fail(
+            "no example exercises the memory budget together: a unit "
+            "budget.max_rss_mb and a journaled scope breach (actor, unit, "
+            "observed peak, limit — see framework/examples/migration-state.json)"
+        )
+    print("ok: an example instance exercises budget.max_rss_mb and a "
+          "journaled memory scope breach")
+
+
 def require_all_statuses_exercised(instances: list[dict], schema: dict) -> None:
     """Every status the schema's enum permits must appear on some unit in
     the example corpus (the worked example exists to cover them all)."""
@@ -199,6 +227,19 @@ def require_fields_constrained(schema: dict) -> None:
         {"gate": "go_no_go", "state": "approved", "decided_by": "policy:GO-1",
          "policy_version": "1.0.0", "evidence": ["saving=58.0"]},
     )
+    budget_schema = schema["properties"]["units"]["items"]["properties"]["budget"]
+    must_accept(
+        "a unit budget with the policy memory ceiling",
+        budget_schema,
+        {"max_rounds": 5, "tokens_spent": 52000, "max_rss_mb": 4096,
+         "exhausted": False},
+    )
+    for bad in (0, -1, "4096", 4096.5, True):
+        must_reject(
+            f"a unit budget max_rss_mb of {bad!r}",
+            budget_schema,
+            {"max_rss_mb": bad},
+        )
     must_reject(
         "a bogus gate resolution state",
         gate_schema,
@@ -244,6 +285,7 @@ def main() -> None:
     require_fields_exercised(instances)
     require_autonomy_exercised(instances)
     require_all_statuses_exercised(instances, schema)
+    require_memory_budget_exercised(instances)
     require_fields_constrained(schema)
     require_units_constrained(schema)
     print(f"validated {len(instances)} example instance(s) against the schema")

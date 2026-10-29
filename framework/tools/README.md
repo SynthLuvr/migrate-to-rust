@@ -280,6 +280,16 @@ included) in the verdict pack, and cites it by id wherever a note used
 to carry prose; an explicit `--k` is an operator override, recorded as
 a deviation from the policy decision.
 
+Memory ceilings are policy too (issue #76): the `memory` block
+(`policy:MEM-1`) is resolved the same way — the agent, compile gates,
+and wheel build take `gate_child_mb`, the oracle judge children take
+the tighter `judge_child_mb` — and rides the verdict pack's `memory`
+decision (decided_by + evidence); a cgroup scope breach (child exit
+137) is journaled like token exhaustion (actor, unit, observed peak,
+limit; `units[].budget.max_rss_mb` records the ceiling in force) and
+resolves as ESC-1 defer. An explicit `--mem-limit-mb` is an operator
+override journaled as a deviation; 0 disables scoping.
+
 Per unit it: computes the per-candidate target paths
 (`src/u_<unit>_c1.rs` … `_cK`, following the unit's recorded `rust_path`
 directory) and writes each delegate an assignment **brief** — its own
@@ -428,13 +438,15 @@ Uniform conventions (so the agent can compose the tools blind):
   as chunks complete, and only the first 500 run entries stay verbatim in
   the payload (beyond that: verdict + detail + diff digest — the summary
   numbers always cover every run). A pre-flight pass refuses a corpus
-  whose estimated footprint exceeds `--max-corpus-mb` (default 1024)
-  before any child is spawned; `--runs N` is the documented cap. Measured:
+  whose estimated footprint exceeds `--max-corpus-mb` (default: the
+  `memory` block of `autonomy/policy.json`, 1024 MB — issue #76) before
+  any child is spawned; `--runs N` is the documented cap. Measured:
   a 2.0 GB / 500k-row corpus judges end-to-end at 268 MB parent peak RSS
   (the pre-streaming code peaked at 1.46 GB on a 350 MB corpus).
 - **Bounded, reaped children (issue #73)**: judge/corpus REPL children
-  are bounded by `--mem-limit-mb` (default 2048 MB cgroup-v2 MemoryMax;
-  0 disables) — a leaking side dies alone in its scope and the judgment
+  are bounded by `--mem-limit-mb` (default: policy `memory`
+  `judge_child_mb`, `policy:MEM-1` — 2048 MB cgroup-v2 MemoryMax; 0
+  disables) — a leaking side dies alone in its scope and the judgment
   reports setup_error → INCOMPARABLE instead of the host OOM-killer
   firing. Every `run_child` child is its own session leader and a
   timeout SIGKILLs the whole process group (no orphaned children
@@ -442,7 +454,8 @@ Uniform conventions (so the agent can compose the tools blind):
   ppid watchdog that exits it if its judge is SIGKILLed, runs
   `gc.collect()` every 64 rows, and self-reports its peak RSS in a
   final `{"peak_rss_kb": N}` meta record that lands in the verdict
-  payload's `resources.peak_rss_mb`.
+  payload's `resources.peak_rss_mb` (with `mem_limit_decided_by`
+  provenance since issue #76).
 
 Quick reference (see each script's docstring for the full input formats):
 

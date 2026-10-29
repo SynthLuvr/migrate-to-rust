@@ -56,6 +56,11 @@ Subcommands
                  the decisions through state.py's journaled writer (pure
                  evaluation is exercised by the tests; --dry-run shows
                  decisions without writing)
+  resolve-memory emit the memory budget decision (issue #76) — the
+                 policy.json 'memory' ceilings with decided_by=policy:<id>
+                 + evidence; consumed in code as the default of every
+                 --mem-limit-mb / --max-corpus-mb flag (judge children,
+                 toolchain children, run slice, corpus pre-flight)
   report         emit the run report (status, gate dossier, escalation
                  dossier, budget usage) — auto-written at every terminal exit
   status         one-JSON run summary
@@ -204,6 +209,7 @@ def _policy_structure_errors(policy: dict) -> list[str]:
         errors.append("budget.max_chain_depth: integer >= 1 required "
                       "(the successor-chain depth cap, issue #25)")
     errors.extend(_candidates_errors(policy))
+    errors.extend(_memory_errors(policy))
     return errors
 
 
@@ -236,6 +242,47 @@ def _candidates_errors(policy: dict) -> list[str]:
         errors.append("candidates.budget_floor_fraction: number in (0, 1] "
                       "required (the run-budget-remaining fraction under "
                       "which K drops to k_large_unit)")
+    return errors
+
+
+#: the memory block's per-child ceilings (issue #76): what each key bounds
+#: and where it is enforced — validation errors cite these so a misedited
+#: policy names the ceiling it broke
+MEMORY_CEILINGS = {
+    "judge_child_mb": "per-child ceiling (MB) for oracle judge/corpus REPL "
+                      "children — untrusted judged code (default 2048)",
+    "gate_child_mb": "per-child ceiling (MB) for toolchain children — "
+                     "delegate agent, compile gates, wheel build, driver "
+                     "stage workers (default 4096)",
+    "run_scope_mb": "run-level migration.slice MemoryMax (MB) the launch "
+                    "command pins — bounds the WHOLE run, not a per-child "
+                    "limit (default 8192)",
+    "max_corpus_mb": "pre-flight parent-side corpus-retention budget (MB), "
+                     "issue #75 (default 1024)",
+}
+
+
+def _memory_errors(policy: dict) -> list[str]:
+    """Issue #76 — memory is a first-class budget, validated like every
+    other policy block: without it (or with garbage ceilings) a policy
+    must not load, or the one unbounded resource behind #73 silently
+    falls back to improvised --mem-limit-mb flags again."""
+    memory = policy.get("memory")
+    if not isinstance(memory, dict):
+        return ["memory: object required — memory is a first-class policy "
+                "budget (issue #76), not improvised --mem-limit-mb flags; "
+                "without the block a runaway child is the session server's "
+                "problem again (#73)"]
+    errors: list[str] = []
+    mid = memory.get("id")
+    if not isinstance(mid, str) or not re.fullmatch(r"[A-Z]+-\d+", mid or ""):
+        errors.append(f"memory.id {mid!r}: must match <AREA>-<number> "
+                      f"(e.g. MEM-1) — journal/pack citations are "
+                      f"'policy:<id>'")
+    for key, meaning in MEMORY_CEILINGS.items():
+        v = memory.get(key)
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            errors.append(f"memory.{key}: integer >= 1 required — {meaning}")
     return errors
 
 
@@ -315,6 +362,63 @@ def resolve_k(state: dict, policy: dict, unit_loc: int | None = None) -> dict:
     return {"k": k, "citation": citation,
             "policy_version": policy.get("version"),
             "rounds_as_candidates": k < k_small, "inputs": inputs, "basis": basis}
+
+
+def resolve_memory(policy: dict, **overrides: int | None) -> dict:
+    """Memory is a first-class, policy-resolved budget (issue #76), the
+    one resource #73 left unbounded: resolve the per-child / per-run
+    ceilings from policy.json's 'memory' block (id MEM-1) — judge_child_mb
+    (oracle judge/corpus REPL children — untrusted judged code),
+    gate_child_mb (delegate agent, compile gates, wheel build, driver
+    stage workers), run_scope_mb (the run-level migration.slice MemoryMax
+    the launch command pins), max_corpus_mb (the #75 pre-flight corpus
+    budget). Pure and shared: oracle.py, delegate.py, and pipeline.py
+    enforce it as the DEFAULT of their memory flags, so no orchestrator
+    re-improvises what N should be; an explicit flag value arrives here as
+    an override and is journaled as a deviation from this decision
+    (None = keep the policy value; the callers translate 0 to 'scoping
+    disabled' before calling). The decision rides the verdict pack /
+    payload as decided_by='policy:MEM-1' + policy_version + evidence[],
+    same shape as a gate decision."""
+    mem = policy.get("memory") or {}
+    citation = f"policy:{mem.get('id', 'MEM-1')}"
+    limits = {key: int(mem.get(key, default))
+              for key, default in (("judge_child_mb", 2048),
+                                   ("gate_child_mb", 4096),
+                                   ("run_scope_mb", 8192),
+                                   ("max_corpus_mb", 1024))}
+    decision = {"decided_by": citation,
+                "policy_version": policy.get("version"),
+                "limits": limits,
+                "evidence": [
+                    "policy.json memory block (issue #76) — the one "
+                    "unbounded resource behind #73 becomes a journaled "
+                    "budget, not an improvised flag",
+                    f"judge_child_mb={limits['judge_child_mb']} — each "
+                    f"oracle judge/corpus REPL child (untrusted judged "
+                    f"code); breach -> exit 137 -> setup_error -> "
+                    f"INCOMPARABLE -> ESC-1 defer",
+                    f"gate_child_mb={limits['gate_child_mb']} — delegate "
+                    f"agent, compile gates, wheel build, driver stage "
+                    f"workers (repo-trusted toolchain)",
+                    f"run_scope_mb={limits['run_scope_mb']} — the run-level "
+                    f"migration.slice MemoryMax (launch-time, bounds the "
+                    f"whole run; not a per-child limit)",
+                    f"max_corpus_mb={limits['max_corpus_mb']} — pre-flight "
+                    f"parent-side corpus-retention budget (issue #75)",
+                ]}
+    for key, value in overrides.items():
+        if key not in limits:
+            raise ValueError(f"unknown memory ceiling {key!r} "
+                             f"(known: {', '.join(limits)})")
+        if value is not None and value != limits[key]:
+            policy_value = limits[key]
+            decision["limits"][key] = value
+            decision.setdefault("deviations", []).append(
+                f"operator override: {key}={value} (policy said "
+                f"{policy_value}) — journaled, never an orchestrator's "
+                f"judgment call")
+    return decision
 
 
 # ------------------------------------------------------------- evidence ----
@@ -1401,16 +1505,19 @@ def _open_stage_gates(state: dict, stage: int, only: str | None = None) -> list:
 
 
 def _execute_stage(args, path: Path, stage: int, events: list,
-                   max_retries: int) -> tuple[dict, list]:
+                   max_retries: int,
+                   mem_limit_mb: int | None = None) -> tuple[dict, list]:
     """Run the stage worker (any CLI agent), then verify the stage's exit
     criteria, retrying within max_retries. Returns (state, changes for gates
-    the driver opened); raises _Terminal when attempts run out."""
+    the driver opened); raises _Terminal when attempts run out. The worker
+    runs under the policy-resolved per-child memory ceiling (issue #76,
+    policy:MEM-1 gate_child_mb) unless the operator overrode/disabled it."""
     attempts = 0
     state: dict | None = None
     while True:
         if not args.dry_run:
             rc, tail = _invoke_agent(args.agent_cmd, stage, path,
-                                     mem_limit_mb=args.agent_mem_limit_mb)
+                                     mem_limit_mb=mem_limit_mb)
             if rc != 0:
                 attempts += 1
                 events.append({"stage": stage, "event": "agent-failed",
@@ -1509,6 +1616,17 @@ def cmd_run(args) -> int:
     max_retries = int((policy.get("budget") or {})
                       .get("max_agent_retries_per_stage", 2))
     ctx = {"today": date.today(), "substitutions": load_substitutions(args.substitutions)}
+    # issue #76: the stage worker's per-child memory ceiling is a
+    # policy-resolved budget — gate_child_mb (policy:MEM-1) unless the
+    # operator overrides (0 disables); it rides the run report like every
+    # other journaled decision
+    memory_policy = resolve_memory(
+        policy, gate_child_mb=args.agent_mem_limit_mb or None)
+    if args.agent_mem_limit_mb == 0:
+        memory_policy["limits"]["gate_child_mb"] = None
+        memory_policy.setdefault("deviations", []).append(
+            "operator override: gate_child_mb=0 — stage-worker scoping "
+            "disabled (the run-level migration.slice still bounds the run)")
 
     if run_status in (None, "pending", "budget_exhausted", "failed_safely"):
         changes = [(None, "run_status", run_status, "running")]
@@ -1539,8 +1657,9 @@ def cmd_run(args) -> int:
                 raise _Terminal("complete", f"stage {stage} beyond {LAST_STAGE}")
 
             # 1. stage worker (any CLI agent), verified, with bounded retries
-            state, open_changes = _execute_stage(args, path, stage, events,
-                                                 max_retries)
+            state, open_changes = _execute_stage(
+                args, path, stage, events, max_retries,
+                mem_limit_mb=memory_policy["limits"]["gate_child_mb"])
 
             # 2. resolve open gates via policy (defer/conservative-default)
             decisions, changes = resolve_open_gates(state, policy, ctx)
@@ -1600,6 +1719,7 @@ def cmd_run(args) -> int:
           "run_status": run_status, "stage": state.get("stage"),
           "autonomy": state.get("autonomy"),
           "containment": self_containment(),
+          "memory": memory_policy,
           "terminal": bool(terminal is not None),
           "reason": terminal.reason if terminal is not None else None,
           "events": events, "report_path": str(rp),
@@ -1652,6 +1772,32 @@ def cmd_resolve_gates(args) -> int:
     emit({"tool": TOOL, "version": VERSION, "file": str(path),
           "decisions": decisions, "policy_version": policy.get("version"),
           "summary": {"exit_code": EXIT_OK, "human": human}}, human_flag=args.human)
+    return EXIT_OK
+
+
+def cmd_resolve_memory(args) -> int:
+    """Issue #76 — emit the memory budget decision the same way gate
+    decisions are emitted: decided_by=policy:<id> + policy_version +
+    evidence[], with operator overrides journaled as deviations. Read-only
+    (no state file touched): delegate.py/oracle.py consume this decision
+    in code as their flag defaults."""
+    policy = load_policy(args.policy)
+    decision = resolve_memory(
+        policy,
+        judge_child_mb=args.judge_child_mb,
+        gate_child_mb=args.gate_child_mb,
+        run_scope_mb=args.run_scope_mb,
+        max_corpus_mb=args.max_corpus_mb)
+    human = (f"{decision['decided_by']} (policy v{decision['policy_version']}): "
+             f"judge children {decision['limits']['judge_child_mb']} MB, "
+             f"toolchain children {decision['limits']['gate_child_mb']} MB, "
+             f"run slice {decision['limits']['run_scope_mb']} MB, "
+             f"corpus pre-flight {decision['limits']['max_corpus_mb']} MB"
+             + (f" | DEVIATIONS: {'; '.join(decision['deviations'])}"
+                if decision.get("deviations") else ""))
+    emit({"tool": TOOL, "version": VERSION, "decision": decision,
+          "summary": {"exit_code": EXIT_OK, "human": human}},
+         human_flag=args.human)
     return EXIT_OK
 
 
@@ -1735,16 +1881,19 @@ def main(argv=None) -> int:
     p.add_argument("--no-selftest", action="store_true",
                    help="skip the oracle.py self-test at Stage 2 (offline corner)")
     p.add_argument("--agent-mem-limit-mb", type=int, default=None,
-                   help="per-child cgroup memory ceiling (MB, issue #74) for "
-                        "the stage-worker agent: each invocation runs in its "
+                   help="per-child cgroup memory ceiling (MB) for the "
+                        "stage-worker agent: each invocation runs in its "
                         "own systemd-run user scope (cgroup-v2 MemoryMax, "
                         "MemorySwapMax=0) so a ballooning worker dies alone "
                         "(exit 137 -> stage verification fails -> retry/"
                         "failed_safely) instead of OOM-killing the session "
-                        "server (#73). None (default) is unscoped; the "
-                        "run-level ceiling is the migration.slice launch "
-                        "(tools/glv-subagents.md § Memory containment); "
-                        "policy defaults are issue #76")
+                        "server (#73). DEFAULT (issue #76): the 'memory' "
+                        "block of autonomy/policy.json (policy:MEM-1) — "
+                        "gate_child_mb; an explicit value is an operator "
+                        "override journaled as a deviation, 0 disables "
+                        "scoping; the run-level ceiling is the "
+                        "migration.slice launch (run_scope_mb, "
+                        "tools/glv-subagents.md § Memory containment)")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("resolve-gates",
@@ -1759,6 +1908,24 @@ def main(argv=None) -> int:
     p.add_argument("--human-override", action="store_true",
                    help="evaluate even below L2 (a human is driving this command)")
     p.set_defaults(func=cmd_resolve_gates)
+
+    p = sub.add_parser("resolve-memory",
+                       help="emit the memory budget decision (issue #76): "
+                            "the policy.json 'memory' ceilings with "
+                            "decided_by=policy:<id> + evidence, as consumed "
+                            "by every --mem-limit-mb default")
+    p.add_argument("--policy")
+    p.add_argument("--judge-child-mb", type=int,
+                   help="operator override of the judge-child ceiling "
+                        "(journaled as a deviation, same as --k)")
+    p.add_argument("--gate-child-mb", type=int,
+                   help="operator override of the toolchain-child ceiling "
+                        "(agent, gates, build, stage workers)")
+    p.add_argument("--run-scope-mb", type=int,
+                   help="operator override of the run-level slice ceiling")
+    p.add_argument("--max-corpus-mb", type=int,
+                   help="operator override of the pre-flight corpus budget (#75)")
+    p.set_defaults(func=cmd_resolve_memory)
 
     p = sub.add_parser("report", help="emit the run report markdown")
     p.add_argument("state")
