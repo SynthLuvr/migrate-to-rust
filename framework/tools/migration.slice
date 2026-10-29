@@ -1,0 +1,28 @@
+# Run-level memory containment for migration runs — issue #74 (fixes the
+# enforcement gap behind #73's overnight OOM kills).
+#
+# A dedicated user slice bounds a WHOLE run independently of the session
+# server's cgroup: one runaway run trips this slice's ceiling and dies
+# alone, session-level exhaustion flows through the normal succession.py
+# chain (successor session, stop-notice, dossier) instead of a service
+# crash-restart loop — and the journal names migration-<project>.scope,
+# not an anonymous python.
+#
+# Install once per host:
+#   mkdir -p ~/.config/systemd/user
+#   cp framework/tools/migration.slice ~/.config/systemd/user/migration.slice
+#   systemctl --user daemon-reload
+#
+# Then launch unattended runs inside it (see tools/glv-subagents.md,
+# "Memory containment"):
+#   systemd-run --user --slice=migration.slice --scope \
+#     -p MemoryHigh=6G -p MemoryMax=8G -p MemorySwapMax=0 \
+#     --unit=migration-<project> \
+#     python framework/tools/pipeline.py run <state.json> --agent-cmd '...'
+#
+# Tune the numbers to the host (this file ships 6G/8G for the 15 GiB dev
+# host from #73; policy-owned defaults are issue #76).
+[Slice]
+MemoryHigh=6G
+MemoryMax=8G
+MemorySwapMax=0

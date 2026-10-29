@@ -89,7 +89,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import state as state_tool  # noqa: E402  — the ONLY writer, composed not duplicated
 from _common import (  # noqa: E402
     EXIT_FINDINGS, EXIT_OK, ToolError, emit, now_iso, python_version_string,
-    run_child, run_cli,
+    run_child, run_cli, self_containment,
 )
 
 TOOL = "pipeline.py"
@@ -732,16 +732,14 @@ def verify_stage_exit(state: dict, stage: int, *, run_selftest: bool = True) -> 
         if not jv.get("normalization_rules"):
             failures.append("judge_validation.normalization_rules missing")
         if run_selftest:
-            try:
-                proc = subprocess.run([sys.executable, str(ORACLE), "self-test"],
-                                      capture_output=True, text=True, timeout=300)
-            except subprocess.TimeoutExpired:
+            code, _out, _err = _probe(
+                [sys.executable, str(ORACLE), "self-test"], timeout=300)
+            if code == 124:
                 failures.append("oracle.py self-test timed out — the parity "
                                 "judge is not validated (Stage 2 hard gate)")
-            else:
-                if proc.returncode != 0:
-                    failures.append("oracle.py self-test failed — the parity "
-                                    "judge is not validated (Stage 2 hard gate)")
+            elif code != 0:
+                failures.append("oracle.py self-test failed — the parity "
+                                "judge is not validated (Stage 2 hard gate)")
     elif stage == 3:
         missing = [u.get("id") for u in units if not u.get("rust_path")]
         if missing:
@@ -1366,20 +1364,25 @@ class _Terminal(Exception):
         self.state = state
 
 
-def _invoke_agent(cmd_template: str, stage: int, state_path: Path) -> tuple[int, str]:
+def _invoke_agent(cmd_template: str, stage: int, state_path: Path,
+                  mem_limit_mb: int | None = None) -> tuple[int, str]:
+    """The stage worker rides _common.run_child — the harness's single
+    child-process choke point (issue #74) — so the driver's agent spawns
+    share the fixed env, captured output, hard timeout, and (when
+    mem_limit_mb is set) the per-child cgroup memory scope."""
     cmd = cmd_template.format(
         stage=stage, state=str(state_path),
         stage_file=str(FRAMEWORK / "stages" / STAGE_FILES[stage]),
         framework=str(FRAMEWORK))
     try:
-        proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True,
-                              timeout=3600)
+        rc, out, err = run_child(shlex.split(cmd), timeout=3600,
+                                 mem_limit_mb=mem_limit_mb)
     except FileNotFoundError as e:
         return 127, f"agent command not found: {e}"
     except subprocess.TimeoutExpired:
         return 124, "agent timed out after 3600s"
-    tail = ((proc.stdout or "") + (proc.stderr or ""))[-2000:]
-    return proc.returncode, tail
+    tail = ((out or "") + (err or ""))[-2000:]
+    return rc, tail
 
 
 def _open_stage_gates(state: dict, stage: int, only: str | None = None) -> list:
@@ -1406,7 +1409,8 @@ def _execute_stage(args, path: Path, stage: int, events: list,
     state: dict | None = None
     while True:
         if not args.dry_run:
-            rc, tail = _invoke_agent(args.agent_cmd, stage, path)
+            rc, tail = _invoke_agent(args.agent_cmd, stage, path,
+                                     mem_limit_mb=args.agent_mem_limit_mb)
             if rc != 0:
                 attempts += 1
                 events.append({"stage": stage, "event": "agent-failed",
@@ -1595,6 +1599,7 @@ def cmd_run(args) -> int:
     emit({"tool": TOOL, "version": VERSION, "file": str(path),
           "run_status": run_status, "stage": state.get("stage"),
           "autonomy": state.get("autonomy"),
+          "containment": self_containment(),
           "terminal": bool(terminal is not None),
           "reason": terminal.reason if terminal is not None else None,
           "events": events, "report_path": str(rp),
@@ -1729,6 +1734,17 @@ def main(argv=None) -> int:
                         "then pause resumable")
     p.add_argument("--no-selftest", action="store_true",
                    help="skip the oracle.py self-test at Stage 2 (offline corner)")
+    p.add_argument("--agent-mem-limit-mb", type=int, default=None,
+                   help="per-child cgroup memory ceiling (MB, issue #74) for "
+                        "the stage-worker agent: each invocation runs in its "
+                        "own systemd-run user scope (cgroup-v2 MemoryMax, "
+                        "MemorySwapMax=0) so a ballooning worker dies alone "
+                        "(exit 137 -> stage verification fails -> retry/"
+                        "failed_safely) instead of OOM-killing the session "
+                        "server (#73). None (default) is unscoped; the "
+                        "run-level ceiling is the migration.slice launch "
+                        "(tools/glv-subagents.md § Memory containment); "
+                        "policy defaults are issue #76")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("resolve-gates",

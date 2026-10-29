@@ -34,6 +34,29 @@ not in the repo being migrated.
      --agent-cmd 'goose run --recipe {framework}/recipe.yaml'
    ```
 
+   **Memory containment for unattended runs (issue #74)** — bound the
+   whole run independently of the session server with the shipped user
+   slice, so a ballooning run dies alone (attributable scope unit) and
+   session exhaustion flows through the successor chain instead of a
+   service crash-restart loop (the failure mode behind #73):
+
+   ```console
+   mkdir -p ~/.config/systemd/user
+   cp framework/tools/migration.slice ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemd-run --user --slice=migration.slice --scope \
+     -p MemoryHigh=6G -p MemoryMax=8G -p MemorySwapMax=0 \
+     --unit=migration-myproject \
+     python framework/tools/pipeline.py run framework/state/migration-state.json \
+       --agent-cmd 'goose run --recipe {framework}/recipe.yaml'
+   ```
+
+   Per-child ceilings (judge children, gates, delegate agents, stage
+   workers) are also available without the slice via `--mem-limit-mb` /
+   `--agent-mem-limit-mb` — details and breach semantics in
+   [`tools/glv-subagents.md`](tools/glv-subagents.md) § *Memory
+   containment*.
+
    Preflight first (issue #31) — one command that machine-checks the
    "Before first use" list below against the target and records it in the
    state file (`preflight` block + `<state>.preflight.md`); it exits 2 on

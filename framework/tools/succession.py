@@ -112,7 +112,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import state as state_tool  # noqa: E402  — the ONLY writer, composed not duplicated
 import pipeline as pipeline_tool  # noqa: E402  — ceilings + report composed, not copied
 from _common import (  # noqa: E402
-    EXIT_FINDINGS, EXIT_OK, ToolError, emit, now_iso, run_cli,
+    EXIT_FINDINGS, EXIT_OK, ToolError, emit, now_iso, run_child, run_cli,
+    self_containment,
 )
 
 TOOL = "succession.py"
@@ -260,7 +261,10 @@ def _serve_start() -> bool:
     """Start ``glv serve`` detached (``-c/--max-concurrent``, default 6 —
     the run queue shared by every served agent). Returns True when the
     CLI exists and the process launched; the log lands in a temp file so
-    a failed start is diagnosable from the tool output."""
+    a failed start is diagnosable from the tool output. Deliberately NOT
+    scoped/contained (issue #74): the server must survive a run's memory
+    breach — bounding it is the server-side companion (glv#392); runs
+    bound themselves via migration.slice (tools/glv-subagents.md)."""
     cli = _glv_cli_path()
     if not cli:
         return False
@@ -318,17 +322,16 @@ def _mint_token_via_cli(name: str) -> str:
         raise ToolError("the glv CLI is not on PATH — `glv token create` "
                         "needs it", kind="io")
     try:
-        proc = subprocess.run(
-            [cli, "token", "create", "--name", name],
-            capture_output=True, text=True, timeout=60)
+        rc, out, err = run_child([cli, "token", "create", "--name", name],
+                                 timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
         raise ToolError(f"glv token create --name {name} failed to run: "
                         f"{e}", kind="io") from e
-    if proc.returncode != 0:
+    if rc != 0:
         raise ToolError(
-            f"glv token create --name {name} exited {proc.returncode}: "
-            f"{(proc.stderr or proc.stdout).strip()[:300]}", kind="io")
-    return _raw_token_from(proc.stdout, "glv token create")
+            f"glv token create --name {name} exited {rc}: "
+            f"{((err or '') + (out or '')).strip()[:300]}", kind="io")
+    return _raw_token_from(out, "glv token create")
 
 
 def _mint_token_via_loopback(base_url: str, name: str) -> str:
@@ -1422,6 +1425,7 @@ def cmd_chain(args) -> int:
              + f"; report: {report_path}")
     emit({"tool": TOOL, "version": VERSION, "file": str(path),
           "run_status": run_status,
+          "containment": self_containment(),
           "glv": transport.public(),
           "chain": chain_pub,
           "events": events, "report_path": str(report_path),
