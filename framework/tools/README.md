@@ -421,6 +421,17 @@ Uniform conventions (so the agent can compose the tools blind):
   bootstrap in #5), sorted iteration, no wall-clock in verdict fields.
   `oracle.py` emits a `verdicts_digest` — identical inputs+rules must give
   identical digests, which is what makes oracle runs diffable in review.
+- **Bounded parents (issue #75)**: `oracle.py` never materializes a corpus
+  — rows stream from disk and are judged in `--chunk-rows` chunks (one
+  child per side per chunk, each with its own `--timeout`, so a slow row
+  times out its chunk only), verdicts fold into counts/histograms/digests
+  as chunks complete, and only the first 500 run entries stay verbatim in
+  the payload (beyond that: verdict + detail + diff digest — the summary
+  numbers always cover every run). A pre-flight pass refuses a corpus
+  whose estimated footprint exceeds `--max-corpus-mb` (default 1024)
+  before any child is spawned; `--runs N` is the documented cap. Measured:
+  a 2.0 GB / 500k-row corpus judges end-to-end at 268 MB parent peak RSS
+  (the pre-streaming code peaked at 1.46 GB on a 350 MB corpus).
 
 Quick reference (see each script's docstring for the full input formats):
 
