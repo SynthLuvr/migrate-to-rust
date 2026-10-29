@@ -620,9 +620,8 @@ def test_verdict_payload_is_chunk_size_invariant(monkeypatch, capsys, tmp_path):
                           ["judge", "--manifest", str(manifest),
                            "--chunk-rows", chunk_rows])
         out.pop("generated_at")
-        # `resources` (issue #73) is observation, not verdict: peak RSS of
-        # whichever children happened to run varies with the chunking by
-        # design — the invariance contract covers the judgment itself
+        # resources.peak_rss_mb is observation, not verdict: it varies with
+        # which children ran; the invariance contract covers the judgment
         out.pop("resources")
         payloads.append(out)
     assert payloads[0] == payloads[1] == payloads[2]

@@ -533,7 +533,7 @@ def test_ensure_server_without_the_cli_is_an_environment_error(monkeypatch):
 def test_mint_token_cli_and_loopback_paths(monkeypatch):
     # CLI path: glv token create --name <label>, raw token parsed once.
     # (Popen is the interception seam since run_child session-leads its
-    # children to group-kill them on timeout — issue #73 fix 3.)
+    # children to group-kill them on timeout — issue #73.)
     monkeypatch.setattr(succession_tool, "_glv_cli_path",
                         lambda: "/usr/bin/glv")
     calls = []

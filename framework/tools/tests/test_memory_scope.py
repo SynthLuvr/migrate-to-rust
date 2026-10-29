@@ -128,11 +128,10 @@ def test_run_child_falls_back_unscoped_when_systemd_run_missing(monkeypatch):
 
 
 class _FakePopen:
-    """Deterministic subprocess.Popen stand-in recording every spawn; each
-    scripted result is a (returncode, stdout, stderr) triple the fake's
-    communicate() hands back. The seam moved from subprocess.run to Popen
-    when run_child started session-leading children to group-kill them on
-    timeout (issue #73 fix 3)."""
+    """Deterministic subprocess.Popen stand-in recording every spawn;
+    ``_FakePopen.results`` holds (returncode, stdout, stderr) triples that
+    communicate() hands back (a callable entry raises on spawn — the
+    spawn itself is the scripted failure)."""
 
     def __init__(self, cmd, **kwargs):
         _FakePopen.calls.append((list(cmd), kwargs))
@@ -396,11 +395,9 @@ def _wait_gone(pid: int, deadline_s: float = 10.0) -> bool:
 def test_run_child_timeout_kills_the_whole_process_group(tmp_path):
     """#73 fix 3, the parent half: a run_child timeout SIGKILLs the child
     SESSION, not just the direct pid — pre-fix, a grandchild blocked on an
-    inherited pipe survived the kill as an orphan holding RSS (the
-    overnight incident's family tree)."""
-    pytest.importorskip("time")
+    inherited pipe survived the kill as an orphan holding RSS."""
     grandchild = tmp_path / "grandchild.py"
-    grandchild.write_text(textwrap.dedent(f"""
+    grandchild.write_text(textwrap.dedent("""
         import os, time
         print(os.getpid(), flush=True)
         time.sleep(120)

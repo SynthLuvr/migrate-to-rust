@@ -233,17 +233,15 @@ def _scope_startup_failed(proc: subprocess.CompletedProcess) -> bool:
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
-    """SIGKILL the child's whole process group (issue #73 fix 3, the
-    parent half): every run_child child is a session leader
-    (``start_new_session``), so this reaps the entire subtree —
-    grandchildren a bare ``proc.kill()`` would orphan (a REPL child
-    blocked on stdin, a wrapper, a daemon). Best-effort by design: a
-    group that is already gone means the job is done."""
+    """SIGKILL the child's whole process group: run_child children are
+    session leaders, so this reaps the entire subtree — grandchildren a
+    bare ``proc.kill()`` would orphan (issue #73). Best-effort: a group
+    that is already gone means the job is done."""
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
+    except OSError:
         try:
-            proc.kill()  # group unkillable (gone / not ours): direct child
+            proc.kill()  # group gone or unkillable: the direct child
         except OSError:
             pass
 
@@ -274,11 +272,11 @@ def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,
     Returns (returncode, stdout, stderr).
 
     Every child runs as its own session leader and a timeout (or an
-    aborting exception) SIGKILLs its whole process group (issue #73 fix
-    3): children can never outlive this parent as orphans — the judge
-    REPL children blocked forever on stdin while holding gigabytes of
-    RSS were exactly that. TimeoutExpired is raised as before, now with
-    the group reaped first.
+    aborting exception) SIGKILLs its whole process group, so no child
+    can outlive this parent as an orphan (issue #73: judge REPL
+    grandchildren stayed blocked on stdin, holding RSS, after their
+    judge was reaped). TimeoutExpired is raised as before, with the
+    group reaped first.
 
     `mem_limit_mb` (issue #74) runs the child inside its own systemd user
     scope (see scope_argv) so a memory breach kills that child alone
@@ -296,12 +294,8 @@ def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,
         env.update(env_extra)
 
     def spawn(argv: list[str]) -> subprocess.CompletedProcess:
-        # Every child leads its own session (setsid), so the group-kill
-        # below can reap its whole subtree: a timed-out (or aborted) run
-        # leaves no orphaned children behind — issue #73's REPL children
-        # were blocked forever on stdin after their judge was reaped.
-        # Same capture/timeout/CompletedProcess contract as the previous
-        # subprocess.run implementation.
+        # start_new_session: the child leads its own process group, so the
+        # timeout path below can kill the whole subtree, not just this pid
         with subprocess.Popen(
                 argv, cwd=cwd, env=env, text=True,
                 stdin=subprocess.PIPE if input_text is not None else None,
@@ -311,7 +305,7 @@ def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,
                 out, err = proc.communicate(input=input_text,
                                             timeout=timeout)
             except subprocess.TimeoutExpired as exc:
-                _kill_process_group(proc)  # the whole subtree, not just pid
+                _kill_process_group(proc)
                 exc.stdout, exc.stderr = proc.communicate()
                 raise
             except BaseException:  # KeyboardInterrupt &c.: no orphans
