@@ -126,21 +126,21 @@ def test_resolve_k_is_pure_policy_size_and_budget_driven():
     unit = {"id": "u-x", "python_path": "src/x.py"}
     fresh = {"units": [dict(unit, budget={"tokens_spent": 0})]}
 
-    small = pipeline_tool.resolve_k(fresh, unit, policy, unit_loc=10)
+    small = pipeline_tool.resolve_k(fresh, policy, unit_loc=10)
     assert small["k"] == 3 and small["rounds_as_candidates"] is False
     assert any("<= size_threshold_loc" in b for b in small["basis"])
 
-    large = pipeline_tool.resolve_k(fresh, unit, policy, unit_loc=10_000)
+    large = pipeline_tool.resolve_k(fresh, policy, unit_loc=10_000)
     assert large["k"] == 1 and large["rounds_as_candidates"] is True
     assert any("> size_threshold_loc" in b for b in large["basis"])
 
-    unknown = pipeline_tool.resolve_k(fresh, unit, policy, unit_loc=None)
+    unknown = pipeline_tool.resolve_k(fresh, policy, unit_loc=None)
     assert unknown["k"] == 3 and unknown["inputs"]["unit_loc"] is None
     assert any("unknown" in b for b in unknown["basis"])
 
     spent = {"units": [dict(unit, budget={"tokens_spent": 900})],
              "autonomy": {"budget": {"max_tokens": 1000}}}
-    floored = pipeline_tool.resolve_k(spent, unit, policy, unit_loc=10)
+    floored = pipeline_tool.resolve_k(spent, policy, unit_loc=10)
     assert floored["k"] == 1            # a 10-LOC unit still drops under the floor
     assert floored["inputs"]["remaining_fraction"] == 0.1
     assert floored["inputs"]["budget_floor_fraction"] == 0.25

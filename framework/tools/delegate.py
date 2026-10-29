@@ -232,8 +232,8 @@ def _resolve_k(args, state: dict, unit: dict, target_root: Path,
     decision. --only restarts (issue #25) may widen a policy K back to the
     prior run's candidate count; that widening is recorded, not silent."""
     policy = pipeline_tool.load_policy()
-    decision = pipeline_tool.resolve_k(state, unit, policy,
-                                       unit_loc=_unit_loc(unit, target_root))
+    decision = pipeline_tool.resolve_k(
+        state, policy, unit_loc=_unit_loc(unit, target_root))
     k, source = decision["k"], "policy"
     if args.k is not None:
         source = "flag override"
@@ -244,14 +244,16 @@ def _resolve_k(args, state: dict, unit: dict, target_root: Path,
                 f"operator override, journaled here")
         k = args.k
     elif only:
-        need = max(int(c[1:]) for c in only if c.startswith("c") and c[1:].isdigit())
+        need = max(int(c[1:]) for c in only
+                   if c.startswith("c") and c[1:].isdigit())
         if need > k:
             decision["restart_widening"] = (
                 f"--only restart covers c1..c{need} from the prior run's "
                 f"schedule; policy K={k} widened to {need} — recorded, "
                 f"not silent")
             k = need
-    decision |= {"k_used": k, "source": source}
+    decision["k_used"] = k
+    decision["source"] = source
     return k, decision
 
 
@@ -847,20 +849,19 @@ def _rank(cands: list[dict]) -> list[dict]:
 
 
 def _table(unit_id: str, ranked: list[dict], winner: dict | None,
-           k_policy: dict | None = None) -> str:
-    lines = [f"{unit_id}: {len(ranked)} candidate(s) — compile gates, then "
+           k_policy: dict) -> str:
+    head = (f"K={k_policy['k_used']} per {k_policy['citation']}: "
+            + "; ".join(k_policy["basis"]))
+    if k_policy.get("rounds_as_candidates"):
+        head += ("; repair rounds count as candidates — the oracle ranks "
+                 "the round outputs, not the model")
+    if k_policy.get("deviation"):
+        head += f" | DEVIATION: {k_policy['deviation']}"
+    if k_policy.get("restart_widening"):
+        head += f" | restart: {k_policy['restart_widening']}"
+    lines = [head,
+             f"{unit_id}: {len(ranked)} candidate(s) — compile gates, then "
              f"oracle ranking (the oracle ranks, not the model)"]
-    if k_policy is not None:
-        head = f"K={k_policy['k_used']} per {k_policy['citation']}: " + \
-            "; ".join(k_policy["basis"])
-        if k_policy.get("rounds_as_candidates"):
-            head += ("; repair rounds count as candidates — the oracle ranks "
-                     "the round outputs, not the model")
-        if k_policy.get("deviation"):
-            head += f" | DEVIATION: {k_policy['deviation']}"
-        if k_policy.get("restart_widening"):
-            head += f" | restart: {k_policy['restart_widening']}"
-        lines.insert(0, head)
     for c in ranked:
         j = c.get("judge") or {}
         if not c["gate_green"]:
@@ -889,7 +890,7 @@ def _table(unit_id: str, ranked: list[dict], winner: dict | None,
 
 
 def _state_commands(unit_id: str, winner: dict | None,
-                    state_path: Path, k_policy: dict | None = None) -> list[str]:
+                    state_path: Path, k_policy: dict) -> list[str]:
     """The exact commands the orchestrator runs to record the pack (this
     tool stays read-only on the state file — role separation)."""
 
@@ -902,28 +903,22 @@ def _state_commands(unit_id: str, winner: dict | None,
                 f"--unit {unit_id} --status {status} "
                 f"--note {shlex.quote(note)}")
 
-    k_note = ""
-    if k_policy is not None:
-        # issue #59: the K decision rides the journal as a policy id, never
-        # as prose ("budget-driven deviation") the next run re-improvises
-        k_note = (f" [K={k_policy['k_used']} per {k_policy['citation']}: "
-                  f"{'; '.join(k_policy['basis'])}]")
-        if k_policy.get("deviation"):
-            k_note += f" [{k_policy['deviation']}]"
+    # issue #59: the K decision rides the journal as a policy id, never as
+    # prose — a "budget-driven deviation" note is what the next run would
+    # re-improvise
+    k_note = (f" [K={k_policy['k_used']} per {k_policy['citation']}: "
+              f"{'; '.join(k_policy['basis'])}]")
+    if k_policy.get("deviation"):
+        k_note += f" [{k_policy['deviation']}]"
 
+    cmds = [set_cmd(f"units[{unit_id}].k={k_policy['k_used']}")]
     if winner is None:
-        cmds = []
-        if k_policy is not None:
-            cmds.append(set_cmd(f"units[{unit_id}].k={k_policy['k_used']}"))
         cmds.append(mark_cmd("escalated",
                              "delegate.py: no gate-green candidate after "
                              f"bounded rounds{k_note}"))
         return cmds
     j = winner.get("judge") or {}
     counts = j.get("counts") or {}
-    cmds = []
-    if k_policy is not None:
-        cmds.append(set_cmd(f"units[{unit_id}].k={k_policy['k_used']}"))
     if counts:
         parity = {"runs": j.get("total", 0),
                   "equivalent": counts.get("equivalent", 0),
@@ -978,8 +973,8 @@ def _resolve_manifest(args, state_path: Path) -> Path | None:
 def _emit_dry_run(args, plan: list[dict], gates: list[str],
                   contract: Path | None, contract_note: str,
                   target_root: Path, import_allow: set[str],
-                  cargo_note: str | None, k_policy: dict | None = None) -> int:
-    human = (f"dry-run: {args.unit} k={args.k} ({k_policy['citation'] if k_policy else '?'}) "
+                  cargo_note: str | None, k_policy: dict) -> int:
+    human = (f"dry-run: {args.unit} k={args.k} ({k_policy['citation']}) "
              f"max_rounds={args.max_rounds} "
              f"gates={len(gates) + 1} target={target_root} — no agent, "
              f"no writes")
@@ -1112,7 +1107,6 @@ def cmd_run_candidates(args) -> int:
     only = [c.strip() for c in args.only.split(",")] if args.only else None
     args.k, k_policy = _resolve_k(args, state, unit, target_root, only)
     plan = _candidate_plan(state_path, unit, target_root, args.k, only)
-
     contract, contract_note = _contract_path(args, state_path)
     gates = args.gate or DEFAULT_GATES
     _validate_usage(args)

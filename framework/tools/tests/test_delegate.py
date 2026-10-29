@@ -216,7 +216,7 @@ def test_end_to_end_scaffold_to_verdict_pack(monkeypatch, capsys, tmp_path):
     cmds = out["state_commands"]
     assert any("parity=" in c for c in cmds)
     assert any("--status ported" in c for c in cmds)
-    assert any("units[u-foo].k=3" in c for c in cmds)   # issue #59: K recorded
+    assert any("units[u-foo].k=3" in c for c in cmds)
     state_py = str(TOOLS / "state.py")
     for c in cmds:
         argv = shlex.split(c)
@@ -230,7 +230,7 @@ def test_end_to_end_scaffold_to_verdict_pack(monkeypatch, capsys, tmp_path):
     assert unit["parity"]["last_verdict"] == "equivalent"
     assert unit["parity"]["equivalent"] == unit["parity"]["runs"]
     assert unit["rust_path"].endswith("u_foo_c1.rs")
-    assert unit["k"] == 3              # issue #59: the policy K, recorded
+    assert unit["k"] == 3
 
 
 def test_divergent_winner_is_findings_and_suggests_escalation(

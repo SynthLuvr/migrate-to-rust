@@ -203,31 +203,39 @@ def _policy_structure_errors(policy: dict) -> list[str]:
                                         or max_chain_depth < 1):
         errors.append("budget.max_chain_depth: integer >= 1 required "
                       "(the successor-chain depth cap, issue #25)")
+    errors.extend(_candidates_errors(policy))
+    return errors
+
+
+def _candidates_errors(policy: dict) -> list[str]:
+    """Issue #59 — the K schedule, validated like every other policy block:
+    without it (or with garbage params) a policy must not load, or K
+    silently falls back to orchestrator judgment again."""
     candidates = policy.get("candidates")
     if not isinstance(candidates, dict):
-        errors.append("candidates: object required — K is policy, not judgment "
-                      "(issue #59); without the schedule every run re-improvises "
-                      "the K-vs-budget tradeoff")
-    else:
-        cid = candidates.get("id")
-        if not isinstance(cid, str) or not re.fullmatch(r"[A-Z]+-\d+", cid or ""):
-            errors.append(f"candidates.id {cid!r}: must match <AREA>-<number> "
-                          f"(e.g. CAND-1) — journal/pack citations are "
-                          f"'policy:<id>'")
-        for key in ("k_small_unit", "k_large_unit"):
-            v = candidates.get(key)
-            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
-                errors.append(f"candidates.{key}: integer >= 1 required")
-        v = candidates.get("size_threshold_loc")
+        return ["candidates: object required — K is policy, not judgment "
+                "(issue #59); without the schedule every run re-improvises "
+                "the K-vs-budget tradeoff"]
+    errors: list[str] = []
+    cid = candidates.get("id")
+    if not isinstance(cid, str) or not re.fullmatch(r"[A-Z]+-\d+", cid or ""):
+        errors.append(f"candidates.id {cid!r}: must match <AREA>-<number> "
+                      f"(e.g. CAND-1) — journal/pack citations are "
+                      f"'policy:<id>'")
+    for key in ("k_small_unit", "k_large_unit"):
+        v = candidates.get(key)
         if not isinstance(v, int) or isinstance(v, bool) or v < 1:
-            errors.append("candidates.size_threshold_loc: integer >= 1 required "
-                          "(unit size in non-blank Python LOC)")
-        frac = candidates.get("budget_floor_fraction")
-        if not isinstance(frac, (int, float)) or isinstance(frac, bool) \
-                or not 0 < frac <= 1:
-            errors.append("candidates.budget_floor_fraction: number in (0, 1] "
-                          "required (the run-budget-remaining fraction under "
-                          "which K drops to k_large_unit)")
+            errors.append(f"candidates.{key}: integer >= 1 required")
+    v = candidates.get("size_threshold_loc")
+    if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+        errors.append("candidates.size_threshold_loc: integer >= 1 required "
+                      "(unit size in non-blank Python LOC)")
+    frac = candidates.get("budget_floor_fraction")
+    if not isinstance(frac, (int, float)) or isinstance(frac, bool) \
+            or not 0 < frac <= 1:
+        errors.append("candidates.budget_floor_fraction: number in (0, 1] "
+                      "required (the run-budget-remaining fraction under "
+                      "which K drops to k_large_unit)")
     return errors
 
 
@@ -250,8 +258,15 @@ def rule_for(policy: dict, gate: str) -> dict | None:
                  if isinstance(r, dict) and r.get("gate") == gate), None)
 
 
-def resolve_k(state: dict, unit: dict, policy: dict,
-              unit_loc: int | None = None) -> dict:
+def _run_token_ceiling(state: dict, policy: dict):
+    """The run-level token ceiling: the state's autonomy budget overrides
+    the policy default. Unvalidated on purpose — callers treat junk as
+    'no ceiling'."""
+    autonomy = (state.get("autonomy") or {}).get("budget") or {}
+    return autonomy.get("max_tokens") or (policy.get("budget") or {}).get("max_tokens")
+
+
+def resolve_k(state: dict, policy: dict, unit_loc: int | None = None) -> dict:
     """K is policy, not judgment (issue #59): resolve a unit's candidate
     count from policy.json's 'candidates' schedule (id CAND-1) — K=3 below
     the size threshold, K=1 + bounded repair rounds above it or under the
@@ -269,8 +284,7 @@ def resolve_k(state: dict, unit: dict, policy: dict,
     citation = f"policy:{cand.get('id', 'CAND-1')}"
 
     spent = tokens_spent(state)
-    ceiling = ((state.get("autonomy") or {}).get("budget") or {}) \
-        .get("max_tokens") or (policy.get("budget") or {}).get("max_tokens")
+    ceiling = _run_token_ceiling(state, policy)
     remaining = None
     if isinstance(ceiling, int) and ceiling > 0:
         remaining = (ceiling - spent) / ceiling
@@ -280,20 +294,20 @@ def resolve_k(state: dict, unit: dict, policy: dict,
                                      if remaining is not None else None),
               "budget_floor_fraction": floor}
 
+    k_large_basis = (f"K={k_large} + bounded repair rounds (MAX_ROUNDS) as "
+                     f"the candidate pool")
     if remaining is not None and remaining < floor:
         k, basis = k_large, [
             f"run budget remaining {remaining:.0%} < floor {floor:.0%} — "
-            f"K={k_large} + bounded repair rounds (MAX_ROUNDS) as the "
-            f"candidate pool"]
+            + k_large_basis]
     elif unit_loc is None:
         k, basis = k_small, [
-            "unit size unknown (python_path unreadable/missing) — K="
-            f"{k_small}, the small-unit default; not a judgment call"]
+            f"unit size unknown (python_path unreadable/missing) — K={k_small}, "
+            f"the small-unit default; not a judgment call"]
     elif unit_loc > threshold:
         k, basis = k_large, [
             f"unit_loc {unit_loc} > size_threshold_loc {threshold} — "
-            f"K={k_large} + bounded repair rounds (MAX_ROUNDS) as the "
-            f"candidate pool"]
+            + k_large_basis]
     else:
         k, basis = k_small, [
             f"unit_loc {unit_loc} <= size_threshold_loc {threshold} — cheap "
