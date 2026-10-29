@@ -968,3 +968,45 @@ def test_int_float_distinction_survives_the_adapter(monkeypatch, capsys, tmp_pat
         adapter.run({"n": 1.0})
     # module envelope: the judged function's result under its own key
     assert adapter.run({"n": 21}) == {"twice": 42}
+
+
+def test_dataclass_decorator_with_arguments_is_recognized():
+    """`@dataclass(frozen=True, slots=True)` — the argument-carrying form —
+    must count as a dataclass decorator. Found porting a target whose
+    house style is exactly that; the bare-name check bailed every unit to
+    hand-completion (framework fix during the wicksmith run, 2026-10-29)."""
+    import ast
+    import importlib.util
+    from pathlib import Path as _Path
+
+    tool_path = _Path(__file__).resolve().parent.parent / "scaffold.py"
+    spec = importlib.util.spec_from_file_location("scaffold_tool", tool_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    source = (
+        "from dataclasses import dataclass\n"
+        "@dataclass(frozen=True, slots=True)\n"
+        "class Bar:\n"
+        "    date: str\n"
+        "    close: float\n"
+        "@dataclass\n"
+        "class Plain:\n"
+        "    x: int\n"
+        "class NotOne:\n"
+        "    pass\n"
+    )
+    decorated = {}
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.ClassDef):
+            decorated[node.name] = any(
+                mod._is_dataclass_decorator(dec) for dec in node.decorator_list
+            )
+    assert decorated == {
+        "Bar": True,       # @dataclass(frozen=True, slots=True)
+        "Plain": True,     # bare @dataclass (existing behavior)
+        "NotOne": False,   # no decorator at all
+    }
+    # An ALIASED argument-carrying import (`import dataclass as dc`) is not
+    # recognized by name — it conservatively flags for hand-completion
+    # (never guessed), which is the safe direction; not a regression.
