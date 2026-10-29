@@ -21,7 +21,9 @@
 #     python framework/tools/pipeline.py run <state.json> --agent-cmd '...'
 #
 # Tune the numbers to the host (this file ships 6G/8G for the 15 GiB dev
-# host from #73; policy-owned defaults are issue #76).
+# host from #73; the policy-owned default — autonomy/policy.json 'memory'
+# .run_scope_mb, policy:MEM-1, issue #76 — is 8192 MB = MemoryMax=8G;
+# MemoryHigh is the reclaim throttle below it).
 [Slice]
 MemoryHigh=6G
 MemoryMax=8G

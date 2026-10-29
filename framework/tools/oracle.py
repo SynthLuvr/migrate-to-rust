@@ -57,9 +57,10 @@ holding RSS. Child side: a ppid watchdog (0.5 s interval timer, so it
 fires even while blocked in a read) exits the child if its judge dies;
 ``gc.collect()`` runs every ``GC_EVERY_N_ROWS`` rows so reference cycles
 in judged code cannot grow peak RSS unbounded; and judge/corpus bound
-each child to ``--mem-limit-mb`` (default 2048 MB cgroup MemoryMax, ``0``
-disables) so a leaking side fails ITS judgment loudly (setup_error →
-INCOMPARABLE) instead of the host. Each side's peak RSS lands in the
+each child to ``--mem-limit-mb`` (default: the ``memory`` block of
+``autonomy/policy.json`` — ``policy:MEM-1``, 2048 MB cgroup MemoryMax;
+``0`` disables) so a leaking side fails ITS judgment loudly (setup_error
+→ INCOMPARABLE) instead of the host. Each side's peak RSS lands in the
 verdict payload's ``resources.peak_rss_mb``.
 
 **Streaming and chunking (issue #75)** — the parent judges the corpus in
@@ -76,8 +77,9 @@ always cover every run. A **pre-flight pass** stream-counts rows and
 bytes (the file is parsed again only when judging) and refuses, in the
 standard error envelope and before any child is spawned, a corpus whose
 estimated parent footprint (``bytes × 4``) exceeds ``--max-corpus-mb``
-(default 1024); cap the judged rows with ``--runs`` or raise the budget
-with ``--max-corpus-mb`` (budgets become policy-driven in #76).
+(default: ``policy.json`` ``memory.max_corpus_mb``, 1024 MB — issue #76);
+cap the judged rows with ``--runs`` or raise the budget with
+``--max-corpus-mb``.
 
 Outputs must be JSON-serializable; sets and other exotic values make the run
 *Incomparable* (the honest verdict — units returning sets must expose a
@@ -160,6 +162,7 @@ from _common import (  # noqa: E402
     EXIT_FINDINGS, EXIT_INCOMPARABLE, EXIT_OK, EXIT_SETUP, ToolError, emit,
     read_json, run_child, run_cli, sha256_bytes,
 )
+import pipeline as pipeline_tool  # noqa: E402  — memory is policy (issue #76)
 
 TOOL = "oracle.py"
 VERSION = 1
@@ -181,13 +184,15 @@ DEFAULT_CHUNK_ROWS = 500
 GC_EVERY_N_ROWS = 64
 
 #: per-child cgroup memory ceiling in MB for judge/corpus REPL children:
-#: a leak must fail THAT judgment (scope breach -> SIGKILL ->
-#: setup_error -> INCOMPARABLE), never the host. ``--mem-limit-mb 0``
-#: opts out (policy defaults are #76)
+#: the default is policy.json memory.judge_child_mb (policy:MEM-1, issue
+#: #76); this constant is the fallback quoted in --help. A leak must fail
+#: THAT judgment (scope breach -> SIGKILL -> setup_error -> INCOMPARABLE),
+#: never the host. ``--mem-limit-mb 0`` opts out
 DEFAULT_MEM_LIMIT_MB = 2048
 
-#: refuse, before any child is spawned, a corpus whose estimated parent
-#: footprint exceeds this many MB (0 disables); see _check_corpus_budget
+#: pre-flight corpus budget in MB — the default is policy.json
+#: memory.max_corpus_mb (issue #76); this constant is the fallback quoted
+#: in --help; see _check_corpus_budget
 DEFAULT_MAX_CORPUS_MB = 1024
 CORPUS_FOOTPRINT_FACTOR = 4.0
 #: run entries kept verbatim in the verdict payload; later entries are
@@ -195,6 +200,53 @@ CORPUS_FOOTPRINT_FACTOR = 4.0
 RETAIN_VERBATIM_RUNS = 500
 #: per-row status entries kept verbatim by the corpus dry-run
 RETAIN_VERBATIM_ROWS = 500
+
+
+def _memory_limits(mem_limit_mb: int | None, max_corpus_mb: int | None,
+                   policy_path: str | None = None) -> tuple[dict, int, int]:
+    """Resolve this run's memory budgets from policy (issue #76): the
+    judge-child ceiling and the corpus pre-flight budget default to
+    policy.json 'memory' (policy:MEM-1); an explicit flag value is an
+    operator override journaled in the decision's deviations, and 0
+    disables that bound. Returns (decision, mem_limit, max_corpus_mb) —
+    mem_limit None = children unscoped, max_corpus_mb 0 = check off."""
+    decision = pipeline_tool.resolve_memory(
+        pipeline_tool.load_policy(policy_path))
+    limits = decision["limits"]
+
+    def apply(flag, key, disable_note):
+        if flag is None:            # absent: the policy ceiling stands
+            return
+        if flag == 0:
+            limits[key] = 0
+            decision.setdefault("deviations", []).append(disable_note)
+        elif flag != limits[key]:
+            decision.setdefault("deviations", []).append(
+                f"operator override: {key}={flag} (policy said "
+                f"{limits[key]}) — journaled, never a judgment call")
+            limits[key] = flag
+
+    apply(mem_limit_mb, "judge_child_mb",
+          "operator override: judge children unscoped (--mem-limit-mb 0)")
+    apply(max_corpus_mb, "max_corpus_mb",
+          "operator override: corpus pre-flight check off (--max-corpus-mb 0)")
+    return (decision, limits["judge_child_mb"] or None,
+            int(limits["max_corpus_mb"] or 0))
+
+
+def _resources_block(memory: dict, mem_limit: int | None,
+                     peak_rss_mb) -> dict:
+    """The verdict payload's resources block: the ceiling in force and its
+    provenance (issue #76), the GC cadence, and the caller's peak-RSS
+    shape (per side for judge, a single value for corpus dry-run)."""
+    return {
+        "mem_limit_mb": mem_limit,
+        "mem_limit_decided_by": memory["decided_by"],
+        "mem_limit_deviations": memory.get("deviations"),
+        "max_corpus_mb": int(memory["limits"]["max_corpus_mb"] or 0) or None,
+        "gc_every_rows": GC_EVERY_N_ROWS,
+        "peak_rss_mb": peak_rss_mb,
+    }
 
 # ---------------------------------------------------------------- rules ----
 
@@ -1016,8 +1068,7 @@ def _check_corpus_budget(path: Path, rows: int, size_bytes: int,
             f"footprint (x{CORPUS_FOOTPRINT_FACTOR:g} byte factor) "
             f"exceeds the {max_corpus_mb} MB budget (issue #75) — "
             "cap the judged rows with --runs N or raise the budget "
-            "with --max-corpus-mb (the budget becomes policy-driven "
-            "in #76)"
+            "with --max-corpus-mb (policy:MEM-1, issue #76)"
         )
 
 
@@ -1054,14 +1105,14 @@ def cmd_judge(args) -> int:
         corpus_path = manifest_path.parent / corpus_path
     rules = merge_rules(manifest)
 
+    memory, mem_limit, max_corpus_mb = _memory_limits(
+        args.mem_limit_mb, args.max_corpus_mb)
     # refusals (empty · pre-wrapped · over-budget) fire before any spawn;
     # a slow row times out its chunk only, every other chunk still judges
     scan, judged, rows = _open_corpus(corpus_path, runs=args.runs,
-                                      max_corpus_mb=args.max_corpus_mb)
-    # judged code is untrusted for memory: bound every child by default so
-    # a leaking side fails its own judgment (setup_error -> INCOMPARABLE),
-    # not the host; ``--mem-limit-mb 0`` opts out explicitly
-    mem_limit = args.mem_limit_mb or None
+                                      max_corpus_mb=max_corpus_mb)
+    # judged code is untrusted for memory: a leaking side must fail its
+    # own judgment (setup_error -> INCOMPARABLE), never the host
     fold = _RunFold()
     ref = _SideRunner(manifest["reference"]["entry"], manifest_path.parent,
                       args.timeout, mem_limit)
@@ -1073,6 +1124,15 @@ def cmd_judge(args) -> int:
         for (i, _value), ref_rec, cand_rec in zip(chunk, ref_recs, cand_recs):
             fold.add(classify_pair(i, ref_rec, cand_rec, rules), ref_rec=ref_rec)
 
+    resources = _resources_block(
+        memory, mem_limit,
+        {"reference": _peak_rss_mb(ref.peak_rss_kb),
+         "candidate": _peak_rss_mb(cand.peak_rss_kb)})
+    # a side's terminal setup error names a memcg-killed child — the
+    # breach signal delegate.py journals per unit (issue #76)
+    resources["side_terminal_errors"] = {"reference": ref.terminal_error,
+                                         "candidate": cand.terminal_error}
+
     return _emit_runs_verdicts(
         unit=manifest.get("unit"), fold=fold, rules=rules,
         runs_requested=judged, corpus_path=corpus_path,
@@ -1083,14 +1143,7 @@ def cmd_judge(args) -> int:
             "candidate_entry": manifest["candidate"]["entry"],
             # observability: None = no child self-reported (zero rows
             # judged, or faked children in tests)
-            "resources": {
-                "mem_limit_mb": mem_limit,
-                "gc_every_rows": GC_EVERY_N_ROWS,
-                "peak_rss_mb": {
-                    "reference": _peak_rss_mb(ref.peak_rss_kb),
-                    "candidate": _peak_rss_mb(cand.peak_rss_kb),
-                },
-            },
+            "resources": resources,
         }, human_flag=args.human)
 
 
@@ -1143,9 +1196,10 @@ def cmd_corpus(args) -> int:
     malformed corpus shows up as a wall of identical errors here, not as
     a hollow all-EQUIVALENT verdict from the judge."""
     corpus_path = Path(args.validate).resolve()
+    memory, mem_limit, max_corpus_mb = _memory_limits(
+        args.mem_limit_mb, args.max_corpus_mb)
     scan, total, rows = _open_corpus(corpus_path, runs=args.runs,
-                                     max_corpus_mb=args.max_corpus_mb)
-    mem_limit = args.mem_limit_mb or None  # 0 disables scoping
+                                     max_corpus_mb=max_corpus_mb)
     side = _SideRunner(args.entry, corpus_path.parent, args.timeout,
                        mem_limit)
     kept_rows, rows_truncated, counts, ref_ok, first_setup = _fold_dry_run(
@@ -1209,11 +1263,8 @@ def cmd_corpus(args) -> int:
         payload["rows_truncated"] = rows_truncated
     # the dry-run side's peak RSS, same self-report the judge folds into
     # its verdict payload
-    payload["resources"] = {
-        "mem_limit_mb": mem_limit,
-        "gc_every_rows": GC_EVERY_N_ROWS,
-        "peak_rss_mb": _peak_rss_mb(side.peak_rss_kb),
-    }
+    payload["resources"] = _resources_block(
+        memory, mem_limit, _peak_rss_mb(side.peak_rss_kb))
     emit(payload, human_flag=args.human)
     return code
 
@@ -1500,23 +1551,30 @@ def main(argv=None) -> int:
                         f"never materializes the corpus, the stdin framing, "
                         f"or the full record set, and each chunk gets its own "
                         f"--timeout (default {DEFAULT_CHUNK_ROWS})")
-    p.add_argument("--max-corpus-mb", type=int, default=DEFAULT_MAX_CORPUS_MB,
+    p.add_argument("--max-corpus-mb", type=int, default=None,
                    help=f"refuse — before any child is spawned — a corpus "
                         f"whose estimated parent footprint (bytes x "
                         f"{CORPUS_FOOTPRINT_FACTOR:g}) exceeds this many MB "
                         f"(issue #75); an explicit --runs cap scales the "
                         f"estimate and is the documented repair, and 0 "
-                        f"disables the check. Becomes policy-driven in #76 "
-                        f"(default {DEFAULT_MAX_CORPUS_MB})")
-    p.add_argument("--mem-limit-mb", type=int, default=DEFAULT_MEM_LIMIT_MB,
-                   help=f"per-child cgroup memory ceiling in MB (#73/#74): "
-                        f"each reference/candidate child runs in its own "
+                        f"disables the check. DEFAULT (issue #76): the "
+                        f"'memory' block of autonomy/policy.json "
+                        f"(policy:MEM-1, max_corpus_mb; fallback "
+                        f"{DEFAULT_MAX_CORPUS_MB}); an explicit value is an "
+                        f"operator override journaled in resources as a "
+                        f"deviation")
+    p.add_argument("--mem-limit-mb", type=int, default=None,
+                   help=f"per-child cgroup memory ceiling in MB: each "
+                        f"reference/candidate child runs in its own "
                         f"systemd-run user scope (cgroup-v2 MemoryMax, "
                         f"MemorySwapMax=0), so a ballooning child is killed "
                         f"alone (SIGKILL -> 137) and judged setup_error -> "
-                        f"incomparable — not a host-wide OOM. Judged code is "
-                        f"untrusted for memory, hence the bounded default "
-                        f"{DEFAULT_MEM_LIMIT_MB}; 0 disables. Falls back to "
+                        f"incomparable — not a host-wide OOM. DEFAULT "
+                        f"(issue #76): the 'memory' block of "
+                        f"autonomy/policy.json (policy:MEM-1, judge_child_mb; "
+                        f"fallback {DEFAULT_MEM_LIMIT_MB}); an explicit value "
+                        f"is an operator override journaled in resources as "
+                        f"a deviation, 0 disables. Falls back to "
                         f"unscoped with a stderr warning when systemd-run "
                         f"is unavailable")
     p.set_defaults(func=cmd_judge)
@@ -1540,16 +1598,17 @@ def main(argv=None) -> int:
     p.add_argument("--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS,
                    help=f"corpus rows per child chunk (issue #75) — same "
                         f"streaming shape as judge (default {DEFAULT_CHUNK_ROWS})")
-    p.add_argument("--max-corpus-mb", type=int, default=DEFAULT_MAX_CORPUS_MB,
+    p.add_argument("--max-corpus-mb", type=int, default=None,
                    help=f"pre-flight corpus budget in MB, same refusal as "
-                        f"judge (issue #75; 0 disables the check; default "
-                        f"{DEFAULT_MAX_CORPUS_MB})")
-    p.add_argument("--mem-limit-mb", type=int, default=DEFAULT_MEM_LIMIT_MB,
-                   help=f"per-child cgroup memory ceiling in MB (#73/#74) — "
-                        f"same scoping as judge children, bounded by "
-                        f"default; a breach shows as a setup error row, not "
-                        f"a host OOM (default {DEFAULT_MEM_LIMIT_MB}; "
-                        f"0 disables)")
+                        f"judge (issue #75; 0 disables the check) — DEFAULT "
+                        f"(issue #76): policy.json 'memory'.max_corpus_mb "
+                        f"(policy:MEM-1; fallback {DEFAULT_MAX_CORPUS_MB})")
+    p.add_argument("--mem-limit-mb", type=int, default=None,
+                   help=f"per-child cgroup memory ceiling in MB — same "
+                        f"scoping as judge children (policy.json 'memory' "
+                        f"judge_child_mb, policy:MEM-1, issue #76; fallback "
+                        f"{DEFAULT_MEM_LIMIT_MB}); a breach shows as a setup "
+                        f"error row, not a host OOM; 0 disables")
     p.set_defaults(func=cmd_corpus)
 
     p = sub.add_parser("compare", help="classify pre-captured runs (shadow mode)")

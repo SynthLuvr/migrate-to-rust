@@ -61,6 +61,7 @@
       "budget": {
         "max_rounds": 5,
         "tokens_spent": 41000,
+        "max_rss_mb": 4096,
         "exhausted": false
       },
       "attribution": {
@@ -125,6 +126,7 @@
       "budget": {
         "max_rounds": 5,
         "tokens_spent": 118000,
+        "max_rss_mb": 4096,
         "exhausted": true
       },
       "attribution": {

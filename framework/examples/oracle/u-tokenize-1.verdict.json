@@ -81,5 +81,20 @@
   "manifest": "framework/examples/oracle/manifests/u-tokenize-1.json",
   "reference_entry": "reference_tokenizer:run",
   "candidate_entry": "candidate_wheel:run",
+  "resources": {
+    "mem_limit_mb": 2048,
+    "mem_limit_decided_by": "policy:MEM-1",
+    "mem_limit_deviations": null,
+    "max_corpus_mb": 1024,
+    "gc_every_rows": 64,
+    "peak_rss_mb": {
+      "reference": 46.5,
+      "candidate": 52.2
+    },
+    "side_terminal_errors": {
+      "reference": null,
+      "candidate": null
+    }
+  },
   "generated_at": "2026-10-27T19:16:16Z"
 }

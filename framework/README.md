@@ -52,8 +52,11 @@ not in the repo being migrated.
    ```
 
    Per-child ceilings (judge children, gates, delegate agents, stage
-   workers) are also available without the slice via `--mem-limit-mb` /
-   `--agent-mem-limit-mb` — details and breach semantics in
+   workers) are policy-resolved since issue #76 — the `memory` block of
+   `autonomy/policy.json` (`policy:MEM-1`) is the DEFAULT of
+   `--mem-limit-mb` / `--agent-mem-limit-mb` (judge children 2048 MB,
+   toolchain children 4096 MB; a breach is a journaled ESC-1 unit
+   escalation, never a service crash) — details and breach semantics in
    [`tools/glv-subagents.md`](tools/glv-subagents.md) § *Memory
    containment*.
 

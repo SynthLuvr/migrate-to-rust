@@ -151,6 +151,91 @@ def test_resolve_k_is_pure_policy_size_and_budget_driven():
         assert d["policy_version"]          # journaled with every decision
 
 
+def test_policy_memory_block_is_required_and_validated(tmp_path):
+    """Issue #76: memory is a first-class policy budget — a policy without
+    the block (or with garbage ceilings) must not load, or the one
+    unbounded resource behind #73 falls back to improvised flags again."""
+    policy = pipeline_tool.load_policy()
+    assert policy["memory"]["id"] == "MEM-1"
+    for key in ("judge_child_mb", "gate_child_mb", "run_scope_mb",
+                "max_corpus_mb"):
+        assert isinstance(policy["memory"][key], int)
+        assert policy["memory"][key] >= 1
+    # judged code is untrusted, hence the tighter judge ceiling
+    assert policy["memory"]["judge_child_mb"] < policy["memory"]["gate_child_mb"]
+
+    def expect_error(mutate, needle):
+        p = json.loads(json.dumps(policy))
+        mutate(p)
+        f = tmp_path / "policy.json"
+        f.write_text(json.dumps(p))
+        try:
+            pipeline_tool.load_policy(f)
+        except state_tool.ToolError as e:
+            assert needle in str(e)
+        else:
+            raise AssertionError(f"{needle} must be rejected")
+
+    expect_error(lambda p: p.pop("memory"), "memory: object required")
+    expect_error(lambda p: p["memory"].pop("id"), "memory.id")
+    expect_error(lambda p: p["memory"].update(id="mem"), "memory.id")
+    expect_error(lambda p: p["memory"].update(judge_child_mb=0),
+                 "judge_child_mb")
+    expect_error(lambda p: p["memory"].update(gate_child_mb="4g"),
+                 "gate_child_mb")
+    expect_error(lambda p: p["memory"].update(run_scope_mb=True),
+                 "run_scope_mb")
+    expect_error(lambda p: p["memory"].pop("max_corpus_mb"),
+                 "max_corpus_mb")
+
+
+def test_resolve_memory_is_pure_policy_with_decided_by_and_evidence():
+    """The memory budget, as code: same decision shape as a gate —
+    decided_by=policy:MEM-1 + policy_version + evidence[] — with the four
+    ceilings, and operator overrides journaled as deviations (never a
+    silent re-decision)."""
+    policy = pipeline_tool.load_policy()
+    d = pipeline_tool.resolve_memory(policy)
+    assert d["decided_by"] == "policy:MEM-1"
+    assert d["policy_version"] == policy["version"]
+    assert d["limits"] == {"judge_child_mb": 2048, "gate_child_mb": 4096,
+                           "run_scope_mb": 8192, "max_corpus_mb": 1024}
+    assert len(d["evidence"]) == 5           # the block + one per ceiling
+    assert not d.get("deviations")           # pure resolution: no overrides
+
+    over = pipeline_tool.resolve_memory(policy, judge_child_mb=1024,
+                                        gate_child_mb=8192)
+    assert over["limits"]["judge_child_mb"] == 1024
+    assert over["limits"]["gate_child_mb"] == 8192
+    assert over["limits"]["run_scope_mb"] == 8192   # untouched key stands
+    assert any("judge_child_mb=1024" in x and "policy said 2048" in x
+               for x in over["deviations"])
+
+    same = pipeline_tool.resolve_memory(policy, judge_child_mb=2048)
+    assert not same.get("deviations")        # a no-op override is not news
+
+    with pytest.raises(ValueError):
+        pipeline_tool.resolve_memory(policy, nonsense_mb=1)
+
+
+def test_resolve_memory_subcommand_emits_the_decision(monkeypatch, capsys):
+    """Acceptance: policy resolution EMITS the memory block — decided_by +
+    evidence — and operator overrides surface as deviations."""
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py", ["resolve-memory"])
+    assert code == 0
+    assert out["decision"]["decided_by"] == "policy:MEM-1"
+    assert out["decision"]["policy_version"]
+    assert out["decision"]["evidence"]
+    assert "MEM-1" in out["summary"]["human"]
+
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["resolve-memory", "--judge-child-mb", "1024"])
+    assert code == 0
+    assert out["decision"]["limits"]["judge_child_mb"] == 1024
+    assert any("judge_child_mb=1024" in x for x in
+               out["decision"]["deviations"])
+
+
 # --------------------------------------------------- pure rule evaluation --
 
 def _decide(state, gate, policy=None):

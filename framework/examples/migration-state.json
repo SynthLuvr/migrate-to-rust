@@ -65,6 +65,7 @@
       "budget": {
         "max_rounds": 5,
         "tokens_spent": 52000,
+        "max_rss_mb": 4096,
         "exhausted": false
       },
       "attribution": {
@@ -129,6 +130,7 @@
       "budget": {
         "max_rounds": 5,
         "tokens_spent": 29000,
+        "max_rss_mb": 4096,
         "exhausted": false
       },
       "attribution": {
@@ -174,6 +176,7 @@
       "budget": {
         "max_rounds": 5,
         "tokens_spent": 71000,
+        "max_rss_mb": 4096,
         "exhausted": false
       },
       "attribution": {
@@ -235,6 +238,7 @@
       "budget": {
         "max_rounds": 5,
         "tokens_spent": 124000,
+        "max_rss_mb": 4096,
         "exhausted": true
       },
       "attribution": {
@@ -242,7 +246,7 @@
         "notice_ok": true
       },
       "review_verdict": "escalate",
-      "notes": "Budget exhausted at round 5 (MAX_ROUNDS hit twice \u2014 mandatory escalation). Fix requires a deterministic serializer over a BTreeMap: a data-structure redesign, which is a Stage-1-semantics proposal needing human sign-off, never improvised mid-loop. Python fallback is the live side for this unit.",
+      "notes": "Budget exhausted at round 5 (MAX_ROUNDS hit twice \u2014 mandatory escalation). delegate.py: MEMORY SCOPE BREACH per policy:MEM-1 \u2014 judge child (c3): peak 4980.0 MB > limit 2048 MB \u2014 ESC-1 defer, Python fallback stays live; never a service crash. Fix requires a deterministic serializer over a BTreeMap: a data-structure redesign, which is a Stage-1-semantics proposal needing human sign-off, never improvised mid-loop. Python fallback is the live side for this unit.",
       "sessions": [
         {
           "id": "sess_01hx2k9r7m3d",
@@ -293,6 +297,7 @@
       "budget": {
         "max_rounds": 5,
         "tokens_spent": 31000,
+        "max_rss_mb": 4096,
         "exhausted": false
       },
       "attribution": {
@@ -417,6 +422,22 @@
       "from": "pending",
       "to": "divergent_explained",
       "actor": "state.py"
+    },
+    {
+      "timestamp": "2026-08-05T18:29:41Z",
+      "unit": "u-index-4",
+      "field": "units[u-index-4].budget.max_rss_mb",
+      "from": null,
+      "to": 4096,
+      "actor": "orchestrator"
+    },
+    {
+      "timestamp": "2026-08-05T18:29:58Z",
+      "unit": "u-index-4",
+      "field": "units[u-index-4].notes",
+      "from": null,
+      "to": "delegate.py: MEMORY SCOPE BREACH per policy:MEM-1 \u2014 judge child (c3): peak 4980.0 MB > limit 2048 MB \u2014 ESC-1 defer, Python fallback stays live; never a service crash",
+      "actor": "orchestrator"
     },
     {
       "timestamp": "2026-08-05T18:30:00Z",

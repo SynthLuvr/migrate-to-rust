@@ -1,6 +1,6 @@
 {
   "$comment": "The autonomy policy layer (issue #22, proposal C): each former human gate becomes a machine-decidable rule with a conservative default, journaled and non-blocking. Evaluated only in code (tools/pipeline.py resolve-gates / tools/state.py resolve-gate) — never by LLM self-approval. Every decision records decided_by='policy:<rule-id>' + policy_version + evidence[] in migration-state.json. Levels: L0 = supervised (gates are hard stops — the agent never asks; it leaves the gate open and ends the run with the dossier for the operator to decide between runs); L1 = agent proposes into the dossier, operator decides between runs; L2 = all gates policy-resolved, publish disabled (the default — never asks); L3 = full autopilot incl. cutover. Operators pre-authorize the level BEFORE the run: there are zero mid-run questions at any level. The dual-build design is what makes autonomy safe — per-unit Python fallback, one-env-var shim, rollback pin; every autonomous decision stays reversible per unit.",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "default_level": "L2",
   "levels": {
     "L0": {
@@ -42,6 +42,14 @@
     "k_large_unit": 1,
     "size_threshold_loc": 150,
     "budget_floor_fraction": 0.25
+  },
+  "memory": {
+    "$comment": "Issue #76 — memory is a first-class, policy-resolved budget (MIGRATION_PROMPT.md hard rule 6), not an improvised flag: #73 showed what the one unbounded resource costs — a multi-GB child OOM-killed the session SERVER, not the unit. The ceilings: judge_child_mb bounds each oracle judge/corpus REPL child (untrusted judged code, hence the tighter ceiling); gate_child_mb bounds the toolchain children — the delegate agent, compile gates, wheel build, and the driver's stage workers (repo-trusted, roomier for rustc/LLVM); run_scope_mb is the run-level migration.slice MemoryMax the launch command pins (tools/glv-subagents.md § Memory containment) — it bounds the WHOLE run independently of the session server, it is not a per-child limit; max_corpus_mb is the pre-flight parent-side corpus-retention budget (issue #75). pipeline.py resolve_memory (id MEM-1) emits the decision — decided_by='policy:MEM-1' + policy_version + evidence[] — and delegate.py / oracle.py / pipeline.py enforce it as the DEFAULT of every --mem-limit-mb / --max-corpus-mb flag: an explicit value is an operator override journaled as a deviation from this decision (never an orchestrator's judgment call), 0 disables scoping entirely, and the graceful unscoped fallback when systemd-run is unavailable stays. A cgroup scope breach (child exit 137) is journaled the way token exhaustion is — actor, unit, observed peak, limit — in units[].budget.max_rss_mb + the journal, and resolves as ESC-1 defer (child dies alone -> setup_error -> INCOMPARABLE -> dossier), never a service crash.",
+    "id": "MEM-1",
+    "judge_child_mb": 2048,
+    "gate_child_mb": 4096,
+    "run_scope_mb": 8192,
+    "max_corpus_mb": 1024
   },
   "rules": [
     {

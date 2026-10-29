@@ -83,13 +83,22 @@ operate a pipeline; the gates decide, not you.
    31% → 54%).
 5. **The Python API is frozen.** Callers must not change. Ship as a PyO3
    wheel via maturin — "Rust where hot, Python everywhere else."
-6. **Every loop is bounded.** Max fix-rounds and a token/time budget per unit;
-   on exhaustion, classify and record the escalation — the unit keeps its
-   Python fallback and drains into the end-of-run escalation dossier; at
-   L2+ (the default) policy rule ESC-1 resolves it as *defer* immediately
-   and the backlog continues, while at L0/L1 it waits for the operator
-   between runs. Never silently give up, never silently descope checks to
-   go green, and never pause mid-run to ask a human.
+6. **Every loop is bounded.** Max fix-rounds and a token/time/memory budget
+   per unit; on exhaustion, classify and record the escalation — the unit
+   keeps its Python fallback and drains into the end-of-run escalation
+   dossier; at L2+ (the default) policy rule ESC-1 resolves it as *defer*
+   immediately and the backlog continues, while at L0/L1 it waits for the
+   operator between runs. **Memory is policy-resolved like the rest**
+   ([`autonomy/policy.json`](autonomy/policy.json) `memory` block,
+   `policy:MEM-1`, issue #76): per-child cgroup ceilings at the single
+   `run_child` choke point (judge children `judge_child_mb` 2048 MB,
+   toolchain children `gate_child_mb` 4096 MB by default) plus the
+   run-level `migration.slice` (`run_scope_mb` 8192 MB) — the ceiling in
+   force recorded per unit in `units[].budget.max_rss_mb`, and a scope
+   breach journaled the way token exhaustion is (actor, unit, observed
+   peak, limit) as a unit escalation, never a service crash. Never
+   silently give up, never silently descope checks to go green, and never
+   pause mid-run to ask a human.
 7. **Redesign data structures deliberately.** Figma got 20% p99 from a data
    swap alone; a literal transliteration forfeits the win. Redesigns are
    *proposals* resolved at the Stage-1 gate — by policy rule RED-1 at L2+
@@ -270,5 +279,6 @@ Rules of the rules:
 | Speed number without a repro script | vendor benchmark rot | every benchmark ships with its corpus + script |
 | Optimized Python matches the port | port wasn't the win | report honestly; keeping Python is a success |
 | Agent pauses to ask a human at a gate | pre-policy gate behavior | gates resolve in code, or the run ends with the dossier for between-runs operator review — "ask" is never an available move |
+| OOM kill of the orchestrator/session server | children ran unscoped — one runaway child's RSS is the *service's* problem (#73) | run under a memory scope: per-child ceilings + the `migration.slice` from [`autonomy/policy.json`](autonomy/policy.json) `memory` (`policy:MEM-1`, issue #76, launch command in `tools/glv-subagents.md` § *Memory containment*); a scope breach is a **unit escalation (ESC-1 defer)** — child dies alone (exit 137 → setup_error → incomparable), journaled with observed peak + limit — never a service crash |
 | Run parks in `budget_exhausted`, waiting for a human to notice and restart | session-level exhaustion (the orchestrator's context window) treated as a human-facing result | `tools/succession.py` spawns the successor GLV session automatically (issue #25) and bootstraps GLV itself (issue #47); only run-level ceiling exhaustion ends the chain — and then the operator's move is to raise the ceiling between runs, never to restart by hand |
 | Private project names leak into public artifacts (PRs, issues, commits) | run reports and state files name the target project | `runs/` stays gitignored; anonymize target-project names in anything committed or posted publicly — refer to "a target project", never its name |

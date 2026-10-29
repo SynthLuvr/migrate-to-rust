@@ -363,6 +363,12 @@ def test_dry_run_derives_the_plan_without_writes(monkeypatch, capsys, tmp_path):
     assert out["gates"][0] == "<mechanical import gate>"
     assert [c["candidate"] for c in out["candidates"]] == ["c1", "c2", "c3"]
     assert out["candidates"][0]["rust_file_rel"] == "src/u_foo_c1.rs"
+    # issue #76: the memory budget rides the plan too — policy:MEM-1's
+    # split (toolchain children vs judge children), visible before any
+    # child is spawned
+    assert out["memory"]["decided_by"] == "policy:MEM-1"
+    assert out["memory"]["limits"]["gate_child_mb"] == 4096
+    assert out["memory"]["limits"]["judge_child_mb"] == 2048
     # no agent needed, and nothing written anywhere
     assert not (tmp_path / "delegates").exists()
 

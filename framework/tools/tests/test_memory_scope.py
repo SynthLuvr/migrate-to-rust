@@ -570,3 +570,161 @@ def test_judge_reports_per_side_peak_rss(monkeypatch, capsys, tmp_path):
     assert code == 0
     assert out["resources"]["peak_rss_mb"] == {"reference": 4.0,
                                                "candidate": 8.0}
+
+
+# ------------------------------------------- issue #76: policy budget ------
+
+def test_judge_defaults_and_provenance_come_from_policy(monkeypatch, capsys,
+                                                        tmp_path):
+    """Issue #76: a bare judge run takes its ceilings from policy.json
+    'memory' (policy:MEM-1) — the decision rides the payload's resources
+    block (decided_by + deviations), and an explicit flag is journaled as
+    a deviation, never a silent re-decision."""
+    import pipeline as pipeline_tool
+    manifest = _tiny_judge_scaffold(tmp_path)
+    mem = pipeline_tool.resolve_memory(pipeline_tool.load_policy())
+    limits = []
+
+    def fake_run_child(cmd, **kw):
+        limits.append(kw.get("mem_limit_mb"))
+        return 0, json.dumps({"i": 0, "ok": True, "value": 1}), ""
+
+    monkeypatch.setattr(oracle, "run_child", fake_run_child)
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["judge", "--manifest", str(manifest)])
+    assert code == 0
+    assert limits == [mem["limits"]["judge_child_mb"]] * 2
+    res = out["resources"]
+    assert res["mem_limit_decided_by"] == "policy:MEM-1"
+    assert res["mem_limit_deviations"] is None
+    assert res["max_corpus_mb"] == mem["limits"]["max_corpus_mb"]
+
+    # operator override: journaled as a deviation from the policy decision
+    code, out = run_tool(monkeypatch, capsys, "oracle.py",
+                         ["judge", "--manifest", str(manifest),
+                          "--mem-limit-mb", "64"])
+    assert code == 0
+    assert limits[-2:] == [64, 64]
+    assert out["resources"]["mem_limit_decided_by"] == "policy:MEM-1"
+    assert any("judge_child_mb=64" in d and "policy said" in d
+               for d in out["resources"]["mem_limit_deviations"])
+
+
+def test_delegate_resolves_both_ceilings_from_policy(monkeypatch):
+    """Issue #76: run-candidates defaults are the policy split — judge
+    children take judge_child_mb, the agent/gates/build take
+    gate_child_mb — with --mem-limit-mb as a journaled deviation (0
+    disables)."""
+    import argparse
+    import pipeline as pipeline_tool
+    mem = pipeline_tool.resolve_memory(pipeline_tool.load_policy())
+
+    judge, gate, d = delegate._resolve_memory(
+        argparse.Namespace(mem_limit_mb=None))
+    assert (judge, gate) == (mem["limits"]["judge_child_mb"],
+                             mem["limits"]["gate_child_mb"])
+    assert d["decided_by"] == "policy:MEM-1"
+    assert not d.get("deviations")
+
+    judge, gate, d = delegate._resolve_memory(
+        argparse.Namespace(mem_limit_mb=0))
+    assert judge is None and gate is None
+    assert any("unscoped" in x for x in d["deviations"])
+
+    judge, gate, d = delegate._resolve_memory(
+        argparse.Namespace(mem_limit_mb=512))
+    assert judge == gate == 512
+    assert any("--mem-limit-mb 512" in x and "policy said" in x
+               for x in d["deviations"])
+
+
+def test_delegate_journals_the_ceiling_and_a_scope_breach(tmp_path):
+    """Issue #76: the pack's state commands journal the unit's memory
+    ceiling (budget.max_rss_mb) like K, and a cgroup scope breach is
+    journaled the way token exhaustion is — actor via state.py, unit,
+    observed peak, limit — resolving as an ESC-1 escalation, never a
+    service crash."""
+    k_policy = {"k_used": 1, "citation": "policy:CAND-1", "basis": ["..."]}
+    results = [{
+        "candidate": "c1", "rounds": [],
+        "judge": {"judged": True, "oracle_exit": 2, "verdict": "incomparable",
+                  "setup_error": "child killed by memory scope "
+                                 "(exit 137) after 4980 MB",
+                  "resources": {"mem_limit_mb": 2048,
+                                "peak_rss_mb": {"reference": None,
+                                                "candidate": 4980.0}}},
+    }]
+    breaches = delegate._breaches(results, gate_mb=4096, judge_mb=2048)
+    assert len(breaches) == 1
+    assert breaches[0]["child"] == "judge"
+    assert breaches[0]["observed_peak_mb"] == 4980.0
+    assert breaches[0]["limit_mb"] == 2048
+
+    # the realistic path: the oracle names the killed side in resources
+    realistic = [{
+        "candidate": "c1", "rounds": [],
+        "judge": {"judged": True, "oracle_exit": 2,
+                  "verdict": "incomparable",
+                  "resources": {"mem_limit_mb": 2048,
+                                "peak_rss_mb": {"reference": None,
+                                                "candidate": 4980.0},
+                                "side_terminal_errors": {
+                                    "reference": None,
+                                    "candidate":
+                                        "child exited 137: Killed"}}},
+    }]
+    real = delegate._breaches(realistic, gate_mb=4096, judge_mb=2048)
+    assert real[0]["child"] == "judge (candidate)"
+    assert real[0]["observed_peak_mb"] == 4980.0
+
+    # gate-child breaches detect too (cargo killed at 137)
+    gate_kill = [{"candidate": "c2", "rounds": [
+        {"round": 0, "gates": [{"exit_code": 137, "output": "Killed"}]}]}]
+    assert delegate._breaches(gate_kill, 4096, 2048)[0]["limit_mb"] == 4096
+    # a clean run reports nothing
+    assert not delegate._breaches(
+        [{"candidate": "c3", "rounds": [{"round": 0, "gates": [
+            {"exit_code": 0, "output": ""}]}],
+          "judge": {"judged": True, "verdict": "equivalent",
+                    "resources": {"mem_limit_mb": 2048}}}],
+        4096, 2048)
+
+    cmds = delegate._state_commands("u-1", None, tmp_path / "state.json",
+                                    k_policy, gate_mb=4096, breaches=breaches,
+                                    decided_by="policy:MEM-1")
+    joined = "\n".join(cmds)
+    assert "units[u-1].budget.max_rss_mb=4096" in joined
+    assert "policy:MEM-1" in joined and "peak 4980" in joined \
+        and "limit 2048 MB" in joined
+    assert "--status escalated" in joined          # ESC-1 defer, not a crash
+
+
+def test_pipeline_run_scopes_the_stage_worker_from_policy(monkeypatch, capsys,
+                                                           tmp_path):
+    """Issue #76: pipeline.py run resolves the stage worker's ceiling from
+    policy.json 'memory' (policy:MEM-1, gate_child_mb) by default — the
+    decision rides the run payload like every journaled decision — and an
+    explicit --agent-mem-limit-mb is journaled as a deviation."""
+    p = tmp_path / "state.json"
+    run_tool(monkeypatch, capsys, "state.py", [
+        "init", str(p), "--name", "demo", "--python-path", "src/demo",
+        "--autonomy-level", "L2"])
+    agent = f"{sys.executable} -c pass"   # verification failures end the
+    # run failed_safely — the memory decision rides the payload regardless
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["run", str(p), "--agent-cmd", agent])
+    assert out["memory"]["decided_by"] == "policy:MEM-1"
+    assert out["memory"]["policy_version"]
+    assert out["memory"]["limits"]["gate_child_mb"] == 4096   # policy
+    assert not out["memory"].get("deviations")
+
+    code, out = run_tool(monkeypatch, capsys, "state.py", [
+        "init", str(tmp_path / "s2.json"), "--name", "demo",
+        "--python-path", "src/demo", "--autonomy-level", "L2"])
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["run", str(tmp_path / "s2.json"),
+                          "--agent-cmd", agent,
+                          "--agent-mem-limit-mb", "2048"])
+    assert out["memory"]["limits"]["gate_child_mb"] == 2048
+    assert any("gate_child_mb=2048" in d and "policy said 4096" in d
+               for d in out["memory"]["deviations"])
