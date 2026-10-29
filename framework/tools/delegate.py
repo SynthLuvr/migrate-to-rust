@@ -1297,9 +1297,11 @@ def main(argv=None) -> int:
                         "dies alone (SIGKILL -> exit 137 -> setup_error -> "
                         "incomparable -> ESC-1 defers) instead of OOM-killing "
                         "the session server (#73). None (default) leaves "
-                        "children unscoped; policy defaults are issue #76. "
-                        "Falls back to unscoped with a stderr warning when "
-                        "systemd-run is unavailable")
+                        "children unscoped (the oracle judge's own REPL "
+                        "children remain bounded by oracle.py's "
+                        "--mem-limit-mb default, issue #73); policy defaults "
+                        "are issue #76. Falls back to unscoped with a stderr "
+                        "warning when systemd-run is unavailable")
     p.add_argument("--dry-run", action="store_true",
                    help="print the derived plan (paths, briefs, gates) — no "
                         "agent, no writes")

@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -231,6 +232,20 @@ def _scope_startup_failed(proc: subprocess.CompletedProcess) -> bool:
     return any(sig in err for sig in _SCOPE_STARTUP_FAILURES)
 
 
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the child's whole process group: run_child children are
+    session leaders, so this reaps the entire subtree — grandchildren a
+    bare ``proc.kill()`` would orphan (issue #73). Best-effort: a group
+    that is already gone means the job is done."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()  # group gone or unkillable: the direct child
+        except OSError:
+            pass
+
+
 def self_containment() -> dict:
     """Where THIS process runs, cgroup-wise: the ``containment`` block the
     driver and the chain harness report so a run's memory scope is
@@ -256,6 +271,13 @@ def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,
     (e.g. a per-unit CARGO_TARGET_DIR) without loosening the fixed ones.
     Returns (returncode, stdout, stderr).
 
+    Every child runs as its own session leader and a timeout (or an
+    aborting exception) SIGKILLs its whole process group, so no child
+    can outlive this parent as an orphan (issue #73: judge REPL
+    grandchildren stayed blocked on stdin, holding RSS, after their
+    judge was reaped). TimeoutExpired is raised as before, with the
+    group reaped first.
+
     `mem_limit_mb` (issue #74) runs the child inside its own systemd user
     scope (see scope_argv) so a memory breach kills that child alone
     (SIGKILL -> exit 137) instead of a host-wide OOM failing the session
@@ -272,9 +294,25 @@ def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,
         env.update(env_extra)
 
     def spawn(argv: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            argv, cwd=cwd, env=env, input=input_text, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        # start_new_session: the child leads its own process group, so the
+        # timeout path below can kill the whole subtree, not just this pid
+        with subprocess.Popen(
+                argv, cwd=cwd, env=env, text=True,
+                stdin=subprocess.PIPE if input_text is not None else None,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True) as proc:
+            try:
+                out, err = proc.communicate(input=input_text,
+                                            timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                _kill_process_group(proc)
+                exc.stdout, exc.stderr = proc.communicate()
+                raise
+            except BaseException:  # KeyboardInterrupt &c.: no orphans
+                _kill_process_group(proc)
+                raise
+            return subprocess.CompletedProcess(argv, proc.returncode,
+                                               stdout=out, stderr=err)
 
     warning = None
     if mem_limit_mb is not None:

@@ -531,21 +531,32 @@ def test_ensure_server_without_the_cli_is_an_environment_error(monkeypatch):
 
 
 def test_mint_token_cli_and_loopback_paths(monkeypatch):
-    # CLI path: glv token create --name <label>, raw token parsed once
+    # CLI path: glv token create --name <label>, raw token parsed once.
+    # (Popen is the interception seam since run_child session-leads its
+    # children to group-kill them on timeout — issue #73.)
     monkeypatch.setattr(succession_tool, "_glv_cli_path",
                         lambda: "/usr/bin/glv")
     calls = []
 
-    class _Proc:
+    class _FakePopen:
         returncode = 0
-        stdout = "created run-demo-s1\nglv_at_Ab3_-z9\n"
-        stderr = ""
 
-    def fake_run(cmd, **kw):
-        calls.append(cmd)
-        return _Proc()
+        def __init__(self, cmd, **kw):
+            calls.append(cmd)
 
-    monkeypatch.setattr(succession_tool.subprocess, "run", fake_run)
+        def communicate(self, input=None, timeout=None):
+            return "created run-demo-s1\nglv_at_Ab3_-z9\n", ""
+
+        def kill(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(succession_tool.subprocess, "Popen", _FakePopen)
     assert succession_tool._mint_token("http://x:1", "run-demo-s1") == \
         "glv_at_Ab3_-z9"
     assert calls[0][1:] == ["token", "create", "--name", "run-demo-s1"]

@@ -45,6 +45,22 @@ and reads per-run records from stdout:
     {"i": 0, "ok": false, "error": {"type": "ValueError", "message": "..."}}
     {"i": 0, "unserializable": true}
     {"setup_error": "ImportError: ..."}              # once, first line
+    {"peak_rss_kb": 47216}                           # once, final line: the
+                                                     # child's high-water RSS
+                                                     # self-report (issue #73)
+
+**Child lifecycle (issue #73)** — the REPL children are hardened on both
+sides of the pipe. Parent side: every harness child is its own session
+leader and a ``run_child`` timeout SIGKILLs the whole process group — a
+reaped judge takes its children with it, none left blocked on stdin
+holding RSS. Child side: a ppid watchdog (0.5 s interval timer, so it
+fires even while blocked in a read) exits the child if its judge dies;
+``gc.collect()`` runs every ``GC_EVERY_N_ROWS`` rows so reference cycles
+in judged code cannot grow peak RSS unbounded; and judge/corpus bound
+each child to ``--mem-limit-mb`` (default 2048 MB cgroup MemoryMax, ``0``
+disables) so a leaking side fails ITS judgment loudly (setup_error →
+INCOMPARABLE) instead of the host. Each side's peak RSS lands in the
+verdict payload's ``resources.peak_rss_mb``.
 
 **Streaming and chunking (issue #75)** — the parent judges the corpus in
 **chunks of ``--chunk-rows`` rows (default 500)**: rows stream from the
@@ -158,6 +174,18 @@ VERSION = 1
 #: corpus rows per child; one chunk's stdin framing is the only
 #: corpus-derived buffer the parent ever holds
 DEFAULT_CHUNK_ROWS = 500
+
+#: REPL children gc.collect() every this many rows: reference cycles in
+#: judged code collect between rows, keeping peak RSS near the per-row
+#: working set instead of growing monotonically (issue #73)
+GC_EVERY_N_ROWS = 64
+
+#: per-child cgroup memory ceiling in MB for judge/corpus REPL children:
+#: a leak must fail THAT judgment (scope breach -> SIGKILL ->
+#: setup_error -> INCOMPARABLE), never the host. ``--mem-limit-mb 0``
+#: opts out (policy defaults are #76)
+DEFAULT_MEM_LIMIT_MB = 2048
+
 #: refuse, before any child is spawned, a corpus whose estimated parent
 #: footprint exceeds this many MB (0 disables); see _check_corpus_budget
 DEFAULT_MAX_CORPUS_MB = 1024
@@ -604,8 +632,32 @@ def _degenerate_note(counts: dict) -> str:
 
 # --------------------------------------------------------------- runner ----
 
-RUNNER_SRC = r"""
-import importlib.util, json, os, sys
+RUNNER_SRC_TEMPLATE = r"""
+import gc, importlib.util, json, os, resource, signal, sys
+
+GC_EVERY_N_ROWS = __GC_EVERY_N_ROWS__  # gc.collect() cadence, between rows
+_JUDGE_PID = os.getppid()              # the judge that spawned this child
+
+
+def _orphan_watchdog(signum, frame):
+    # Exit when the judge is gone (timeout group kill, SIGKILL, OOM) —
+    # otherwise this child blocks on stdin forever holding RSS. A 0.5 s
+    # interval timer, not a per-row check: it fires even while BLOCKED
+    # in a read() (issue #73).
+    if os.getppid() != _JUDGE_PID:
+        try:
+            os.write(2, ("oracle-repl: judge pid %d is gone — exiting, "
+                         "not blocking on stdin\n" % _JUDGE_PID).encode())
+        except OSError:
+            pass
+        os._exit(75)
+
+
+def _peak_rss_kb():
+    # ru_maxrss is the high-water RSS: KiB on Linux, bytes on macOS
+    ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return int(ru / 1024.0) if sys.platform == "darwin" else int(ru)
+
 
 def _load(entry):
     # entry is "module:function" (module imported with the child's cwd on
@@ -636,6 +688,13 @@ def main(entry):
     except Exception as e:  # setup failure: nothing on this side is judgeable
         print(json.dumps({"setup_error": f"{type(e).__name__}: {e}"}), flush=True)
         return
+    try:
+        signal.signal(signal.SIGALRM, _orphan_watchdog)
+        signal.setitimer(signal.ITIMER_REAL, 0.5, 0.5)
+    except (AttributeError, ValueError, OSError):
+        pass  # no interval timers here (non-POSIX): the parent's group
+              # kill remains the reaper of record
+    rows = 0
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -658,9 +717,23 @@ def main(entry):
             print(json.dumps({"i": i, "ok": False,
                               "error": {"type": type(e).__name__, "message": str(e)}}),
                   flush=True)
+        rows += 1
+        if rows % GC_EVERY_N_ROWS == 0:
+            gc.collect()  # collect cycles so judged code can't grow peak RSS
+    try:
+        print(json.dumps({"peak_rss_kb": _peak_rss_kb()}), flush=True)
+    except BrokenPipeError:
+        pass  # the judge is gone; the watchdog/EOF handles the exit
+
 
 main(sys.argv[1])
 """
+
+#: the source handed to children: the template with the gc cadence
+#: spliced in (a raw string, so no f-string brace-doubling); one splice
+#: point keeps tests asserting against the constant children really run
+RUNNER_SRC = RUNNER_SRC_TEMPLATE.replace("__GC_EVERY_N_ROWS__",
+                                         str(GC_EVERY_N_ROWS))
 
 
 def _load_entry_callable(entry: str):
@@ -718,12 +791,14 @@ def _frame_stdin(rows) -> str:
     return "".join(json.dumps({"i": i, "input": v}) + "\n" for i, v in rows)
 
 
-def _parse_child_records(stdout: str) -> tuple[dict[int, dict], list[str]]:
-    """Index the child's NDJSON stdout into per-run records by ``i``, plus
-    any setup errors in order. Unparseable lines are child chatter
-    (prints), not fatal."""
+def _parse_child_records(stdout: str) -> tuple[dict[int, dict], list[str], int]:
+    """Index the child's NDJSON stdout into per-run records by ``i``, any
+    setup errors in order, and the child's ``{"peak_rss_kb": N}``
+    self-report (max across lines; 0 when no child reported). Lines that
+    are not JSON are child chatter (prints), not fatal."""
     records: dict[int, dict] = {}
     setup_errors = []
+    peak_rss_kb = 0
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -736,11 +811,19 @@ def _parse_child_records(stdout: str) -> tuple[dict[int, dict], list[str]]:
             setup_errors.append(rec["setup_error"])
         elif "i" in rec:
             records[rec["i"]] = rec
-    return records, setup_errors
+        elif isinstance(rec.get("peak_rss_kb"), int):
+            peak_rss_kb = max(peak_rss_kb, rec["peak_rss_kb"])
+    return records, setup_errors, peak_rss_kb
 
 
 def _child_exit_error(code: int, stderr: str) -> str:
     return f"child exited {code}: {stderr.strip()[:400] or 'no stderr'}"
+
+
+def _peak_rss_mb(kb: int) -> float | None:
+    """A child's KiB high-water self-report -> MB (one decimal); None when
+    nothing reported — a null is honest, 0.0 would read as measured."""
+    return None if not kb else round(kb / 1024.0, 1)
 
 
 def _execute_entry_subprocess(entry: str, inputs: list, manifest_dir: Path,
@@ -753,7 +836,7 @@ def _execute_entry_subprocess(entry: str, inputs: list, manifest_dir: Path,
         cwd=str(manifest_dir), input_text=_frame_stdin(enumerate(inputs)),
         timeout=timeout, mem_limit_mb=mem_limit_mb,
     )
-    records, setup_errors = _parse_child_records(stdout)
+    records, setup_errors, _peak = _parse_child_records(stdout)
     if setup_errors:
         return [{"setup_error": setup_errors[0]}]
     if code != 0 and not records:
@@ -793,12 +876,13 @@ def _chunk_timeout_records(timeout: float, rows: int) -> list[dict]:
 
 
 def _run_entry_chunk(entry: str, chunk: list, cwd, timeout: float,
-                     mem_limit_mb: int | None) -> tuple[list, str | None]:
+                     mem_limit_mb: int | None) -> tuple[list, str | None, int]:
     """One child over one chunk of (index, value) rows. Returns
-    ``(records, terminal_error)``: ``records`` index-aligned with ``chunk``
-    (None where the child produced nothing); a non-None terminal_error (a
-    setup error, or a child exit before any record) means the side is dead
-    and later chunks must not spawn. A timeout is NOT terminal."""
+    ``(records, terminal_error, peak_rss_kb)``: ``records`` index-aligned
+    with ``chunk`` (None where the child produced nothing); a non-None
+    terminal_error (a setup error, or a child exit before any record)
+    means the side is dead and later chunks must not spawn. A timeout is
+    NOT terminal."""
     try:
         code, stdout, stderr = run_child(
             [sys.executable, "-c", RUNNER_SRC, entry],
@@ -806,13 +890,13 @@ def _run_entry_chunk(entry: str, chunk: list, cwd, timeout: float,
             timeout=timeout, mem_limit_mb=mem_limit_mb,
         )
     except subprocess.TimeoutExpired:
-        return _chunk_timeout_records(timeout, len(chunk)), None
-    records, setup_errors = _parse_child_records(stdout)
+        return _chunk_timeout_records(timeout, len(chunk)), None, 0
+    records, setup_errors, peak_rss_kb = _parse_child_records(stdout)
     if setup_errors:
-        return [None] * len(chunk), setup_errors[0]
+        return [None] * len(chunk), setup_errors[0], peak_rss_kb
     if code != 0 and not records:
-        return [None] * len(chunk), _child_exit_error(code, stderr)
-    return [records.get(i) for i, _ in chunk], None
+        return [None] * len(chunk), _child_exit_error(code, stderr), peak_rss_kb
+    return [records.get(i) for i, _ in chunk], None, peak_rss_kb
 
 
 class _SideRunner:
@@ -830,6 +914,9 @@ class _SideRunner:
         self.timeout = timeout
         self.mem_limit_mb = mem_limit_mb
         self.terminal_error: str | None = None
+        #: max high-water RSS (KiB) self-reported by this side's children,
+        #: folded into the verdict payload
+        self.peak_rss_kb = 0
 
     def run_chunk(self, chunk: list) -> list:
         """Records for one chunk of rows: index-aligned, None where this
@@ -837,8 +924,9 @@ class _SideRunner:
         the child never answered)."""
         if self.terminal_error is not None or not chunk:
             return [None] * len(chunk)
-        records, terminal = _run_entry_chunk(
+        records, terminal, peak_rss_kb = _run_entry_chunk(
             self.entry, chunk, self.cwd, self.timeout, self.mem_limit_mb)
+        self.peak_rss_kb = max(self.peak_rss_kb, peak_rss_kb)
         if terminal is not None:
             self.terminal_error = terminal
             records = [None] * len(chunk)
@@ -970,11 +1058,15 @@ def cmd_judge(args) -> int:
     # a slow row times out its chunk only, every other chunk still judges
     scan, judged, rows = _open_corpus(corpus_path, runs=args.runs,
                                       max_corpus_mb=args.max_corpus_mb)
+    # judged code is untrusted for memory: bound every child by default so
+    # a leaking side fails its own judgment (setup_error -> INCOMPARABLE),
+    # not the host; ``--mem-limit-mb 0`` opts out explicitly
+    mem_limit = args.mem_limit_mb or None
     fold = _RunFold()
     ref = _SideRunner(manifest["reference"]["entry"], manifest_path.parent,
-                      args.timeout, args.mem_limit_mb)
+                      args.timeout, mem_limit)
     cand = _SideRunner(manifest["candidate"]["entry"], manifest_path.parent,
-                       args.timeout, args.mem_limit_mb)
+                       args.timeout, mem_limit)
     for chunk in _chunks(rows, args.chunk_rows):
         ref_recs = ref.run_chunk(chunk)
         cand_recs = cand.run_chunk(chunk)
@@ -989,6 +1081,16 @@ def cmd_judge(args) -> int:
             "manifest": str(manifest_path),
             "reference_entry": manifest["reference"]["entry"],
             "candidate_entry": manifest["candidate"]["entry"],
+            # observability: None = no child self-reported (zero rows
+            # judged, or faked children in tests)
+            "resources": {
+                "mem_limit_mb": mem_limit,
+                "gc_every_rows": GC_EVERY_N_ROWS,
+                "peak_rss_mb": {
+                    "reference": _peak_rss_mb(ref.peak_rss_kb),
+                    "candidate": _peak_rss_mb(cand.peak_rss_kb),
+                },
+            },
         }, human_flag=args.human)
 
 
@@ -1043,8 +1145,9 @@ def cmd_corpus(args) -> int:
     corpus_path = Path(args.validate).resolve()
     scan, total, rows = _open_corpus(corpus_path, runs=args.runs,
                                      max_corpus_mb=args.max_corpus_mb)
+    mem_limit = args.mem_limit_mb or None  # 0 disables scoping
     side = _SideRunner(args.entry, corpus_path.parent, args.timeout,
-                       args.mem_limit_mb)
+                       mem_limit)
     kept_rows, rows_truncated, counts, ref_ok, first_setup = _fold_dry_run(
         side, rows, args.chunk_rows)
 
@@ -1104,6 +1207,13 @@ def cmd_corpus(args) -> int:
         payload["setup_error"] = side.terminal_error
     if rows_truncated:
         payload["rows_truncated"] = rows_truncated
+    # the dry-run side's peak RSS, same self-report the judge folds into
+    # its verdict payload
+    payload["resources"] = {
+        "mem_limit_mb": mem_limit,
+        "gc_every_rows": GC_EVERY_N_ROWS,
+        "peak_rss_mb": _peak_rss_mb(side.peak_rss_kb),
+    }
     emit(payload, human_flag=args.human)
     return code
 
@@ -1398,16 +1508,17 @@ def main(argv=None) -> int:
                         f"estimate and is the documented repair, and 0 "
                         f"disables the check. Becomes policy-driven in #76 "
                         f"(default {DEFAULT_MAX_CORPUS_MB})")
-    p.add_argument("--mem-limit-mb", type=int, default=None,
-                   help="per-child cgroup memory ceiling in MB (issue #74): "
-                        "each reference/candidate child runs in its own "
-                        "systemd-run user scope (cgroup-v2 MemoryMax, "
-                        "MemorySwapMax=0), so a ballooning child is killed "
-                        "alone (SIGKILL -> 137) and judged setup_error -> "
-                        "incomparable — instead of a host-wide OOM failing "
-                        "the session server (#73). None (default) runs "
-                        "children unscoped; falls back to unscoped with a "
-                        "stderr warning when systemd-run is unavailable")
+    p.add_argument("--mem-limit-mb", type=int, default=DEFAULT_MEM_LIMIT_MB,
+                   help=f"per-child cgroup memory ceiling in MB (#73/#74): "
+                        f"each reference/candidate child runs in its own "
+                        f"systemd-run user scope (cgroup-v2 MemoryMax, "
+                        f"MemorySwapMax=0), so a ballooning child is killed "
+                        f"alone (SIGKILL -> 137) and judged setup_error -> "
+                        f"incomparable — not a host-wide OOM. Judged code is "
+                        f"untrusted for memory, hence the bounded default "
+                        f"{DEFAULT_MEM_LIMIT_MB}; 0 disables. Falls back to "
+                        f"unscoped with a stderr warning when systemd-run "
+                        f"is unavailable")
     p.set_defaults(func=cmd_judge)
 
     p = sub.add_parser(
@@ -1433,10 +1544,12 @@ def main(argv=None) -> int:
                    help=f"pre-flight corpus budget in MB, same refusal as "
                         f"judge (issue #75; 0 disables the check; default "
                         f"{DEFAULT_MAX_CORPUS_MB})")
-    p.add_argument("--mem-limit-mb", type=int, default=None,
-                   help="per-child cgroup memory ceiling in MB (issue #74) — "
-                        "same scoping as judge children; a breach shows as a "
-                        "setup error row, not a host OOM")
+    p.add_argument("--mem-limit-mb", type=int, default=DEFAULT_MEM_LIMIT_MB,
+                   help=f"per-child cgroup memory ceiling in MB (#73/#74) — "
+                        f"same scoping as judge children, bounded by "
+                        f"default; a breach shows as a setup error row, not "
+                        f"a host OOM (default {DEFAULT_MEM_LIMIT_MB}; "
+                        f"0 disables)")
     p.set_defaults(func=cmd_corpus)
 
     p = sub.add_parser("compare", help="classify pre-captured runs (shadow mode)")
