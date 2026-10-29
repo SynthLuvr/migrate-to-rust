@@ -708,7 +708,7 @@ def cmd_corpus(args) -> int:
         inputs = inputs[: args.runs]
     recs = _execute_entry_subprocess(args.entry, inputs,
                                      corpus_path.parent, args.timeout,
-                                     getattr(args, "mem_limit_mb", None))
+                                     args.mem_limit_mb)
     corpus_digest = sha256_bytes(corpus_path.read_bytes())
 
     setup_error = _first_setup_error(recs)

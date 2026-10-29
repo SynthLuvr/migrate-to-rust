@@ -1367,9 +1367,9 @@ class _Terminal(Exception):
 def _invoke_agent(cmd_template: str, stage: int, state_path: Path,
                   mem_limit_mb: int | None = None) -> tuple[int, str]:
     """The stage worker rides _common.run_child — the harness's single
-    child-process choke point (issue #74) — so the driver's agent spawns
-    share the fixed env, captured output, hard timeout, and (when
-    mem_limit_mb is set) the per-child cgroup memory scope."""
+    child-process choke point (issue #74) — for the fixed env, captured
+    output, hard timeout, and (when mem_limit_mb is set) the per-child
+    cgroup memory scope."""
     cmd = cmd_template.format(
         stage=stage, state=str(state_path),
         stage_file=str(FRAMEWORK / "stages" / STAGE_FILES[stage]),

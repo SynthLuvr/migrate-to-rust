@@ -610,11 +610,11 @@ def _run_gate(cmd: str, subs: dict, cwd: Path, timeout: float,
 def _invoke_agent(cmd_template: str, subs: dict, cwd: Path,
                   timeout: float, env: dict[str, str] | None = None,
                   mem_limit_mb: int | None = None) -> tuple[int, str]:
-    """The agent invocation rides _common.run_child — the harness's single
-    child-process choke point (issue #74) — instead of spawning directly:
-    same fixed env, captured output, and hard timeout, plus (when
-    mem_limit_mb is set) the per-child cgroup memory scope, so a ballooning
-    agent dies alone as exit 137 -> unit escalation, never a host OOM."""
+    """Rides _common.run_child — the harness's single child-process choke
+    point (issue #74) — so the agent gets the fixed env, captured output,
+    hard timeout, and (when mem_limit_mb is set) the per-child cgroup
+    memory scope: a ballooning agent dies alone as exit 137 instead of
+    OOM-killing the host."""
     cmd = shlex.split(cmd_template.format_map(_Template(subs)))
     try:
         rc, out, err = run_child(cmd, cwd=str(cwd), timeout=timeout,

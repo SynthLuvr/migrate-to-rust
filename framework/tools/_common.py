@@ -163,16 +163,15 @@ def run_cli(main_func, argv=None, *, tool: str | None = None,
 
 
 # ------------------------------------------------- memory containment ----
-# Issue #74 (-> #73): a runaway child must die alone inside its own cgroup
-# scope — exit non-zero, the oracle records setup_error, the verdict is
-# incomparable, ESC-1 defers — never a host-wide OOM that fails the whole
-# session server's unit.
+# Issue #74 (fixes the enforcement gap behind #73): a runaway child must
+# die alone inside its own cgroup scope — never a host-wide OOM that
+# fails the whole session server's unit.
 
 _SCOPE_WARN = "[run_child]"
-# systemd-run's OWN startup failures: the scope was never created and the
-# command never ran. Matched only on a scoped attempt that also produced no
-# stdout (see _scope_startup_failed), so a child that legitimately ran and
-# failed is never mistaken for a scoping failure — and never re-run.
+# systemd-run's own startup failures: the scope was never created and the
+# command never ran. Matched only on a scoped attempt that also produced
+# no stdout (see _scope_startup_failed), so a child that legitimately ran
+# and failed is never mistaken for a scoping failure — and never re-run.
 _SCOPE_STARTUP_FAILURES = (
     "Failed to connect to bus",
     "Failed to start transient scope unit",
@@ -183,22 +182,23 @@ _SCOPE_STARTUP_FAILURES = (
 _scope_seq = count()
 
 
-def scope_argv(cmd: list[str], mem_limit_mb: int | float, *,
+def scope_argv(cmd: list[str], mem_limit_mb: int, *,
                unit: str | None = None,
                systemd_run: str | None = None) -> tuple[list[str], str | None]:
-    """Prefix ``cmd`` with a per-child systemd user scope bounding cgroup-v2
-    memory (issue #74): ``systemd-run --user --scope -p MemoryMax=<n>M -p
-    MemorySwapMax=0 --unit=<name> -- <cmd...>``. Returns ``(argv, unit)``
-    with ``unit=None`` when scoping is unavailable (no systemd-run on PATH)
-    — the caller then runs ``cmd`` unscoped. ``MemoryMax`` bounds actual
-    memory (RSS), not address space: RLIMIT_AS breaks rustc/LLVM's large
-    reservations and large-mmap Python workloads, so cgroup v2 is the only
-    ceiling that fits this harness. The named unit makes a breach
-    attributable — the journal says ``run-child-…​.scope``, not an
+    """Prefix ``cmd`` with a per-child systemd user scope bounding memory:
+    ``systemd-run --user --scope -p MemoryMax=<n>M -p MemorySwapMax=0
+    --unit=<name> -- <cmd...>``. Returns ``(argv, unit)`` with ``unit=None``
+    when scoping is unavailable (no systemd-run on PATH) — the caller then
+    runs ``cmd`` unscoped, and the returned argv is ``cmd`` itself.
+
+    ``MemoryMax`` bounds actual memory (RSS), not address space: an
+    ``RLIMIT_AS`` ceiling breaks rustc/LLVM's large reservations, so cgroup
+    v2 is the only ceiling that fits this harness. The named unit makes a
+    breach attributable — the journal says ``run-child-….scope``, not an
     anonymous python. ``systemd_run`` pins the binary for tests (``''``
     forces the unavailable path); ``unit`` defaults to a unique derived
     name. Pure — nothing is spawned here."""
-    if mem_limit_mb is None or float(mem_limit_mb) <= 0:
+    if mem_limit_mb is None or mem_limit_mb <= 0:
         raise ValueError(f"mem_limit_mb must be a positive number of MB, "
                          f"got {mem_limit_mb!r}")
     exe = shutil.which("systemd-run") if systemd_run is None else systemd_run
@@ -206,7 +206,7 @@ def scope_argv(cmd: list[str], mem_limit_mb: int | float, *,
         return cmd, None
     name = unit or _scope_unit_name(cmd)
     return [exe, "--user", "--scope",
-            "-p", f"MemoryMax={int(mem_limit_mb)}M",
+            "-p", f"MemoryMax={mem_limit_mb}M",
             "-p", "MemorySwapMax=0",
             f"--unit={name}", "--", *cmd], name
 
@@ -237,15 +237,14 @@ def self_containment() -> dict:
     attributable from the artifacts alone (issue #74). Never raises — an
     unreadable /proc reads as unknown."""
     try:
-        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
-        path = cgroup.strip().split(":", 2)[-1].rsplit("/", 1)[-1] \
-            if cgroup.strip() else None
-        line = next((l for l in cgroup.splitlines() if l.strip()), "")
-        full = line.split(":", 2)[-1] if line else None
+        raw = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+        lines = [l for l in raw.splitlines() if l.strip()]
     except OSError:
-        full = path = None
-    return {"cgroup": full, "unit": path or None,
-            "in_migration_slice": bool(path and "migration.slice" in full)}
+        lines = []
+    full = lines[0].split(":", 2)[-1] if lines else None
+    unit = lines[-1].split(":", 2)[-1].rsplit("/", 1)[-1] if lines else None
+    return {"cgroup": full, "unit": unit or None,
+            "in_migration_slice": bool(unit and "migration.slice" in full)}
 
 
 def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,
@@ -258,48 +257,44 @@ def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,
     Returns (returncode, stdout, stderr).
 
     `mem_limit_mb` (issue #74) runs the child inside its own systemd user
-    scope (cgroup-v2 MemoryMax=<n>M, MemorySwapMax=0 — see scope_argv), so
-    a memory breach kills that child alone (SIGKILL -> exit 137) instead of
-    a host-wide OOM failing the session server's unit (#73). Graceful
-    fallback, never a hard failure: no systemd-run on PATH, or the scope
-    fails to start (container/CI without a user manager) -> the child runs
-    unscoped with a `[run_child]` warning appended to stderr. Unscoped
-    paths (`mem_limit_mb=None`) behave exactly as before."""
+    scope (see scope_argv) so a memory breach kills that child alone
+    (SIGKILL -> exit 137) instead of a host-wide OOM failing the session
+    server's unit (#73). Graceful fallback, never a hard failure: no
+    systemd-run on PATH, or the scope fails to start (container/CI without
+    a user manager) -> the child runs unscoped with a `[run_child]` warning
+    appended to stderr. Unscoped paths (`mem_limit_mb=None`) behave exactly
+    as before."""
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = "0"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.pop("PYTHONSTARTUP", None)
     if env_extra:
         env.update(env_extra)
-    warns: list[str] = []
+
+    def spawn(argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            argv, cwd=cwd, env=env, input=input_text, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
+    warning = None
     if mem_limit_mb is not None:
         scoped, unit = scope_argv(cmd, mem_limit_mb)
-        if unit is not None:
-            proc = subprocess.run(
-                scoped, cwd=cwd, env=env, input=input_text, text=True,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=timeout,
-            )
+        if unit is None:
+            warning = (f"{_SCOPE_WARN} systemd-run not on PATH — cannot "
+                       f"scope the child to mem_limit_mb={mem_limit_mb}M; "
+                       f"running unscoped (issue #74 fallback)")
+        else:
+            proc = spawn(scoped)
             if not _scope_startup_failed(proc):
                 return proc.returncode, proc.stdout, proc.stderr
-            warns.append(
-                f"{_SCOPE_WARN} memory scope failed to start "
-                f"({(proc.stderr or '').strip()[:160]}) — running unscoped "
-                f"(issue #74 fallback)")
-        else:
-            warns.append(
-                f"{_SCOPE_WARN} systemd-run not on PATH — cannot scope the "
-                f"child to mem_limit_mb={mem_limit_mb}M; running unscoped "
-                f"(issue #74 fallback)")
-    proc = subprocess.run(
-        cmd, cwd=cwd, env=env, input=input_text, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-    )
-    if warns:
-        tail = "\n".join(warns)
-        return proc.returncode, proc.stdout, \
-            (proc.stderr + "\n" + tail if proc.stderr else tail)
-    return proc.returncode, proc.stdout, proc.stderr
+            warning = (f"{_SCOPE_WARN} memory scope failed to start "
+                       f"({(proc.stderr or '').strip()[:160]}) — running "
+                       f"unscoped (issue #74 fallback)")
+    proc = spawn(cmd)
+    if warning is None:
+        return proc.returncode, proc.stdout, proc.stderr
+    stderr = f"{proc.stderr}\n{warning}" if proc.stderr else warning
+    return proc.returncode, proc.stdout, stderr
 
 
 def iter_tree_files(root: str | os.PathLike, extensions: set[str] | None = None) -> list[Path]:

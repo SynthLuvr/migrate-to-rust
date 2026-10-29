@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -32,18 +33,18 @@ import oracle
 import pipeline
 from conftest import run_tool
 
-# a Python child that allocates ~512 MB in touched 8 MiB chunks — pages
-# are written, not just reserved, so RSS actually grows past a 64 MB
-# MemoryMax (bytearray alone can ride untouched zero pages)
-BALLOON_CHILD = (
+# A child that allocates ~512 MB in touched 8 MiB chunks — pages are
+# written, not just reserved, so RSS actually grows past a 64 MB MemoryMax
+# (bytearray alone can ride untouched zero pages).
+BALLOON_LOOP = (
     "data = []\n"
     "for _ in range(64):\n"
     "    b = bytearray(8 << 20)\n"
     "    for i in range(0, len(b), 4096):\n"
     "        b[i] = 1\n"
     "    data.append(b)\n"
-    "print(len(data))\n"
 )
+BALLOON_CHILD = BALLOON_LOOP + "print(len(data))\n"
 
 
 def _user_scope_available() -> bool:
@@ -209,13 +210,8 @@ def test_oracle_maps_a_scoped_breach_to_incomparable(monkeypatch, capsys,
     (tmp_path / "ref.py").write_text("def run(v):\n    return v\n")
     (tmp_path / "cand.py").write_text(
         "def run(v):\n"
-        "    data = []\n"
-        "    for _ in range(64):\n"
-        "        b = bytearray(8 << 20)\n"
-        "        for i in range(0, len(b), 4096):\n"
-        "            b[i] = 1\n"
-        "        data.append(b)\n"
-        "    return v\n")
+        + textwrap.indent(BALLOON_LOOP, "    ")
+        + "    return v\n")
     (tmp_path / "corpus.jsonl").write_text(
         json.dumps(1) + "\n" + json.dumps(2) + "\n")
     manifest = tmp_path / "manifest.json"
