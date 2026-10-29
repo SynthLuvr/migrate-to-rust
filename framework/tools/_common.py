@@ -16,10 +16,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
+from itertools import count
 from pathlib import Path
 
 EXIT_OK = 0
@@ -159,24 +162,139 @@ def run_cli(main_func, argv=None, *, tool: str | None = None,
                           version=version, human_flag=human_flag)
 
 
+# ------------------------------------------------- memory containment ----
+# Issue #74 (fixes the enforcement gap behind #73): a runaway child must
+# die alone inside its own cgroup scope — never a host-wide OOM that
+# fails the whole session server's unit.
+
+_SCOPE_WARN = "[run_child]"
+# systemd-run's own startup failures: the scope was never created and the
+# command never ran. Matched only on a scoped attempt that also produced
+# no stdout (see _scope_startup_failed), so a child that legitimately ran
+# and failed is never mistaken for a scoping failure — and never re-run.
+_SCOPE_STARTUP_FAILURES = (
+    "Failed to connect to bus",
+    "Failed to start transient scope unit",
+    "Failed to start transient service unit",
+    "System has not been booted with systemd",
+    "Trying to run as user instance",
+)
+_scope_seq = count()
+
+
+def scope_argv(cmd: list[str], mem_limit_mb: int, *,
+               unit: str | None = None,
+               systemd_run: str | None = None) -> tuple[list[str], str | None]:
+    """Prefix ``cmd`` with a per-child systemd user scope bounding memory:
+    ``systemd-run --user --scope -p MemoryMax=<n>M -p MemorySwapMax=0
+    --unit=<name> -- <cmd...>``. Returns ``(argv, unit)`` with ``unit=None``
+    when scoping is unavailable (no systemd-run on PATH) — the caller then
+    runs ``cmd`` unscoped, and the returned argv is ``cmd`` itself.
+
+    ``MemoryMax`` bounds actual memory (RSS), not address space: an
+    ``RLIMIT_AS`` ceiling breaks rustc/LLVM's large reservations, so cgroup
+    v2 is the only ceiling that fits this harness. The named unit makes a
+    breach attributable — the journal says ``run-child-….scope``, not an
+    anonymous python. ``systemd_run`` pins the binary for tests (``''``
+    forces the unavailable path); ``unit`` defaults to a unique derived
+    name. Pure — nothing is spawned here."""
+    if mem_limit_mb is None or mem_limit_mb <= 0:
+        raise ValueError(f"mem_limit_mb must be a positive number of MB, "
+                         f"got {mem_limit_mb!r}")
+    exe = shutil.which("systemd-run") if systemd_run is None else systemd_run
+    if not exe:
+        return cmd, None
+    name = unit or _scope_unit_name(cmd)
+    return [exe, "--user", "--scope",
+            "-p", f"MemoryMax={mem_limit_mb}M",
+            "-p", "MemorySwapMax=0",
+            f"--unit={name}", "--", *cmd], name
+
+
+def _scope_unit_name(cmd: list[str]) -> str:
+    """A unique, syntactically valid scope unit name derived from the
+    command — the attribution trail when the kernel kills a breach."""
+    exe = Path(cmd[0]).stem if cmd else "child"
+    safe = re.sub(r"[^0-9A-Za-z_.-]", "_", exe)[:40].strip("_") or "child"
+    return f"run-child-{safe}-{os.getpid()}-{next(_scope_seq)}"
+
+
+def _scope_startup_failed(proc: subprocess.CompletedProcess) -> bool:
+    """True only when systemd-run died BEFORE the command ran (scope never
+    created): non-zero exit, no stdout, and one of systemd-run's own
+    startup-failure messages on stderr. Only then may run_child retry
+    unscoped — a child that ran is never re-run (side effects must not
+    happen twice)."""
+    if proc.returncode == 0 or proc.stdout:
+        return False
+    err = proc.stderr or ""
+    return any(sig in err for sig in _SCOPE_STARTUP_FAILURES)
+
+
+def self_containment() -> dict:
+    """Where THIS process runs, cgroup-wise: the ``containment`` block the
+    driver and the chain harness report so a run's memory scope is
+    attributable from the artifacts alone (issue #74). Never raises — an
+    unreadable /proc reads as unknown."""
+    try:
+        raw = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+        lines = [l for l in raw.splitlines() if l.strip()]
+    except OSError:
+        lines = []
+    full = lines[0].split(":", 2)[-1] if lines else None
+    unit = lines[-1].split(":", 2)[-1].rsplit("/", 1)[-1] if lines else None
+    return {"cgroup": full, "unit": unit or None,
+            "in_migration_slice": bool(unit and "migration.slice" in full)}
+
+
 def run_child(cmd: list[str], *, cwd: str | os.PathLike | None = None,
               input_text: str | None = None, timeout: float = 120.0,
-              env_extra: dict[str, str] | None = None) -> tuple[int, str, str]:
+              env_extra: dict[str, str] | None = None,
+              mem_limit_mb: int | None = None) -> tuple[int, str, str]:
     """Deterministic child-process helper: fixed env additions, captured
     stdout/stderr, hard timeout. `env_extra` layers caller variables on top
     (e.g. a per-unit CARGO_TARGET_DIR) without loosening the fixed ones.
-    Returns (returncode, stdout, stderr)."""
+    Returns (returncode, stdout, stderr).
+
+    `mem_limit_mb` (issue #74) runs the child inside its own systemd user
+    scope (see scope_argv) so a memory breach kills that child alone
+    (SIGKILL -> exit 137) instead of a host-wide OOM failing the session
+    server's unit (#73). Graceful fallback, never a hard failure: no
+    systemd-run on PATH, or the scope fails to start (container/CI without
+    a user manager) -> the child runs unscoped with a `[run_child]` warning
+    appended to stderr. Unscoped paths (`mem_limit_mb=None`) behave exactly
+    as before."""
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = "0"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.pop("PYTHONSTARTUP", None)
     if env_extra:
         env.update(env_extra)
-    proc = subprocess.run(
-        cmd, cwd=cwd, env=env, input=input_text, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-    )
-    return proc.returncode, proc.stdout, proc.stderr
+
+    def spawn(argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            argv, cwd=cwd, env=env, input=input_text, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
+    warning = None
+    if mem_limit_mb is not None:
+        scoped, unit = scope_argv(cmd, mem_limit_mb)
+        if unit is None:
+            warning = (f"{_SCOPE_WARN} systemd-run not on PATH — cannot "
+                       f"scope the child to mem_limit_mb={mem_limit_mb}M; "
+                       f"running unscoped (issue #74 fallback)")
+        else:
+            proc = spawn(scoped)
+            if not _scope_startup_failed(proc):
+                return proc.returncode, proc.stdout, proc.stderr
+            warning = (f"{_SCOPE_WARN} memory scope failed to start "
+                       f"({(proc.stderr or '').strip()[:160]}) — running "
+                       f"unscoped (issue #74 fallback)")
+    proc = spawn(cmd)
+    if warning is None:
+        return proc.returncode, proc.stdout, proc.stderr
+    stderr = f"{proc.stderr}\n{warning}" if proc.stderr else warning
+    return proc.returncode, proc.stdout, stderr
 
 
 def iter_tree_files(root: str | os.PathLike, extensions: set[str] | None = None) -> list[Path]:

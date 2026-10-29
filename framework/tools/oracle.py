@@ -593,11 +593,13 @@ def _execute_entry_local(entry: str, inputs: list) -> list[dict]:
 
 
 def _execute_entry_subprocess(entry: str, inputs: list, manifest_dir: Path,
-                              timeout: float) -> list[dict]:
+                              timeout: float,
+                              mem_limit_mb: int | None = None) -> list[dict]:
     stdin = "".join(json.dumps({"i": i, "input": v}) + "\n" for i, v in enumerate(inputs))
     code, stdout, stderr = run_child(
         [sys.executable, "-c", RUNNER_SRC, entry],
         cwd=str(manifest_dir), input_text=stdin, timeout=timeout,
+        mem_limit_mb=mem_limit_mb,
     )
     records: dict[int, dict] = {}
     setup_errors = []
@@ -666,9 +668,11 @@ def cmd_judge(args) -> int:
     rules = merge_rules(manifest)
 
     ref_recs = _execute_entry_subprocess(manifest["reference"]["entry"], inputs,
-                                         manifest_path.parent, args.timeout)
+                                         manifest_path.parent, args.timeout,
+                                         args.mem_limit_mb)
     cand_recs = _execute_entry_subprocess(manifest["candidate"]["entry"], inputs,
-                                          manifest_path.parent, args.timeout)
+                                          manifest_path.parent, args.timeout,
+                                          args.mem_limit_mb)
 
     return _emit_runs_verdicts(
         unit=manifest.get("unit"), inputs=inputs, corpus_path=corpus_path,
@@ -703,7 +707,8 @@ def cmd_corpus(args) -> int:
     if args.runs:
         inputs = inputs[: args.runs]
     recs = _execute_entry_subprocess(args.entry, inputs,
-                                     corpus_path.parent, args.timeout)
+                                     corpus_path.parent, args.timeout,
+                                     args.mem_limit_mb)
     corpus_digest = sha256_bytes(corpus_path.read_bytes())
 
     setup_error = _first_setup_error(recs)
@@ -1028,6 +1033,16 @@ def main(argv=None) -> int:
     p.add_argument("--manifest", required=True, help="JSON manifest (see module docstring)")
     p.add_argument("--runs", type=int, default=0, help="cap the corpus (0 = all)")
     p.add_argument("--timeout", type=float, default=120.0, help="per-side timeout (s)")
+    p.add_argument("--mem-limit-mb", type=int, default=None,
+                   help="per-child cgroup memory ceiling in MB (issue #74): "
+                        "each reference/candidate child runs in its own "
+                        "systemd-run user scope (cgroup-v2 MemoryMax, "
+                        "MemorySwapMax=0), so a ballooning child is killed "
+                        "alone (SIGKILL -> 137) and judged setup_error -> "
+                        "incomparable — instead of a host-wide OOM failing "
+                        "the session server (#73). None (default) runs "
+                        "children unscoped; falls back to unscoped with a "
+                        "stderr warning when systemd-run is unavailable")
     p.set_defaults(func=cmd_judge)
 
     p = sub.add_parser(
@@ -1043,6 +1058,10 @@ def main(argv=None) -> int:
                         "directory as cwd")
     p.add_argument("--runs", type=int, default=0, help="cap the corpus (0 = all)")
     p.add_argument("--timeout", type=float, default=120.0, help="per-side timeout (s)")
+    p.add_argument("--mem-limit-mb", type=int, default=None,
+                   help="per-child cgroup memory ceiling in MB (issue #74) — "
+                        "same scoping as judge children; a breach shows as a "
+                        "setup error row, not a host OOM")
     p.set_defaults(func=cmd_corpus)
 
     p = sub.add_parser("compare", help="classify pre-captured runs (shadow mode)")

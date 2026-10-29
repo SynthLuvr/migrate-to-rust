@@ -85,7 +85,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shlex
 import shutil
@@ -590,12 +589,13 @@ def _attributed_spans(output: str, rust_file_rel: str) -> dict:
 
 
 def _run_gate(cmd: str, subs: dict, cwd: Path, timeout: float,
-              env: dict[str, str] | None = None) -> dict:
+              env: dict[str, str] | None = None,
+              mem_limit_mb: int | None = None) -> dict:
     rendered = cmd.format_map(_Template(subs))
     argv = shlex.split(rendered)
     try:
         rc, out, err = run_child(argv, cwd=str(cwd), timeout=timeout,
-                                 env_extra=env)
+                                 env_extra=env, mem_limit_mb=mem_limit_mb)
     except subprocess.TimeoutExpired:
         return {"cmd": rendered, "exit_code": 124,
                 "output": f"timed out after {timeout:g}s", "truncated": False}
@@ -608,19 +608,23 @@ def _run_gate(cmd: str, subs: dict, cwd: Path, timeout: float,
 
 
 def _invoke_agent(cmd_template: str, subs: dict, cwd: Path,
-                  timeout: float, env: dict[str, str] | None = None
-                  ) -> tuple[int, str]:
-    cmd = cmd_template.format_map(_Template(subs))
+                  timeout: float, env: dict[str, str] | None = None,
+                  mem_limit_mb: int | None = None) -> tuple[int, str]:
+    """Rides _common.run_child — the harness's single child-process choke
+    point (issue #74) — so the agent gets the fixed env, captured output,
+    hard timeout, and (when mem_limit_mb is set) the per-child cgroup
+    memory scope: a ballooning agent dies alone as exit 137 instead of
+    OOM-killing the host."""
+    cmd = shlex.split(cmd_template.format_map(_Template(subs)))
     try:
-        proc = subprocess.run(shlex.split(cmd), cwd=str(cwd),
-                              capture_output=True, text=True, timeout=timeout,
-                              env={**dict(os.environ), **(env or {})})
+        rc, out, err = run_child(cmd, cwd=str(cwd), timeout=timeout,
+                                 env_extra=env, mem_limit_mb=mem_limit_mb)
     except FileNotFoundError as e:
         return 127, f"agent command not found: {e}"
     except subprocess.TimeoutExpired:
         return 124, f"agent timed out after {timeout:g}s"
-    tail = ((proc.stdout or "") + (proc.stderr or ""))[-TAIL:]
-    return proc.returncode, tail
+    tail = ((out or "") + (err or ""))[-TAIL:]
+    return rc, tail
 
 
 def _feedback_text(entry: dict, round_no: int, max_rounds: int,
@@ -693,12 +697,20 @@ def _derive_judge_files(base_manifest_path: Path, manifest: dict, entry: dict,
     return derived_manifest
 
 
-def _judge_candidate(derived_manifest: Path, timeout: float) -> dict:
+def _judge_candidate(derived_manifest: Path, timeout: float,
+                     mem_limit_mb: int | None = None) -> dict:
     """Run oracle.py judge over the derived manifest as a real subprocess —
     no verdict is ever produced in here: the oracle ranks, not the model
-    and not this tool."""
+    and not this tool. With mem_limit_mb set (issue #74) the flag is
+    forwarded to the oracle, which scopes each judge child (the #73
+    victim) to MemoryMax — the oracle PARENT stays unscoped from here on
+    purpose: it must survive a breach to record setup_error and return
+    the incomparable verdict (the run-level migration.slice bounds the
+    parent; see tools/glv-subagents.md)."""
     cmd = [sys.executable, str(ORACLE), "judge",
            "--manifest", str(derived_manifest), "--timeout", str(timeout)]
+    if mem_limit_mb is not None:
+        cmd += ["--mem-limit-mb", str(mem_limit_mb)]
     try:
         rc, out, err = run_child(cmd, cwd=str(derived_manifest.parent),
                                  timeout=timeout * 2 + 60)
@@ -732,7 +744,8 @@ def _judge_candidate(derived_manifest: Path, timeout: float) -> dict:
 
 def _gates_after_agent(rec: dict, entry: dict, gates: list[str], subs: dict,
                        import_allow: set[str], target_root: Path,
-                       gate_timeout: float, isolation: dict | None = None
+                       gate_timeout: float, isolation: dict | None = None,
+                       mem_limit_mb: int | None = None
                        ) -> tuple[list[dict], dict | None]:
     """The import gate plus the compile gates, run only after a clean agent
     exit; import findings ride rec for the verdict pack. Under isolation
@@ -747,7 +760,8 @@ def _gates_after_agent(rec: dict, entry: dict, gates: list[str], subs: dict,
                   "output": "\n".join(findings),
                   "truncated": False}], None)
     if isolation is None:
-        return [_run_gate(g, subs, target_root, gate_timeout)
+        return [_run_gate(g, subs, target_root, gate_timeout,
+                          mem_limit_mb=mem_limit_mb)
                 for g in gates], None
     sandbox = _materialize_sandbox(
         target_root, isolation["sandbox_root"] / entry["candidate"],
@@ -756,7 +770,8 @@ def _gates_after_agent(rec: dict, entry: dict, gates: list[str], subs: dict,
     gate_subs = {**subs, "rust_file": str(root / entry["rust_file_rel"]),
                  "target_root": sandbox["root"]}
     return [_run_gate(g, gate_subs, root, gate_timeout,
-                      env=_cargo_env(isolation["cargo_target"]))
+                      env=_cargo_env(isolation["cargo_target"]),
+                      mem_limit_mb=mem_limit_mb)
             for g in gates], sandbox
 
 
@@ -787,7 +802,8 @@ def _run_candidate(entry: dict, args, gates: list[str], import_allow: set[str],
                 _feedback_text(entry, round_no, args.max_rounds, None, None),
                 encoding="utf-8")
         rc, tail = _invoke_agent(args.agent_cmd, subs, target_root,
-                                 args.agent_timeout, env=agent_env)
+                                 args.agent_timeout, env=agent_env,
+                                 mem_limit_mb=args.mem_limit_mb)
         rec["agent_invocations"] += 1
         round_rec: dict = {"round": round_no, "agent_exit": rc,
                            "agent_tail": tail[-800:]}
@@ -796,7 +812,8 @@ def _run_candidate(entry: dict, args, gates: list[str], import_allow: set[str],
         if rc == 0:
             gate_recs, sandbox = _gates_after_agent(
                 rec, entry, gates, subs, import_allow, target_root,
-                args.gate_timeout, isolation)
+                args.gate_timeout, isolation,
+                mem_limit_mb=args.mem_limit_mb)
         # evidence stays exact: a round blocked by the import gate ran in no
         # sandbox, so the pack must not cite an earlier round's
         if sandbox is not None:
@@ -1017,7 +1034,8 @@ def _build_wheel(args, target_root: Path, plan: list[dict],
     try:
         rc, out, err = run_child(shlex.split(args.build_cmd),
                                  cwd=str(cwd),
-                                 timeout=args.build_timeout, env_extra=env)
+                                 timeout=args.build_timeout, env_extra=env,
+                                 mem_limit_mb=args.mem_limit_mb)
     except subprocess.TimeoutExpired:
         rc, out, err = 124, "", f"build timed out after {args.build_timeout:g}s"
     except FileNotFoundError as e:
@@ -1062,7 +1080,8 @@ def _judge_green_candidates(plan: list[dict], green: list[dict], args,
                                "adapter with a CANDIDATE_MODULE line — "
                                "cannot retarget per candidate")
             continue
-        r["judge"] = _judge_candidate(derived, args.judge_timeout)
+        r["judge"] = _judge_candidate(derived, args.judge_timeout,
+                                      mem_limit_mb=args.mem_limit_mb)
         r["judge"]["manifest"] = str(derived)
         r["judge"]["wheel_module"] = wheel_module
         judged_any = bool(r["judge"].get("judged"))
@@ -1269,6 +1288,18 @@ def main(argv=None) -> int:
     p.add_argument("--gate-timeout", type=float, default=GATE_TIMEOUT)
     p.add_argument("--build-timeout", type=float, default=BUILD_TIMEOUT)
     p.add_argument("--judge-timeout", type=float, default=JUDGE_TIMEOUT)
+    p.add_argument("--mem-limit-mb", type=int, default=None,
+                   help="per-child cgroup memory ceiling (MB, issue #74): "
+                        "every child this command spawns — the agent, each "
+                        "gate, the wheel build, and the oracle judge's "
+                        "children — runs in its own systemd-run user scope "
+                        "(cgroup-v2 MemoryMax, MemorySwapMax=0). A breach "
+                        "dies alone (SIGKILL -> exit 137 -> setup_error -> "
+                        "incomparable -> ESC-1 defers) instead of OOM-killing "
+                        "the session server (#73). None (default) leaves "
+                        "children unscoped; policy defaults are issue #76. "
+                        "Falls back to unscoped with a stderr warning when "
+                        "systemd-run is unavailable")
     p.add_argument("--dry-run", action="store_true",
                    help="print the derived plan (paths, briefs, gates) — no "
                         "agent, no writes")

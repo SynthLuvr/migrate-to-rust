@@ -70,6 +70,73 @@ transport.
    `GLV_API_TOKEN`, and continue — re-auth is never a stop and never a
    human ask. Never fall back to riding a browser cookie.
 
+## Memory containment — never the host's problem (issue #74)
+
+One runaway child must fail as a **unit-level escalation** (child exits
+non-zero → oracle records `setup_error` → verdict `incomparable` → ESC-1
+defers, Python fallback stays live) — never as a host or service failure.
+The overnight OOM kills in #73 happened because nothing in the chain had
+a memory ceiling: the kernel killed the fattest process, systemd marked
+the whole `glv.service` unit failed, and the restart loop re-ran the same
+ballooning workload.
+
+**Per-child scopes (in code).** Every child the harness spawns funnels
+through `_common.run_child()` — the oracle judge children, the parity
+gates, cargo/miri/clippy, delegate agents (issue #74 closed the last
+bypass: `delegate.py::_invoke_agent`), the wheel build, and the driver's
+stage workers. `run_child(..., mem_limit_mb=N)` prefixes the command with
+
+```bash
+systemd-run --user --scope -p MemoryMax=<N>M -p MemorySwapMax=0 \
+  --unit=run-child-<exe>-<pid>-<n> -- <cmd...>
+```
+
+so a breach is killed by the memcg (SIGKILL → exit 137) **inside its own
+scope** — attributable by unit name in the journal — while the server,
+sibling sessions, and the parent tool keep running. cgroup v2
+`MemoryMax` bounds actual memory (RSS); `RLIMIT_AS` does not (it counts
+address space and breaks rustc/LLVM's large reservations). When
+`systemd-run` is unavailable or the scope cannot start (container CI),
+`run_child` falls back to unscoped with a `[run_child]` stderr warning —
+the harness stays portable and never hard-fails the tool. Opt in per
+command: `oracle.py judge --mem-limit-mb`, `delegate.py run-candidates
+--mem-limit-mb` (agent + gates + build + judge children), `pipeline.py
+run --agent-mem-limit-mb`. Policy-owned defaults (what N should be) are
+issue #76.
+
+**Run-level slice (the launch path).** Per-child scopes bound each child;
+a whole unattended run (driver, chain, or recipe) is bounded independently
+of the session server by launching it inside a dedicated user slice.
+Install the shipped slice once:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp framework/tools/migration.slice ~/.config/systemd/user/migration.slice
+systemctl --user daemon-reload
+```
+
+Then prefix the launch — the driver, the chain, or the goose recipe:
+
+```bash
+systemd-run --user --slice=migration.slice --scope \
+  -p MemoryHigh=6G -p MemoryMax=8G -p MemorySwapMax=0 \
+  --unit=migration-<project> \
+  python framework/tools/pipeline.py run framework/state/migration-state.json \
+    --agent-cmd 'goose run --recipe {framework}/recipe.yaml'
+# chain harness:
+systemd-run --user --slice=migration.slice --scope ... --unit=migration-<project> \
+  python framework/tools/succession.py chain framework/state/migration-state.json
+```
+
+A scope-killed run is attributable (`journalctl --user-unit
+migration-<project>.scope`) and the session continues: the chain
+composes a successor per `succession.py` — no service crash-restart.
+`pipeline.py run` and `succession.py chain` report a `containment` block
+(cgroup, unit, whether inside `migration.slice`) so the artifacts alone
+show where the run was bounded. The GLV server itself stays OUTSIDE the
+slice on purpose — it must survive a run's breach; server-side per-run
+bounding is the companion glv#392.
+
 ## API cheat sheet
 
 | Purpose | Call | Notes |
@@ -205,7 +272,9 @@ Per unit, in leaf-first dependency order:
   signalled once when the run settles, so a delegate's background jobs
   cannot outlive it and leak into the service's cgroup. Launch freely,
   but still `stop` anything left running when you escalate: the
-  six-slot queue is pipeline throughput.
+  six-slot queue is pipeline throughput. Memory is contained the same
+  way — per-child cgroup scopes at the `run_child` choke point plus the
+  run-level `migration.slice` (§ *Memory containment*, issue #74).
 - **Attribution survives the hop.** Code reaches the repo only through
   the orchestrator's commit discipline (provenance headers, checked by
   `attribution.py`).
