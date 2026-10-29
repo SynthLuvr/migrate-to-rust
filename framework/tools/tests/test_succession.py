@@ -931,8 +931,10 @@ def test_chained_resume_does_not_warn_but_plain_resume_still_does(
 def test_pipeline_budget_exhausted_points_at_the_chain(monkeypatch, capsys,
                                                        tmp_path):
     """pipeline.py's own budget_exhausted exit is the RUN-level bound; its
-    summary says the session-level case chains automatically and never
-    presents a human resume path as the expected outcome (issue #47)."""
+    summary names it as the only thing that can stop a healthy run (ADR
+    design/0001 — contexts are recycled per unit chunk, so a ceiling stop
+    is a budget decision, never a resume path) and never presents a human
+    resume as the expected outcome (issue #47)."""
     p = _midrun_state(tmp_path, run_status="pending",
                       budget={"max_tokens": 5000,
                               "max_wall_clock_minutes": 720,
@@ -943,8 +945,8 @@ def test_pipeline_budget_exhausted_points_at_the_chain(monkeypatch, capsys,
     code, out = run_tool(monkeypatch, capsys, "pipeline.py",
                          ["run", str(p), "--dry-run"])
     assert code == 0 and out["run_status"] == "budget_exhausted"
-    assert "succession.py" in out["summary"]["human"]
-    assert "session-level" in out["summary"]["human"]
+    assert "run-level budget is spent" in out["summary"]["human"]
+    assert "design/0001" in out["summary"]["human"]
     assert "manual" not in out["summary"]["human"]
 
 

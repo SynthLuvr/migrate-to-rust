@@ -1,7 +1,7 @@
 # Python → Rust Migration Harness — Agent Prompt
 
 **Portable harness.** Paste this file into any coding agent as system context:
-goose (`recipe.yaml` directs the agent here) · Claude Code `CLAUDE.md` ·
+goose · Claude Code `CLAUDE.md` ·
 Codex/Aider `AGENTS.md`/`CONVENTIONS.md`. It encodes the pipeline from
 [`../SUMMARY.md`](../SUMMARY.md) §3 and its 10 evidence-backed requirements as
 executable rules. Per-stage checklists: [`stages/`](stages/). Helper-tool
@@ -27,21 +27,31 @@ operate a pipeline; the gates decide, not you.
 
 **Who runs the loop.** Two operating modes (issue #22):
 
+- **Driver-driven (L2/L3, the acceptance path — design/0001)** — the
+  deterministic driver [`tools/pipeline.py`](tools/pipeline.py) owns the
+  run start to finish (stage order, exit-criteria verification, gate
+  resolution via [`autonomy/policy.json`](autonomy/policy.json), budget
+  guard, terminal states) and invokes *you* as a **chunk worker** through
+  any CLI agent: a whole stage outside Stage 4, or exactly ONE unit at
+  Stage 4 (the `{unit}`/`{brief_file}` placeholders). Contexts are
+  disposable: if your context runs low, record what you verified through
+  `tools/state.py` and exit — the driver recycles a fresh context on the
+  same brief. Never "wrap up" or end the run; the run is the driver
+  process's, not yours. Record only chunk results in the state file and
+  never touch gates, `run_status`, or `stage` — those are the driver's.
+  Judgment stays inside chunks (tranche selection, decomposition,
+  repair); gate decisions are code. A unit that cannot finish after the
+  policy's fresh-context retries is escalated (ESC-1 defer, Python
+  fallback stays live) and the backlog continues — one bad unit never
+  stops the run.
 - **Agent-driven (L0/L1)** — you drive stages 0→7 yourself per this prompt
   and the stage checklists. You never stop to ask a human: at a gate you
   leave it open with the evidence recorded and end the run with the
-  dossier; the operator decides *between* runs, never mid-run.
-- **Driver-driven (L2/L3)** — the deterministic driver
-  [`tools/pipeline.py`](tools/pipeline.py) owns the loop (stage order,
-  exit-criteria verification, gate resolution via
-  [`autonomy/policy.json`](autonomy/policy.json), budget guard, terminal
-  states) and invokes *you* as a **stage worker** through any CLI agent.
-  In this mode: do the current stage's work only, record results in the
-  state file through `tools/state.py`, and never touch gates, `run_status`,
-  or `stage` — those are the driver's. Judgment stays inside stages (tranche
-  selection, decomposition, repair); gate decisions are code.
-- **Chained (any level)** — when the run is started by
-  [`tools/succession.py chain`](tools/succession.py) (issue #25), the
+  dossier; the operator decides *between* runs, never mid-run. (The
+  driver refuses these levels; they are the supervised exception, not the
+  acceptance path.)
+- **Chained (any level, optional GLV transport)** — when the run is started
+  by [`tools/succession.py chain`](tools/succession.py) (issue #25), the
   orchestrator role itself runs as a series of GLV sessions: if your
   session's context budget exhausts before the run reaches a terminal
   state, record `budget_exhausted` and stop — the harness spawns a
@@ -54,7 +64,9 @@ operate a pipeline; the gates decide, not you.
   the runbook section every session runs before any role or chain work.
   A run then finishes from one human prompt with zero manual restarts;
   the run-level ceilings and the chain guardrails (depth cap, monotonic
-  progress) bound everything.
+  progress) bound everything. This is the OPTIONAL multi-process variant
+  of the same guarantee the driver already provides in one process
+  (design/0001) — not a prerequisite for it.
 
 ## Hard rules — violating any one fails the task
 
@@ -203,11 +215,12 @@ Divergent / Incomparable`; every Divergent carries a written explanation.
   start `glv serve` if nothing answers, mint your own token
   `glv token create --name run-<project>-s<n>`, export
   `GLV_BASE_URL`/`GLV_API_TOKEN`, re-mint on a 401 run). The oracle
-  still judges; GLV only carries the roles. GLV also carries the
+  still judges; GLV only carries the roles. GLV can also carry the
   **orchestrator chain**
-  ([`tools/succession.py`](tools/succession.py), issue #25):
-  session-level `budget_exhausted` spawns the successor session
-  automatically, so the whole run finishes from one human prompt.
+  ([`tools/succession.py`](tools/succession.py), issue #25) as the
+  optional multi-process variant; in the default single-process model
+  (design/0001) the driver itself recycles contexts per chunk, so one
+  human prompt — one command — finishes the run.
 
 ## Gates — autonomy levels and policy resolution (issue #22)
 
@@ -254,14 +267,17 @@ Rules of the rules:
   `no_go_measured` / `budget_exhausted` / `failed_safely` — never "awaiting
   input". Every terminal state emits the same deliverable set (run report
   with the gate + escalation dossiers, state file, journal). Global
-  token/time ceilings are enforced by the driver. `budget_exhausted` at
-  the *session* level (the orchestrator's context window) is a scheduling
-  event, not a result: `tools/succession.py` chains a successor session
-  automatically (depth-capped, progress-guarded, stop-noticed — issues
-  #25/#47), so it never survives as a run's final status; it stays final
-  only when the run-level ceilings themselves are spent — the
-  pre-authorized budget is gone, and raising it is the operator's
-  between-runs decision, never a mid-run ask.
+  day-scale ceilings are enforced by the driver (design/0001: policy
+  v1.4.0 budgets are the only thing that can stop a healthy run — agent
+  contexts are recycled per chunk, so no context window is a run limit).
+  A context exhausting mid-chunk is a scheduling
+  event, not a result: the driver starts a fresh context on the same
+  brief (and, under the optional GLV chain, `tools/succession.py` spawns
+  a successor session — depth-capped, progress-guarded — issues
+  #25/#47). `budget_exhausted` stays final only when the run-level
+  ceilings themselves are spent — the pre-authorized budget is gone, and
+  raising it is the operator's between-runs decision, never a mid-run
+  ask.
 - Undecidable-from-evidence gates (e.g. a substitution with no recorded
   module) stay open and drain into the report — they never block silently.
 - Safety rests on the dual-build design: per-unit Python fallback, the
@@ -280,5 +296,5 @@ Rules of the rules:
 | Optimized Python matches the port | port wasn't the win | report honestly; keeping Python is a success |
 | Agent pauses to ask a human at a gate | pre-policy gate behavior | gates resolve in code, or the run ends with the dossier for between-runs operator review — "ask" is never an available move |
 | OOM kill of the orchestrator/session server | children ran unscoped — one runaway child's RSS is the *service's* problem (#73) | run under a memory scope: per-child ceilings + the `migration.slice` from [`autonomy/policy.json`](autonomy/policy.json) `memory` (`policy:MEM-1`, issue #76, launch command in `tools/glv-subagents.md` § *Memory containment*); a scope breach is a **unit escalation (ESC-1 defer)** — child dies alone (exit 137 → setup_error → incomparable), journaled with observed peak + limit — never a service crash |
-| Run parks in `budget_exhausted`, waiting for a human to notice and restart | session-level exhaustion (the orchestrator's context window) treated as a human-facing result | `tools/succession.py` spawns the successor GLV session automatically (issue #25) and bootstraps GLV itself (issue #47); only run-level ceiling exhaustion ends the chain — and then the operator's move is to raise the ceiling between runs, never to restart by hand |
+| Run parks in `budget_exhausted`, waiting for a human to notice and restart | a context window (or a parked orchestrator session) treated as a human-facing result | design/0001: the driver recycles agent contexts per chunk and escalates stuck units — a run stops only on the run-level ceilings; raising `autonomy.budget` between runs is the operator's move, never a mid-run restart by hand (the optional GLV chain, `tools/succession.py`, extends the same guarantee across processes — issues #25/#47) |
 | Private project names leak into public artifacts (PRs, issues, commits) | run reports and state files name the target project | `runs/` stays gitignored; anonymize target-project names in anything committed or posted publicly — refer to "a target project", never its name |

@@ -9,7 +9,7 @@ A research-grounded design for a framework that helps **AI agents migrate Python
 | **[SUMMARY.md](SUMMARY.md)** | The research synthesis: verified case studies with numbers, the 10 evidence-backed requirements, the framework architecture, honest caveats |
 | **[TOOLCHAIN.md](TOOLCHAIN.md)** | The tool list, organized by pipeline stage — what to adopt off-the-shelf vs what the framework must build |
 | **[research/](research/)** | 6 source files (~1,100 lines): case studies, manual-migration lessons, tool catalog with maintenance verification, academic literature, idiom/ecosystem mapping — every quantitative claim carries its source URL; unverifiable claims are flagged |
-| **[framework/](framework/)** | The executable packaging of the research: agent prompt, goose orchestrator recipe, 8 stage checklists, translator/reviewer roles, 8 gap-tool specs, the GLV subagent-transport guide, crate-substitution knowledge, the migration state schema, and a [worked example](framework/examples/) showing the artifacts a real run leaves behind |
+| **[framework/](framework/)** | The executable packaging of the research: agent prompt, deterministic driver, 8 stage checklists, translator/reviewer roles, 8 gap-tool specs, the GLV subagent-transport guide, crate-substitution knowledge, the migration state schema, and a [worked example](framework/examples/) showing the artifacts a real run leaves behind |
 | **[scripts/](scripts/)** | CI checker scripts (stdlib-only): `check_json.py` parse-checks every JSON file, `check_links.py` resolves every relative markdown link (plus an optional `--external` citation URL spot-check) |
 
 ## The one-paragraph thesis
@@ -18,7 +18,7 @@ Successful AI-driven ports (Volatility3: 29k LOC in 68 h for ~$3k of tokens at 6
 
 ## CI
 
-Every push and PR ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs, with no LLM calls: `goose recipe validate` + a `--render-recipe` smoke test against a pinned goose (catches recipe-format drift like the 1.53 `author`/`context` breakage), JSON parse checks, JSON Schema validation of the state file (including rejecting deliberately incomplete units), an internal-markdown-link check, and the tools test-suite. A best-effort, non-blocking citation URL spot-check runs alongside.
+Every push and PR ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs, with no LLM calls: a full driver acceptance run against a stub agent (boots from `--target`, reaches `complete`, recycles Stage-4 unit contexts, escalates a stuck unit instead of halting), JSON parse checks, JSON Schema validation of the state file (including rejecting deliberately incomplete units), an internal-markdown-link check, and the tools test-suite. A best-effort, non-blocking citation URL spot-check runs alongside.
 
 ## What the evidence flatly rules out
 
@@ -30,5 +30,5 @@ Every push and PR ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs,
 
 ## License
 
-[MIT](LICENSE) — free to use, adapt, and redistribute, provided the license notice is retained. The research digests and the framework artifacts (recipe, prompts, stage checklists, schema) are all covered.
+[MIT](LICENSE) — free to use, adapt, and redistribute, provided the license notice is retained. The research digests and the framework artifacts (driver, prompts, stage checklists, schema) are all covered.
 

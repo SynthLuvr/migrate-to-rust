@@ -167,7 +167,7 @@ loop:
 - **Autonomy levels** (`--autonomy L0..L3`, pre-authorized before the run):
   L2 (the default for new runs) resolves every gate by policy, publish
   disabled; L3 adds cutover/publish. L0/L1 stay with the agent-driven
-  recipe, which never asks either: the gate stays open, the run ends with
+  mode, which never asks either: the gate stays open, the run ends with
   the dossier, and the operator decides between runs (the driver refuses
   these levels). Zero mid-run questions at any level.
 - **Terminal-state discipline**: a run always ends in `complete` /
@@ -495,8 +495,14 @@ python framework/tools/state.py validate|journal|show|migrate state.json
 # oracle self-test 5/5, rust-template HEAD SHA, toolchain, target
 # venv/PYO3_PYTHON, substitutions freshness -> one journaled block + report
 python framework/tools/pipeline.py preflight state.json --target-root /abs/target
+# single-session entrypoint (design/0001): boots the state from --target when
+# absent, then drives start to finish — day-scale budgets, unit-chunk
+# contexts, any CLI agent behind --agent-cmd
+python framework/tools/pipeline.py run --target /abs/target \
+  --agent-cmd '<any CLI agent> {stage} {state} {stage_file} {framework} {unit} {brief_file}' \
+  --autonomy L2
 python framework/tools/pipeline.py run state.json \
-  --agent-cmd 'goose run --recipe {framework}/recipe.yaml' --autonomy L2
+  --agent-cmd '<any CLI agent> {stage} {state} {stage_file} {framework} {unit} {brief_file}' --autonomy L2
 python framework/tools/pipeline.py resolve-gates state.json   # policy only, no agent
 python framework/tools/pipeline.py status|report state.json
 

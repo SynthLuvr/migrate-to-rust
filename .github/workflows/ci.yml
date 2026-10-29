@@ -5,47 +5,11 @@ on:
     branches: [main]
   pull_request:
 
-# Pinned goose for the recipe checks. The recipe format changed across goose
-# versions (early versions had a `context` block; 1.53 does not), so validate
-# against one known-good version and bump deliberately.
-env:
-  GOOSE_VERSION: 1.53.0
+# design/0001: no agent-specific packaging — CI exercises the deterministic
+# driver end-to-end against a stub agent (no LLM calls, no goose install).
+# The full acceptance suite lives in framework/tools/tests/test_pipeline.py.
 
 jobs:
-  recipe:
-    name: recipe validate + render smoke test (pinned goose)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install pinned goose
-        run: |
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL \
-            "https://github.com/block/goose/releases/download/v${GOOSE_VERSION}/goose-x86_64-unknown-linux-gnu.tar.gz" \
-            -o goose.tgz
-          tar -xzf goose.tgz
-          install -m 0755 goose "$HOME/.local/bin/goose"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Verify goose version matches the pin
-        run: |
-          version="$(goose --version | tr -d '[:space:]')"
-          echo "goose ${version} (pinned: ${GOOSE_VERSION})"
-          test "$version" = "$GOOSE_VERSION"
-      - name: Recipe validates
-        run: goose recipe validate framework/recipe.yaml
-      - name: Render smoke test
-        run: |
-          goose run --recipe framework/recipe.yaml \
-            --params TARGET_PYTHON_PROJECT=/tmp/example-project \
-            --render-recipe > rendered.yaml
-          test -s rendered.yaml
-          echo "--- rendered recipe:"
-          cat rendered.yaml
-          echo "--- placeholder scan:"
-          grep -n '/tmp/example-project' rendered.yaml
-          # no $VAR or {{ mustache }} template syntax may remain
-          ! grep -nE '\{\{|[$][A-Za-z_][A-Za-z0-9_]*' rendered.yaml
-
   json-and-links:
     name: JSON validity + internal markdown links
     runs-on: ubuntu-latest
@@ -103,5 +67,31 @@ jobs:
         run: pip install pytest "jsonschema>=4.18"
       - name: Run the tools test-suite (oracle 5/5 gate, journaling, attribution, ...)
         run: python -m pytest framework/tools/tests/ -v
+      - name: Driver acceptance run — one command, start to finish (stub agent)
+        run: |
+          python - <<'EOF'
+          import json, subprocess, sys, tempfile
+          from pathlib import Path
+          tmp = Path(tempfile.mkdtemp())
+          proj = tmp / "acceptance-proj"
+          (proj / "src" / "acceptance_proj").mkdir(parents=True)
+          (proj / "src" / "acceptance_proj" / "__init__.py").write_text("")
+          (proj / "pyproject.toml").write_text('[project]\nname = "acceptance-proj"\n')
+          stub = tmp / "stub_agent.py"
+          src = Path("framework/tools/tests/test_pipeline.py").read_text()
+          stub.write_text(src.split("STUB_AGENT = '''")[1].split("'''")[0])
+          cmd = (f"{sys.executable} {stub} "
+                 f"{Path('framework/tools/state.py').resolve()} "
+                 f"{{state}} {{stage}}")
+          r = subprocess.run(
+              [sys.executable, "framework/tools/pipeline.py", "run",
+               "--target", str(proj), "--runs-dir", str(tmp / "runs"),
+               "--agent-cmd", cmd],
+              capture_output=True, text=True)
+          out = json.loads(r.stdout)
+          assert out["run_status"] == "complete", out
+          assert out["terminal"] is True, out
+          print("driver acceptance run:", out["summary"]["human"])
+          EOF
       - name: Oracle judge-first self-test (the Stage 2 hard gate)
         run: python framework/tools/oracle.py self-test

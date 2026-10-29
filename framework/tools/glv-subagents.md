@@ -115,7 +115,7 @@ journal, resolving as ESC-1 defer; per-side peak RSS rides the verdict
 payload's `resources.peak_rss_mb`.
 
 **Run-level slice (the launch path).** Per-child scopes bound each child;
-a whole unattended run (driver, chain, or recipe) is bounded independently
+a whole unattended run (driver or chain) is bounded independently
 of the session server by launching it inside a dedicated user slice — the
 ceiling is policy too: `memory.run_scope_mb` (`policy:MEM-1`, 8192 MB).
 Install the shipped slice once:
@@ -126,14 +126,14 @@ cp framework/tools/migration.slice ~/.config/systemd/user/migration.slice
 systemctl --user daemon-reload
 ```
 
-Then prefix the launch — the driver, the chain, or the goose recipe:
+Then prefix the launch — the driver or the chain:
 
 ```bash
 systemd-run --user --slice=migration.slice --scope \
   -p MemoryHigh=6G -p MemoryMax=8G -p MemorySwapMax=0 \
   --unit=migration-<project> \
-  python framework/tools/pipeline.py run framework/state/migration-state.json \
-    --agent-cmd 'goose run --recipe {framework}/recipe.yaml'
+  python framework/tools/pipeline.py run --target /abs/target \
+    --agent-cmd '<any CLI agent> {brief_file}'
 # chain harness:
 systemd-run --user --slice=migration.slice --scope ... --unit=migration-<project> \
   python framework/tools/succession.py chain framework/state/migration-state.json

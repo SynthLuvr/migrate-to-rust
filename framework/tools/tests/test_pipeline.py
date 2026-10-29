@@ -454,15 +454,18 @@ def test_resolve_gates_refusal_explains_schema_only_state(monkeypatch, capsys,
     assert "autonomy block reads as L0" in out["error"]
 
 
-def test_recipe_prompt_inits_state_via_state_py():
-    """issue #27: the recipe used to tell the orchestrator to hand-write the
-    state file from the schema — autonomy is not schema-required, so that
-    file read as L0 and the run's first resolve-gates failed. The prompt
-    must initialize through state.py init (autonomy journaled, default L2)."""
-    recipe = (REPO_ROOT / "framework" / "recipe.yaml").read_text()
-    assert "state.py init framework/state/migration-state.json" in recipe
+def test_prompt_inits_state_via_state_py():
+    """issue #27: the prompt must tell the orchestrator to initialize the
+    state file through state.py init (autonomy journaled, default L2) —
+    never hand-written from the schema, which reads as L0 and fails its
+    first resolve-gates."""
+    prompt = (REPO_ROOT / "framework" / "MIGRATION_PROMPT.md").read_text()
+    assert "state.py init" in prompt
     # the hand-init phrasing that produced autonomy-less (L0) state is gone
-    assert "migration-state.json from" not in recipe
+    assert "migration-state.json from" not in prompt
+
+    # design/0001 R6: no agent-specific packaging anywhere in the framework
+    assert not (REPO_ROOT / "framework" / "recipe.yaml").exists()
 
 
 def test_resolve_gates_dry_run_writes_nothing(monkeypatch, capsys, tmp_path):
@@ -894,3 +897,170 @@ def test_substitutions_freshness_flags_stale_and_unparsable_versions():
     unparsable = pipeline_tool._substitutions_record({"version": "recent"},
                                                      date(2026, 10, 28))
     assert unparsable["stale"] is True and unparsable["age_days"] is None
+
+
+# ------------------------------------------------- unit-chunk driving (ADR 0001)
+
+UNIT_STUB_AGENT = '''#!/usr/bin/env python3
+import json, subprocess, sys
+STATE_PY, state_path, stage = sys.argv[1], sys.argv[2], int(sys.argv[3])
+counts_path, mode = sys.argv[-2], sys.argv[-1]
+# {unit} formats to "" for stage-level passes and shlex drops it, so the
+# unit (when present) is whatever sits between stage and the tail args
+unit = sys.argv[4] if len(sys.argv) > 6 else ""
+
+def bump(key):
+    c = json.loads(open(counts_path).read() or "{}")
+    c[key] = c.get(key, 0) + 1
+    json.dump(c, open(counts_path, "w"))
+    return c[key]
+
+def sp(*a):
+    r = subprocess.run([sys.executable, STATE_PY, *a], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+def setf(field, value):
+    sp("set", state_path, "--field", f"{field}={value}", "--json-value")
+
+if stage == 0:
+    setf("go_no_go", json.dumps({
+        "decision": "go", "scope": ["demo.parse", "demo.rank"],
+        "projection": {"scoped_loc": 900, "token_cost_usd": 153.0,
+                       "end_to_end_saving_pct": 58.0},
+        "no_equivalent_deps": []}))
+elif stage == 1:
+    setf("units", json.dumps([
+        {"id": "u-parse-1", "python_path": "src/demo/parse.py", "deps": [],
+         "order": 1, "status": "pending",
+         "contract": {"covering_tests": ["tests/test_parse.py::test_roundtrip"]}},
+        {"id": "u-rank-2", "python_path": "src/demo/rank.py",
+         "deps": ["u-parse-1"], "order": 2, "status": "pending",
+         "contract": {"covering_tests": ["tests/test_rank.py::test_order"]}}]))
+elif stage == 2:
+    setf("judge_validation", json.dumps({
+        "injected_bugs": 5, "caught": 5, "mutation_sample_killed": 90,
+        "normalization_rules": "contracts/normalization.md", "date": "2026-10-27"}))
+elif stage == 3:
+    setf("units[u-parse-1].rust_path", json.dumps("crates/demo/src/u_parse_1.rs"))
+    setf("units[u-rank-2].rust_path", json.dumps("crates/demo/src/u_rank_2.rs"))
+elif stage == 4:
+    if unit == "u-parse-1":
+        n = bump("u-parse-1")
+        if n == 1:
+            # first context exhausts mid-unit: progress recorded, no
+            # terminal status — the driver must recycle a fresh context
+            setf("units[u-parse-1].notes",
+                 json.dumps("attempt 1: context exhausted mid-port"))
+        else:
+            setf("units[u-parse-1].parity", json.dumps({
+                "runs": 30, "equivalent": 30, "divergent": 0, "incomparable": 0,
+                "last_verdict": "equivalent"}))
+            sp("mark", state_path, "--unit", "u-parse-1", "--status", "ported")
+    elif unit == "u-rank-2":
+        bump("u-rank-2")
+        if mode == "stall":
+            pass  # never reaches a terminal status in any context
+        else:
+            sp("mark", state_path, "--unit", "u-rank-2", "--status",
+               "fallback_python", "--note", "descoped: outside the hot tranche")
+    # unit == "" is the driver's stage wrap-up pass: nothing to record
+elif stage == 5:
+    setf("units[u-parse-1].attribution",
+         json.dumps({"header_preserved": True, "notice_ok": True}))
+# stages 6/7: the driver owns the cutover gate; at L2 CUT-1 rejects and
+# Stage 7 maintenance completes the run
+print(f"stub stage {stage} unit {unit!r} done")
+'''
+
+
+def _unit_agent_cmd(tmp_path, mode="port"):
+    stub = tmp_path / "stub_unit_agent.py"
+    stub.write_text(UNIT_STUB_AGENT)
+    counts = tmp_path / "chunk-counts.json"
+    counts.write_text("{}")
+    cmd = (f"{sys.executable} {stub} {TOOLS / 'state.py'} "
+           f"{{state}} {{stage}} {{unit}} {counts} {mode}")
+    return cmd, counts
+
+
+def test_stage4_recycles_agent_contexts_per_unit(monkeypatch, capsys, tmp_path):
+    """ADR 0001 R2/R3: Stage 4 is driven unit-by-unit in fresh contexts; a
+    context that exhausts mid-unit is recycled (with its tail fed back into
+    the brief) and the RUN never notices."""
+    p = tmp_path / "state.json"
+    run_tool(monkeypatch, capsys, "state.py", [
+        "init", str(p), "--name", "demo", "--python-path", "src/demo",
+        "--autonomy-level", "L2"])
+    cmd, counts = _unit_agent_cmd(tmp_path)
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["run", str(p), "--agent-cmd", cmd])
+    assert code == 0, out
+    assert out["run_status"] == "complete"
+    c = json.loads(counts.read_text())
+    # u-parse-1: 1 exhausted context + 1 successful chunk (the stage
+    # wrap-up pass runs with no unit, so it never bumps)
+    assert c["u-parse-1"] == 2
+    # u-rank-2: exactly 1 chunk
+    assert c["u-rank-2"] == 1
+    st = _load(p)
+    units = {u["id"]: u for u in st["units"]}
+    assert units["u-parse-1"]["status"] == "ported"
+    # the exhausted attempt's output tail was fed back verbatim
+    brief = (tmp_path / "delegates" / "u-parse-1" / "driver-brief.md")
+    assert brief.exists() and "Previous attempt 1" in brief.read_text()
+    recycle = [e for e in out["events"] if e.get("event") == "unit-chunk-retry"]
+    assert len(recycle) == 1 and recycle[0]["unit"] == "u-parse-1"
+
+
+def test_stuck_unit_escalates_and_the_run_continues(monkeypatch, capsys, tmp_path):
+    """ADR 0001 R4 — the acceptance criterion: one unit that can never
+    finish cannot stop the run. After the policy's fresh-context retries
+    the unit is escalated (ESC-1 defer, Python fallback live) and the run
+    reaches `complete`."""
+    p = tmp_path / "state.json"
+    run_tool(monkeypatch, capsys, "state.py", [
+        "init", str(p), "--name", "demo", "--python-path", "src/demo",
+        "--autonomy-level", "L2"])
+    cmd, counts = _unit_agent_cmd(tmp_path, mode="stall")
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["run", str(p), "--agent-cmd", cmd])
+    assert code == 0, out
+    assert out["run_status"] == "complete"
+    st = _load(p)
+    units = {u["id"]: u for u in st["units"]}
+    assert units["u-parse-1"]["status"] == "ported"
+    assert units["u-rank-2"]["status"] == "escalated"
+    # policy budget.max_agent_retries_per_unit (3): 4 chunk attempts
+    assert json.loads(counts.read_text())["u-rank-2"] == 4
+    gates = {g["gate"]: g for g in st["human_gates"]}
+    assert gates["unit_escalation"]["state"] == "deferred"
+    assert gates["unit_escalation"]["decided_by"] == "policy:ESC-1"
+    escalated = [e for e in out["events"] if e.get("event") == "unit-escalated"]
+    assert escalated and escalated[0]["unit"] == "u-rank-2"
+
+
+def test_target_boots_a_fresh_run_and_completes(monkeypatch, capsys, tmp_path):
+    """ADR 0001 R6: one command from nothing — `run --target` boots the
+    state (L2, package derived) and drives it to a terminal state. Wiping
+    runs/ is the operator's reset; the next invocation boots fresh."""
+    proj = tmp_path / "widgetpro"
+    (proj / "src" / "widgetpro").mkdir(parents=True)
+    (proj / "src" / "widgetpro" / "__init__.py").write_text("")
+    (proj / "pyproject.toml").write_text('[project]\nname = "widgetpro"\n')
+    runs_dir = tmp_path / "runs"
+    cmd, _counts = _unit_agent_cmd(tmp_path)
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["run", "--target", str(proj),
+                          "--runs-dir", str(runs_dir), "--agent-cmd", cmd])
+    assert code == 0, out
+    assert out["run_status"] == "complete"
+    st = _load(runs_dir / "widgetpro" / "migration-state.json")
+    assert st["project"] == {"name": "widgetpro", "python_path": "src/widgetpro"}
+    assert st["autonomy"]["level"] == "L2"
+    assert st["run_status"] == "complete" and st["stage"] == 7
+
+
+def test_run_without_state_or_target_refuses(monkeypatch, capsys):
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py", ["run"])
+    assert code == 2
+    assert "--target" in out["error"]
