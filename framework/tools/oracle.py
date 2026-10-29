@@ -183,17 +183,16 @@ DEFAULT_CHUNK_ROWS = 500
 #: working set instead of growing monotonically (issue #73)
 GC_EVERY_N_ROWS = 64
 
-#: per-child cgroup memory ceiling in MB for judge/corpus REPL children.
-#: The DEFAULT since issue #76 is the 'memory' block of
-#: autonomy/policy.json (policy:MEM-1, judge_child_mb) — this constant is
-#: the shipped fallback value quoted in --help; a leak must fail THAT
-#: judgment (scope breach -> SIGKILL -> setup_error -> INCOMPARABLE),
+#: per-child cgroup memory ceiling in MB for judge/corpus REPL children:
+#: the default is policy.json memory.judge_child_mb (policy:MEM-1, issue
+#: #76); this constant is the fallback quoted in --help. A leak must fail
+#: THAT judgment (scope breach -> SIGKILL -> setup_error -> INCOMPARABLE),
 #: never the host. ``--mem-limit-mb 0`` opts out
 DEFAULT_MEM_LIMIT_MB = 2048
 
-#: pre-flight corpus budget in MB — the default since issue #76 is
-#: policy.json 'memory'.max_corpus_mb (0 disables); this constant is the
-#: shipped fallback value quoted in --help; see _check_corpus_budget
+#: pre-flight corpus budget in MB — the default is policy.json
+#: memory.max_corpus_mb (issue #76); this constant is the fallback quoted
+#: in --help; see _check_corpus_budget
 DEFAULT_MAX_CORPUS_MB = 1024
 CORPUS_FOOTPRINT_FACTOR = 4.0
 #: run entries kept verbatim in the verdict payload; later entries are
@@ -205,10 +204,10 @@ RETAIN_VERBATIM_ROWS = 500
 
 def _memory_limits(mem_limit_mb: int | None, max_corpus_mb: int | None,
                    policy_path: str | None = None) -> tuple[dict, int, int]:
-    """Issue #76 — the judge's memory budgets are policy-resolved, not
-    improvised: defaults come from autonomy/policy.json 'memory'
-    (policy:MEM-1); an explicit flag value is an operator override
-    journaled in the payload's resources block as a deviation, and 0
+    """Resolve this run's memory budgets from policy (issue #76): the
+    judge-child ceiling and the corpus pre-flight budget default to
+    policy.json 'memory' (policy:MEM-1); an explicit flag value is an
+    operator override journaled in the decision's deviations, and 0
     disables that bound. Returns (decision, mem_limit, max_corpus_mb) —
     mem_limit None = children unscoped, max_corpus_mb 0 = check off."""
     decision = pipeline_tool.resolve_memory(
@@ -231,8 +230,23 @@ def _memory_limits(mem_limit_mb: int | None, max_corpus_mb: int | None,
           "operator override: judge children unscoped (--mem-limit-mb 0)")
     apply(max_corpus_mb, "max_corpus_mb",
           "operator override: corpus pre-flight check off (--max-corpus-mb 0)")
-    return decision, limits["judge_child_mb"] or None, \
-        int(limits["max_corpus_mb"] or 0)
+    return (decision, limits["judge_child_mb"] or None,
+            int(limits["max_corpus_mb"] or 0))
+
+
+def _resources_block(memory: dict, mem_limit: int | None,
+                     peak_rss_mb) -> dict:
+    """The verdict payload's resources block: the ceiling in force and its
+    provenance (issue #76), the GC cadence, and the caller's peak-RSS
+    shape (per side for judge, a single value for corpus dry-run)."""
+    return {
+        "mem_limit_mb": mem_limit,
+        "mem_limit_decided_by": memory["decided_by"],
+        "mem_limit_deviations": memory.get("deviations"),
+        "max_corpus_mb": int(memory["limits"]["max_corpus_mb"] or 0) or None,
+        "gc_every_rows": GC_EVERY_N_ROWS,
+        "peak_rss_mb": peak_rss_mb,
+    }
 
 # ---------------------------------------------------------------- rules ----
 
@@ -1091,19 +1105,14 @@ def cmd_judge(args) -> int:
         corpus_path = manifest_path.parent / corpus_path
     rules = merge_rules(manifest)
 
-    # memory is policy (issue #76): judge/corpus children take
-    # memory.judge_child_mb, the corpus pre-flight takes memory.max_corpus_mb
-    # — an explicit flag is an operator override journaled as a deviation,
-    # 0 disables that bound
     memory, mem_limit, max_corpus_mb = _memory_limits(
         args.mem_limit_mb, args.max_corpus_mb)
     # refusals (empty · pre-wrapped · over-budget) fire before any spawn;
     # a slow row times out its chunk only, every other chunk still judges
     scan, judged, rows = _open_corpus(corpus_path, runs=args.runs,
                                       max_corpus_mb=max_corpus_mb)
-    # judged code is untrusted for memory: bound every child so a leaking
-    # side fails its own judgment (setup_error -> INCOMPARABLE), never the
-    # host (policy:MEM-1 by default; --mem-limit-mb 0 opts out explicitly)
+    # judged code is untrusted for memory: a leaking side must fail its
+    # own judgment (setup_error -> INCOMPARABLE), never the host
     fold = _RunFold()
     ref = _SideRunner(manifest["reference"]["entry"], manifest_path.parent,
                       args.timeout, mem_limit)
@@ -1115,6 +1124,15 @@ def cmd_judge(args) -> int:
         for (i, _value), ref_rec, cand_rec in zip(chunk, ref_recs, cand_recs):
             fold.add(classify_pair(i, ref_rec, cand_rec, rules), ref_rec=ref_rec)
 
+    resources = _resources_block(
+        memory, mem_limit,
+        {"reference": _peak_rss_mb(ref.peak_rss_kb),
+         "candidate": _peak_rss_mb(cand.peak_rss_kb)})
+    # a side's terminal setup error names a memcg-killed child — the
+    # breach signal delegate.py journals per unit (issue #76)
+    resources["side_terminal_errors"] = {"reference": ref.terminal_error,
+                                         "candidate": cand.terminal_error}
+
     return _emit_runs_verdicts(
         unit=manifest.get("unit"), fold=fold, rules=rules,
         runs_requested=judged, corpus_path=corpus_path,
@@ -1125,23 +1143,7 @@ def cmd_judge(args) -> int:
             "candidate_entry": manifest["candidate"]["entry"],
             # observability: None = no child self-reported (zero rows
             # judged, or faked children in tests)
-            "resources": {
-                "mem_limit_mb": mem_limit,
-                "mem_limit_decided_by": memory["decided_by"],
-                "mem_limit_deviations": memory.get("deviations"),
-                "max_corpus_mb": int(memory["limits"]["max_corpus_mb"] or 0)
-                                 or None,
-                "gc_every_rows": GC_EVERY_N_ROWS,
-                "peak_rss_mb": {
-                    "reference": _peak_rss_mb(ref.peak_rss_kb),
-                    "candidate": _peak_rss_mb(cand.peak_rss_kb),
-                },
-                # a side's terminal setup error names a killed child
-                # (e.g. "child exited 137") — the breach signal #76
-                # journals per unit
-                "side_terminal_errors": {"reference": ref.terminal_error,
-                                         "candidate": cand.terminal_error},
-            },
+            "resources": resources,
         }, human_flag=args.human)
 
 
@@ -1261,14 +1263,8 @@ def cmd_corpus(args) -> int:
         payload["rows_truncated"] = rows_truncated
     # the dry-run side's peak RSS, same self-report the judge folds into
     # its verdict payload
-    payload["resources"] = {
-        "mem_limit_mb": mem_limit,
-        "mem_limit_decided_by": memory["decided_by"],
-        "mem_limit_deviations": memory.get("deviations"),
-        "max_corpus_mb": int(memory["limits"]["max_corpus_mb"] or 0) or None,
-        "gc_every_rows": GC_EVERY_N_ROWS,
-        "peak_rss_mb": _peak_rss_mb(side.peak_rss_kb),
-    }
+    payload["resources"] = _resources_block(
+        memory, mem_limit, _peak_rss_mb(side.peak_rss_kb))
     emit(payload, human_flag=args.human)
     return code
 

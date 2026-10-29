@@ -124,6 +124,7 @@ def require_memory_budget_exercised(instances: list[dict]) -> None:
     budget.max_rss_mb, and some journal entry must demonstrate the
     scope-breach journaling shape (actor, unit, observed peak, limit),
     or those fields stop being guarded."""
+    journal = [e for inst in instances for e in inst.get("journal", [])]
     ceiling = any(
         isinstance(u.get("budget"), dict) and u["budget"].get("max_rss_mb")
         for inst in instances for u in inst.get("units", [])
@@ -131,13 +132,14 @@ def require_memory_budget_exercised(instances: list[dict]) -> None:
     breach = any(
         e.get("actor") and e.get("unit")
         and "max_rss_mb" in str(e.get("field", ""))
-        for inst in instances for e in inst.get("journal", [])
-    ) and any(
+        for e in journal
+    )
+    breach_note = any(
         "peak" in str(e.get("to", "")) and "limit" in str(e.get("to", ""))
         and "MEM-1" in str(e.get("to", ""))
-        for inst in instances for e in inst.get("journal", [])
+        for e in journal
     )
-    if not (ceiling and breach):
+    if not (ceiling and breach and breach_note):
         fail(
             "no example exercises the memory budget together: a unit "
             "budget.max_rss_mb and a journaled scope breach (actor, unit, "
