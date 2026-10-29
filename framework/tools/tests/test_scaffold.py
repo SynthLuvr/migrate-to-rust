@@ -31,6 +31,7 @@ silent [] nor per-row noise masquerading as divergence.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
@@ -968,3 +969,28 @@ def test_int_float_distinction_survives_the_adapter(monkeypatch, capsys, tmp_pat
         adapter.run({"n": 1.0})
     # module envelope: the judged function's result under its own key
     assert adapter.run({"n": 21}) == {"twice": 42}
+
+
+def test_dataclass_decorator_with_arguments_is_recognized():
+    """`@dataclass(frozen=True, slots=True)` must count as a dataclass
+    decorator — the bare-name-only check used to bail every unit of such
+    a project to hand-completion."""
+    tool = _load_module(Path(__file__).resolve().parent.parent / "scaffold.py")
+    source = (
+        "@dataclass(frozen=True, slots=True)\n"
+        "class Bar:\n"
+        "    date: str\n"
+        "    close: float\n"
+        "@dataclass\n"
+        "class Plain:\n"
+        "    x: int\n"
+        "class NotOne:\n"
+        "    pass\n"
+    )
+    decorated = {
+        node.name: any(tool._is_dataclass_decorator(d) for d in node.decorator_list)
+        for node in ast.parse(source).body if isinstance(node, ast.ClassDef)
+    }
+    assert decorated == {"Bar": True, "Plain": True, "NotOne": False}
+    # Aliased imports (`from dataclasses import dataclass as dc`) stay
+    # unrecognized: flagging for hand-completion is the safe direction.

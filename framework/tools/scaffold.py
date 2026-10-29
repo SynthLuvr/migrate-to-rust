@@ -193,6 +193,8 @@ def _dotted(node) -> str | None:
 
 
 def _is_dataclass_decorator(dec) -> bool:
+    while isinstance(dec, ast.Call):  # @dataclass(frozen=True, ...) — unwrap the call
+        dec = dec.func
     return ((isinstance(dec, ast.Name) and dec.id == "dataclass")
             or (isinstance(dec, ast.Attribute) and dec.attr == "dataclass"))
 
