@@ -6,6 +6,7 @@ the judging path."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -548,14 +549,10 @@ def test_corpus_validate_warns_on_thin_ground_truth(monkeypatch, capsys, tmp_pat
 
 
 # ---------------------------------------------------------- issue #75 ----
-# The judge used to materialize everything in the parent: every corpus row
-# parsed up front, the whole corpus re-encoded as one stdin string, all
-# records and diffs retained. Now the corpus streams — pre-flight refusals
-# before any child spawns, rows judged chunk by chunk (each chunk its own
-# child per side with its own timeout), verdicts folded as chunks complete
-# with a verbatim-retention cap. A corpus far larger than RAM is judgeable
-# in a few hundred MB of parent RSS (measured: 2.0 GB corpus -> 268 MB
-# peak, vs the old code's 1.46 GB peak on a 350 MB corpus).
+# The judge streams the corpus instead of materializing it: pre-flight
+# refusals before any child spawns, rows judged chunk by chunk (each chunk
+# its own child per side with its own timeout), verdicts folded as chunks
+# complete with a verbatim-retention cap.
 
 def _stream_scaffold(tmp_path, rows=10, ref_src=None, cand_src=None):
     (tmp_path / "impl.py").write_text(ref_src or "def run(v):\n    return {'x': v['x'] * 2}\n")
@@ -572,10 +569,21 @@ def _stream_scaffold(tmp_path, rows=10, ref_src=None, cand_src=None):
     return manifest
 
 
+def _oversized_scaffold(tmp_path):
+    # ~300 KB of corpus: over a 1 MB x4 footprint estimate, under it with --runs 5
+    (tmp_path / "impl.py").write_text("def run(v):\n    return len(v['pad'])\n")
+    (tmp_path / "corpus.jsonl").write_text("\n".join(
+        json.dumps({"i": i, "pad": "z" * 1000}) for i in range(300)) + "\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "unit": "u-big", "reference": {"entry": "impl:run"},
+        "candidate": {"entry": "impl:run"}, "corpus": "corpus.jsonl"}))
+    return manifest
+
+
 def test_judge_streams_stdin_in_chunks(monkeypatch, capsys, tmp_path):
-    # the parent must never build one bulk stdin: with --chunk-rows 3 a
-    # 10-row corpus spawns 4 children per side, each receiving at most 3
-    # framed rows
+    # with --chunk-rows 3 a 10-row corpus spawns 4 children per side, each
+    # receiving at most 3 framed rows — never one bulk stdin
     manifest = _stream_scaffold(tmp_path, rows=10)
     stdins = []
     real_run_child = oracle.run_child
@@ -591,8 +599,6 @@ def test_judge_streams_stdin_in_chunks(monkeypatch, capsys, tmp_path):
     assert out["counts"] == {"equivalent": 10, "divergent": 0, "incomparable": 0}
     assert len(stdins) == 8  # ceil(10/3) = 4 chunks x 2 sides
     corpus_bytes = (tmp_path / "corpus.jsonl").stat().st_size
-    # no child ever receives more than its chunk: every stdin carries at
-    # most 3 framed rows — never the whole corpus in one buffer
     assert all(s.count("\n") <= 3 for s in stdins)
     assert max(len(s) for s in stdins) < corpus_bytes
     # the 10 framed inputs all reached the children exactly once
@@ -621,9 +627,8 @@ def test_verdict_payload_is_chunk_size_invariant(monkeypatch, capsys, tmp_path):
 
 def test_slow_row_times_out_its_chunk_only(monkeypatch, capsys, tmp_path):
     # the adjacent failure behind #73's secondary observation: one slow
-    # reference function used to blow the whole-run timeout. Now the slow
-    # chunk times out alone — its rows judge incomparable with the timeout
-    # detail — and every other chunk still produces verdicts.
+    # reference function used to blow the whole-run timeout. The slow chunk
+    # times out alone; every other chunk still produces verdicts.
     slow = ("import time\n"
             "def run(v):\n"
             "    if v['slow']:\n"
@@ -648,16 +653,9 @@ def test_slow_row_times_out_its_chunk_only(monkeypatch, capsys, tmp_path):
 
 
 def test_oversized_corpus_refused_before_any_child_spawns(monkeypatch, capsys, tmp_path):
-    # pre-flight guard: estimated footprint (bytes x 4) over budget -> the
-    # standard error envelope, and run_child is never called at all
-    pad = "z" * 1000
-    (tmp_path / "impl.py").write_text("def run(v):\n    return len(v['pad'])\n")
-    (tmp_path / "corpus.jsonl").write_text("\n".join(
-        json.dumps({"i": i, "pad": pad}) for i in range(300)) + "\n")
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({
-        "unit": "u-big", "reference": {"entry": "impl:run"},
-        "candidate": {"entry": "impl:run"}, "corpus": "corpus.jsonl"}))
+    # estimated footprint (bytes x 4) over budget -> the standard error
+    # envelope, and run_child is never called at all
+    manifest = _oversized_scaffold(tmp_path)
 
     def no_spawn(cmd, **kwargs):
         raise AssertionError("a child was spawned for an oversized corpus")
@@ -674,15 +672,8 @@ def test_oversized_corpus_refused_before_any_child_spawns(monkeypatch, capsys, t
 
 def test_runs_cap_admits_an_oversized_corpus(monkeypatch, capsys, tmp_path):
     # an explicit --runs cap scales the estimated footprint to the rows
-    # that will actually be judged — the policy-driven "try smaller" repair
-    pad = "z" * 1000
-    (tmp_path / "impl.py").write_text("def run(v):\n    return len(v['pad'])\n")
-    (tmp_path / "corpus.jsonl").write_text("\n".join(
-        json.dumps({"i": i, "pad": pad}) for i in range(300)) + "\n")
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({
-        "unit": "u-big", "reference": {"entry": "impl:run"},
-        "candidate": {"entry": "impl:run"}, "corpus": "corpus.jsonl"}))
+    # that will actually be judged
+    manifest = _oversized_scaffold(tmp_path)
     code, out = run_tool(monkeypatch, capsys, "oracle.py",
                          ["judge", "--manifest", str(manifest),
                           "--max-corpus-mb", "1", "--runs", "5"])
@@ -693,8 +684,8 @@ def test_runs_cap_admits_an_oversized_corpus(monkeypatch, capsys, tmp_path):
 
 def test_retention_cap_summarizes_runs_beyond_the_first_n(monkeypatch, capsys, tmp_path):
     # the first RETAIN_VERBATIM_RUNS run entries stay verbatim; beyond
-    # that entries are summarized (verdict, detail, diff digest) — while
-    # counts, histogram and verdicts_digest still cover every run
+    # that entries are summarized — while counts, histogram and
+    # verdicts_digest still cover every run
     monkeypatch.setattr(oracle, "RETAIN_VERBATIM_RUNS", 4)
     manifest = _stream_scaffold(tmp_path, rows=12, cand_src=(
         "def run(v):\n    return {'x': v['x'] * 2 + 1}\n"))  # every row divergent
@@ -715,7 +706,6 @@ def test_retention_cap_summarizes_runs_beyond_the_first_n(monkeypatch, capsys, t
 def test_retention_cap_covers_all_runs_in_the_digest(monkeypatch, capsys, tmp_path):
     # the digest is folded incrementally but must equal the list-era
     # sha256("\n".join(f"{run}:{verdict}"))
-    import hashlib
     manifest = _stream_scaffold(tmp_path, rows=9)
     monkeypatch.setattr(oracle, "RETAIN_VERBATIM_RUNS", 2)
     _, out = run_tool(monkeypatch, capsys, "oracle.py",
@@ -758,7 +748,6 @@ def test_streamed_refusals_keep_file_line_context(tmp_path):
     prewrapped = tmp_path / "pre.jsonl"
     prewrapped.write_text("\n".join(
         json.dumps({"i": i, "input": {"x": i}}) for i in range(2)) + "\n")
-    scan = oracle._corpus_preflight  # noqa: F841  (refusal raises below)
     try:
         oracle._corpus_preflight(prewrapped)
         raise AssertionError("pre-wrapped corpus was not refused")

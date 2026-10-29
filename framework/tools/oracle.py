@@ -56,12 +56,12 @@ verdicts. Per-run verdicts fold into counts / diff histograms /
 ``verdicts_digest`` as chunks complete, so the parent retains only the
 first ``RETAIN_VERBATIM_RUNS`` run entries verbatim (later entries are
 summarized: run, verdict, detail, diff digest) — the summary numbers
-always cover every run. A **pre-flight pass stream-counts rows and bytes
-before parsing anything twice**, and refuses (standard error envelope,
-before any child is spawned) a corpus whose estimated parent footprint
-(``bytes × 4``) exceeds ``--max-corpus-mb`` (default 1024); cap the
-judged rows with ``--runs`` or raise the budget with ``--max-corpus-mb``
-(budgets become policy-driven in #76).
+always cover every run. A **pre-flight pass** stream-counts rows and
+bytes (the file is parsed again only when judging) and refuses, in the
+standard error envelope and before any child is spawned, a corpus whose
+estimated parent footprint (``bytes × 4``) exceeds ``--max-corpus-mb``
+(default 1024); cap the judged rows with ``--runs`` or raise the budget
+with ``--max-corpus-mb`` (budgets become policy-driven in #76).
 
 Outputs must be JSON-serializable; sets and other exotic values make the run
 *Incomparable* (the honest verdict — units returning sets must expose a
@@ -134,7 +134,10 @@ import subprocess
 import sys
 import types
 import unicodedata
+from collections.abc import Iterator
+from itertools import islice
 from pathlib import Path
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
@@ -146,25 +149,21 @@ TOOL = "oracle.py"
 VERSION = 1
 
 # ------------------------------------------------------ streaming (#75) ----
-# The judge never materializes the corpus, the re-encoded stdin, or the
-# full record set in the parent (issue #75: the old bulk stdin made parent
-# peak ≈ raw corpus + JSON re-encoding + buffered stdin + records + diffs,
-# several multiples of the corpus file). Rows stream from disk in chunks;
-# each chunk is its own child per side with its own timeout, and per-run
+# The parent never materializes the corpus, the stdin framing, or the full
+# classified run set (issue #75: the old bulk-stdin path peaked at several
+# multiples of the corpus file in parent RSS). Rows stream from disk in
+# chunks — one child per side per chunk, each with its own timeout — and
 # verdicts fold into counts/histograms/digests as chunks complete.
 
-#: rows per child: stdin per chunk is the only corpus-derived buffer the
-#: parent ever holds (plus the chunk's parsed values and records)
+#: corpus rows per child; one chunk's stdin framing is the only
+#: corpus-derived buffer the parent ever holds
 DEFAULT_CHUNK_ROWS = 500
-#: refuse a corpus whose ESTIMATED parent footprint (bytes x factor, the
-#: parsed-rows + framing + records overhead of the pre-streaming era)
-#: exceeds this before any child is spawned; --runs caps the estimate,
-#: --max-corpus-mb raises it. Policy-driven once #76 lands.
+#: refuse, before any child is spawned, a corpus whose estimated parent
+#: footprint exceeds this many MB (0 disables); see _check_corpus_budget
 DEFAULT_MAX_CORPUS_MB = 1024
 CORPUS_FOOTPRINT_FACTOR = 4.0
-#: run entries kept verbatim in the verdict payload; beyond that entries
-#: are summarized (verdict, detail, diff digest) — counts, histograms and
-#: verdicts_digest always cover every run
+#: run entries kept verbatim in the verdict payload; later entries are
+#: summarized — counts/histogram/digest still cover every run
 RETAIN_VERBATIM_RUNS = 500
 #: per-row status entries kept verbatim by the corpus dry-run
 RETAIN_VERBATIM_ROWS = 500
@@ -448,16 +447,38 @@ def count_verdicts(runs: list[dict]) -> dict:
     return counts
 
 
+def _diff_kind_counts(diffs: list) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for d in diffs:
+        counts[d["kind"]] = counts.get(d["kind"], 0) + 1
+    return counts
+
+
+def _summarized_run(run: dict) -> dict:
+    """Bounded shadow of a run entry past the verbatim retention cap:
+    keeps ``runs`` indexable without retaining every diff operand."""
+    return {
+        "run": run["run"],
+        "verdict": run["verdict"],
+        "detail": run["detail"],
+        "diff_digest": sha256_bytes(
+            json.dumps(run["diffs"], sort_keys=True,
+                       ensure_ascii=False).encode("utf-8"))[:16]
+        if run["diffs"] else None,
+        "diff_kinds": _diff_kind_counts(run["diffs"]),
+        "diff_truncated": run.get("diff_truncated"),
+        "summarized": True,
+    }
+
+
 class _RunFold:
     """Streaming summary of a judgment (issue #75): per-run verdicts fold
     in as chunks complete, so the parent never retains the full classified
     run set. Everything the verdict payload needs is maintained
     incrementally — counts, the diff-kind histogram, the verdicts digest
-    (same bytes as the list-era ``sha256("\\n".join(...))``), ground-truth
-    counters — and run entries are kept verbatim only up to
-    ``RETAIN_VERBATIM_RUNS``; beyond that a bounded summarized entry
-    (verdict, detail, diff digest) keeps ``runs`` indexable without
-    retaining every diff operand."""
+    (same bytes as the list-era ``sha256("\\n".join(...))``), and the
+    ground-truth counters — and run entries are kept verbatim only up to
+    ``max_verbatim`` (default RETAIN_VERBATIM_RUNS)."""
 
     def __init__(self, max_verbatim: int | None = None):
         self.counts = {"equivalent": 0, "divergent": 0, "incomparable": 0}
@@ -468,24 +489,19 @@ class _RunFold:
         self.ref_ok = 0
         self.setup_error: str | None = None
         self._digest = hashlib.sha256()
-        self._digest_first = True
         self.max_verbatim = (RETAIN_VERBATIM_RUNS if max_verbatim is None
                              else max_verbatim)
 
     def add(self, run: dict, ref_rec: dict | None = None) -> None:
-        """Fold one classified run (and its reference record, for the
-        ground-truth counters — the judge/corpus streams and compare both
-        pass the record when they have it)."""
+        """Fold one classified run; ``ref_rec`` (which the judge/corpus
+        streams and compare all pass when they have it) feeds the
+        ground-truth counters."""
         self.total += 1
         self.counts[run["verdict"]] += 1
         for d in run["diffs"]:
             self.diff_kinds[d["kind"]] = self.diff_kinds.get(d["kind"], 0) + 1
         part = f"{run['run']}:{run['verdict']}".encode("utf-8")
-        if self._digest_first:
-            self._digest.update(part)
-            self._digest_first = False
-        else:
-            self._digest.update(b"\n" + part)
+        self._digest.update(part if self.total == 1 else b"\n" + part)
         if ref_rec is not None:
             if ref_rec.get("ok") is True:
                 self.ref_ok += 1
@@ -495,21 +511,7 @@ class _RunFold:
             self.runs.append(run)
         else:
             self.summarized += 1
-            kinds: dict[str, int] = {}
-            for d in run["diffs"]:
-                kinds[d["kind"]] = kinds.get(d["kind"], 0) + 1
-            self.runs.append({
-                "run": run["run"],
-                "verdict": run["verdict"],
-                "detail": run["detail"],
-                "diff_digest": sha256_bytes(
-                    json.dumps(run["diffs"], sort_keys=True,
-                               ensure_ascii=False).encode("utf-8"))[:16]
-                if run["diffs"] else None,
-                "diff_kinds": kinds,
-                "diff_truncated": run.get("diff_truncated"),
-                "summarized": True,
-            })
+            self.runs.append(_summarized_run(run))
 
     @property
     def verdicts_digest(self) -> str:
@@ -542,9 +544,10 @@ def reference_ground_truth(ref_recs: list, total: int, rules: dict) -> dict:
 def _ground_truth_from(ref_ok: int, setup_error: str | None, total: int,
                        rules: dict) -> dict:
     """The ``ground_truth`` block from folded counters instead of a
-    materialized record list (issue #75: the streamed judge folds
-    reference-ok and setup-error facts as chunks complete — same block,
-    byte for byte, as the list-shaped reference_ground_truth above)."""
+    materialized record list — the same block, byte for byte, that
+    ``reference_ground_truth`` above builds from the record list (issue
+    #75: the streamed judge folds reference-ok and setup-error facts as
+    chunks complete)."""
     fraction = (ref_ok / total) if total else None
     min_frac = rules["min_reference_ok_fraction"]
     gt = {
@@ -710,15 +713,15 @@ def _execute_entry_local(entry: str, inputs: list) -> list[dict]:
     return records
 
 
-def _execute_entry_subprocess(entry: str, inputs: list, manifest_dir: Path,
-                              timeout: float,
-                              mem_limit_mb: int | None = None) -> list[dict]:
-    stdin = "".join(json.dumps({"i": i, "input": v}) + "\n" for i, v in enumerate(inputs))
-    code, stdout, stderr = run_child(
-        [sys.executable, "-c", RUNNER_SRC, entry],
-        cwd=str(manifest_dir), input_text=stdin, timeout=timeout,
-        mem_limit_mb=mem_limit_mb,
-    )
+def _frame_stdin(rows) -> str:
+    """The child stdin framing: one {"i": ..., "input": ...} per row."""
+    return "".join(json.dumps({"i": i, "input": v}) + "\n" for i, v in rows)
+
+
+def _parse_child_records(stdout: str) -> tuple[dict[int, dict], list[str]]:
+    """Index the child's NDJSON stdout into per-run records by ``i``, plus
+    any setup errors in order. Unparseable lines are child chatter
+    (prints), not fatal."""
     records: dict[int, dict] = {}
     setup_errors = []
     for line in stdout.splitlines():
@@ -728,33 +731,46 @@ def _execute_entry_subprocess(entry: str, inputs: list, manifest_dir: Path,
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
-            continue  # child chatter (prints) is ignored, not fatal
+            continue
         if "setup_error" in rec:
             setup_errors.append(rec["setup_error"])
         elif "i" in rec:
             records[rec["i"]] = rec
-    result = [records.get(i) for i in range(len(inputs))]
+    return records, setup_errors
+
+
+def _child_exit_error(code: int, stderr: str) -> str:
+    return f"child exited {code}: {stderr.strip()[:400] or 'no stderr'}"
+
+
+def _execute_entry_subprocess(entry: str, inputs: list, manifest_dir: Path,
+                              timeout: float,
+                              mem_limit_mb: int | None = None) -> list[dict]:
+    """One-shot bulk-stdin execution — kept for bench.py / scaffold.py and
+    small corpora; the judge/corpus commands stream via _SideRunner below."""
+    code, stdout, stderr = run_child(
+        [sys.executable, "-c", RUNNER_SRC, entry],
+        cwd=str(manifest_dir), input_text=_frame_stdin(enumerate(inputs)),
+        timeout=timeout, mem_limit_mb=mem_limit_mb,
+    )
+    records, setup_errors = _parse_child_records(stdout)
     if setup_errors:
         return [{"setup_error": setup_errors[0]}]
     if code != 0 and not records:
-        return [{"setup_error": f"child exited {code}: "
-                                f"{stderr.strip()[:400] or 'no stderr'}"}]
-    return result
+        return [{"setup_error": _child_exit_error(code, stderr)}]
+    return [records.get(i) for i in range(len(inputs))]
 
 
 # ------------------------------------------------------- chunked runs ----
-# Issue #75: judge/corpus no longer use the one-shot bulk-stdin path above
-# (kept for bench.py / scaffold.py and small corpora). Rows stream from the
-# corpus file in chunks; each chunk is its own child per side with its own
-# timeout, so stdin is bounded by one chunk and a pathologically slow row
-# costs its chunk only — never the whole judgment (the adjacent failure
-# behind #73's secondary observation: one slow reference function blowing
-# the whole-run timeout while every other unit finishes in seconds).
+# judge/corpus stream rows in --chunk-rows chunks: one child per side per
+# chunk with its own --timeout, so stdin is bounded by one chunk and a
+# pathologically slow row costs its chunk only — never the whole judgment
+# (the adjacent failure behind #73's secondary observation: one slow
+# reference function blowing the whole-run timeout).
 
 def _chunks(rows_iter, size: int):
-    """Yield lists of at most ``size`` (index, value) pairs from a row
-    iterator — the only corpus-derived buffer the judge parent holds."""
-    if size is None or size <= 0:
+    """Yield lists of at most ``size`` rows from an iterator."""
+    if size <= 0:
         raise ValueError(f"chunk size must be a positive number of rows, "
                          f"got {size!r}")
     chunk: list = []
@@ -767,50 +783,36 @@ def _chunks(rows_iter, size: int):
         yield chunk
 
 
+def _chunk_timeout_records(timeout: float, rows: int) -> list[dict]:
+    """Per-row pseudo-records for a chunk that blew its timeout — judged
+    incomparable; the remaining chunks still judge (issue #75)."""
+    detail = (f"chunk timed out after {timeout}s — {rows} rows on this "
+              "side were not judged (issue #75: the timeout is "
+              "chunk-local; other chunks still judge)")
+    return [{"setup_error": detail} for _ in range(rows)]
+
+
 def _run_entry_chunk(entry: str, chunk: list, cwd, timeout: float,
                      mem_limit_mb: int | None) -> tuple[list, str | None]:
-    """One child over one chunk of (index, value) rows — the streaming
-    unit of execution (issue #75). Returns ``(records, terminal_error)``:
-    ``records`` is index-aligned with ``chunk`` (None where the child
-    produced nothing), and ``terminal_error`` is a non-None setup error
-    (import failure, child exit before any record, ...) meaning the side
-    is dead — later chunks must not spawn. A per-chunk TIMEOUT is NOT
-    terminal: the slow chunk's rows come back as per-row
-    ``{"setup_error": "chunk timed out ..."}`` records (judged
-    incomparable) and the caller keeps judging the remaining chunks."""
-    stdin = "".join(json.dumps({"i": i, "input": v}) + "\n" for i, v in chunk)
+    """One child over one chunk of (index, value) rows. Returns
+    ``(records, terminal_error)``: ``records`` index-aligned with ``chunk``
+    (None where the child produced nothing); a non-None terminal_error (a
+    setup error, or a child exit before any record) means the side is dead
+    and later chunks must not spawn. A timeout is NOT terminal."""
     try:
         code, stdout, stderr = run_child(
             [sys.executable, "-c", RUNNER_SRC, entry],
-            cwd=str(cwd), input_text=stdin, timeout=timeout,
-            mem_limit_mb=mem_limit_mb,
+            cwd=str(cwd), input_text=_frame_stdin(chunk),
+            timeout=timeout, mem_limit_mb=mem_limit_mb,
         )
     except subprocess.TimeoutExpired:
-        detail = (f"chunk timed out after {timeout}s — {len(chunk)} rows "
-                  "on this side were not judged (issue #75: the timeout "
-                  "is chunk-local; other chunks still judge)")
-        return [{"setup_error": detail} for _ in chunk], None
-    records: dict[int, dict] = {}
-    setup_errors = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue  # child chatter (prints) is ignored, not fatal
-        if "setup_error" in rec:
-            setup_errors.append(rec["setup_error"])
-        elif "i" in rec:
-            records[rec["i"]] = rec
-    result = [records.get(i) for i, _ in chunk]
+        return _chunk_timeout_records(timeout, len(chunk)), None
+    records, setup_errors = _parse_child_records(stdout)
     if setup_errors:
         return [None] * len(chunk), setup_errors[0]
     if code != 0 and not records:
-        return ([None] * len(chunk),
-                f"child exited {code}: {stderr.strip()[:400] or 'no stderr'}")
-    return result, None
+        return [None] * len(chunk), _child_exit_error(code, stderr)
+    return [records.get(i) for i, _ in chunk], None
 
 
 class _SideRunner:
@@ -854,36 +856,18 @@ def _is_framing_envelope(value) -> bool:
             and not isinstance(value["i"], bool))
 
 
-class _CorpusScan:
-    """Pre-flight facts about a corpus (issue #75): row count, byte size
-    and file digest — gathered in ONE streaming pass that never holds more
-    than a single parsed row, and that applies every load-time refusal
-    (empty · pre-wrapped · over-budget) BEFORE any child is spawned."""
-
-    __slots__ = ("rows", "size_bytes", "sha256")
-
-    def __init__(self, rows: int, size_bytes: int, sha256: str):
-        self.rows = rows
-        self.size_bytes = size_bytes
-        self.sha256 = sha256
+class _CorpusScan(NamedTuple):
+    """Pre-flight facts about a corpus (issue #75), gathered in one
+    streaming pass that never holds more than a single row."""
+    rows: int
+    size_bytes: int
+    sha256: str
 
 
-def _corpus_preflight(path: Path, *, max_corpus_mb: int = DEFAULT_MAX_CORPUS_MB,
-                      runs_cap: int = 0) -> _CorpusScan:
-    """Stream-count a corpus's rows and bytes (parsing one row at a time,
-    never materializing the file) and refuse what must be refused at load
-    time, in the order the list-era loader refused it: (a) an empty
-    corpus, (b) a corpus pre-wrapped in the child stdin framing (issue
-    #29), (c) — new in #75 — a corpus whose ESTIMATED parent footprint
-    (bytes x CORPUS_FOOTPRINT_FACTOR, the parsed-rows + framing + records
-    overhead of the bulk-stdin era) exceeds ``max_corpus_mb``. A
-    ``runs_cap`` scales the estimate to the rows that would actually be
-    judged, so an explicit ``--runs`` cap is the documented repair for an
-    oversized corpus. Malformed lines raise the same file:line ValueError
-    read_jsonl raises."""
-    rows = framed = 0
-    size_bytes = 0
-    hasher = hashlib.sha256()
+def _iter_corpus_rows(path: Path):
+    """Lazily yield ``(line_number, raw_line, value)`` for every non-blank
+    corpus line — the streaming counterpart of read_jsonl; same
+    malformed-line refusal."""
     with open(path, "rb") as fh:
         for n, raw in enumerate(fh, start=1):
             if not raw.strip():
@@ -892,11 +876,23 @@ def _corpus_preflight(path: Path, *, max_corpus_mb: int = DEFAULT_MAX_CORPUS_MB,
                 value = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise ValueError(f"{path}:{n}: invalid JSON line: {exc}") from exc
-            rows += 1
-            size_bytes += len(raw)
-            hasher.update(raw)
-            if _is_framing_envelope(value):
-                framed += 1
+            yield n, raw, value
+
+
+def _corpus_preflight(path: Path, *, max_corpus_mb: int = DEFAULT_MAX_CORPUS_MB,
+                      runs_cap: int = 0) -> _CorpusScan:
+    """Apply every load-time refusal — empty, pre-wrapped in the child
+    stdin framing (issue #29), over budget (issue #75) — in one streaming
+    pass over the corpus, so they fire BEFORE any child is spawned."""
+    rows = framed = 0
+    size_bytes = 0
+    hasher = hashlib.sha256()
+    for _n, raw, value in _iter_corpus_rows(path):
+        rows += 1
+        size_bytes += len(raw)
+        hasher.update(raw)
+        if _is_framing_envelope(value):
+            framed += 1
     if rows == 0:
         raise ValueError(f"corpus {path} is empty — nothing to judge")
     if framed == rows:
@@ -909,67 +905,54 @@ def _corpus_preflight(path: Path, *, max_corpus_mb: int = DEFAULT_MAX_CORPUS_MB,
             "file format in the module docstring / tools/README.md "
             "(issue #29)."
         )
-    if max_corpus_mb is not None and max_corpus_mb > 0:
-        cap = runs_cap if runs_cap and runs_cap > 0 else rows
-        judged_fraction = min(cap, rows) / rows
-        est_bytes = size_bytes * judged_fraction
-        est_mb = est_bytes * CORPUS_FOOTPRINT_FACTOR / (1024 * 1024)
-        if est_mb > max_corpus_mb:
-            raise ValueError(
-                f"corpus {path} is too large to judge: {rows} rows / "
-                f"{size_bytes} bytes ≈ {est_mb:.0f} MB estimated parent "
-                f"footprint (x{CORPUS_FOOTPRINT_FACTOR:g} byte factor) "
-                f"exceeds the {max_corpus_mb} MB budget (issue #75) — "
-                "cap the judged rows with --runs N or raise the budget "
-                "with --max-corpus-mb (the budget becomes policy-driven "
-                "in #76)"
-            )
+    _check_corpus_budget(path, rows, size_bytes, runs_cap, max_corpus_mb)
     return _CorpusScan(rows, size_bytes, hasher.hexdigest())
 
 
-def _iter_corpus_rows(path: Path):
-    """Lazily yield (line_number, value) for every non-blank corpus line —
-    the streaming counterpart of read_jsonl; same malformed-line refusal."""
-    with open(path, "rb") as fh:
-        for n, raw in enumerate(fh, start=1):
-            if not raw.strip():
-                continue
-            try:
-                value = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ValueError(f"{path}:{n}: invalid JSON line: {exc}") from exc
-            yield n, value
+def _check_corpus_budget(path: Path, rows: int, size_bytes: int,
+                         runs_cap: int, max_corpus_mb: int) -> None:
+    """Refuse a corpus whose estimated parent footprint — bytes ×
+    CORPUS_FOOTPRINT_FACTOR, the parsed-rows + framing + records overhead
+    of the pre-streaming bulk-stdin era — exceeds the budget (issue #75).
+    A ``runs_cap`` scales the estimate to the rows that would actually be
+    judged, making an explicit --runs the documented repair."""
+    if max_corpus_mb <= 0:
+        return
+    cap = runs_cap if runs_cap > 0 else rows
+    judged_fraction = min(cap, rows) / rows
+    est_mb = size_bytes * judged_fraction * CORPUS_FOOTPRINT_FACTOR / (1024 * 1024)
+    if est_mb > max_corpus_mb:
+        raise ValueError(
+            f"corpus {path} is too large to judge: {rows} rows / "
+            f"{size_bytes} bytes ≈ {est_mb:.0f} MB estimated parent "
+            f"footprint (x{CORPUS_FOOTPRINT_FACTOR:g} byte factor) "
+            f"exceeds the {max_corpus_mb} MB budget (issue #75) — "
+            "cap the judged rows with --runs N or raise the budget "
+            "with --max-corpus-mb (the budget becomes policy-driven "
+            "in #76)"
+        )
 
 
 def _open_corpus(path: Path, *, runs: int = 0,
                  max_corpus_mb: int = DEFAULT_MAX_CORPUS_MB
-                 ) -> tuple[_CorpusScan, int, "Iterator[tuple[int, object]]"]:
-    """Pre-flight a corpus, then return ``(scan, judged_rows, row_iter)``:
+                 ) -> tuple[_CorpusScan, int, Iterator[tuple[int, object]]]:
+    """Pre-flight the corpus, then return ``(scan, judged_rows, row_iter)``:
     the scan facts, how many rows will actually be judged (``runs > 0``
     caps the corpus), and a lazy iterator over exactly those rows as
-    ``(index, value)`` pairs (index = position among judged rows, i.e. the
-    run id the child framing uses). The refusals fire HERE — before the
-    caller has spawned any child (issue #75 acceptance: oversized corpora
-    never reach a spawn)."""
+    ``(index, value)`` pairs — the index is the run id the child framing
+    uses."""
     scan = _corpus_preflight(path, max_corpus_mb=max_corpus_mb, runs_cap=runs)
-    judged = min(runs, scan.rows) if runs and runs > 0 else scan.rows
-    return scan, judged, _capped_rows(path, judged)
-
-
-def _capped_rows(path: Path, judged: int):
-    for i, (_, value) in enumerate(_iter_corpus_rows(path)):
-        if i >= judged:
-            return
-        yield i, value
+    judged = min(runs, scan.rows) if runs > 0 else scan.rows
+    rows = ((i, value) for i, (_n, _raw, value) in enumerate(_iter_corpus_rows(path)))
+    return scan, judged, islice(rows, judged)
 
 
 def _load_corpus(path: Path) -> list:
-    """Load a corpus as the list of raw input values (the pre-#75 list
-    API — kept for bench.py / scaffold.py and small corpora; the judge and
-    corpus commands stream via _open_corpus instead). Same refusals, same
-    messages, one row resident at a time while scanning."""
-    _corpus_preflight(path)  # the refusals (empty / pre-wrapped / budget)
-    return [v for _, v in _iter_corpus_rows(path)]
+    """Load a corpus as the list of raw input values — the pre-#75 list
+    API kept for bench.py / scaffold.py and small corpora; the judge and
+    corpus commands stream via _open_corpus instead. Same refusals."""
+    _corpus_preflight(path)
+    return [value for _n, _raw, value in _iter_corpus_rows(path)]
 
 
 def cmd_judge(args) -> int:
@@ -983,13 +966,8 @@ def cmd_judge(args) -> int:
         corpus_path = manifest_path.parent / corpus_path
     rules = merge_rules(manifest)
 
-    # issue #75: stream the corpus. The load-time refusals (empty ·
-    # pre-wrapped · over-budget) fire in _open_corpus BEFORE any child is
-    # spawned; rows are then judged chunk by chunk — one child per side per
-    # chunk, stdin framed one chunk at a time — folding verdicts as chunks
-    # complete so neither the corpus nor the record set is ever
-    # materialized in this process. A slow row times out its chunk only;
-    # every other chunk still produces verdicts.
+    # refusals (empty · pre-wrapped · over-budget) fire before any spawn;
+    # a slow row times out its chunk only, every other chunk still judges
     scan, judged, rows = _open_corpus(corpus_path, runs=args.runs,
                                       max_corpus_mb=args.max_corpus_mb)
     fold = _RunFold()
@@ -1020,8 +998,8 @@ def _corpus_row_status(i: int, rec: dict | None) -> dict:
         return {"i": i, "status": "missing",
                 "detail": "child produced no record for this input"}
     if rec.get("setup_error"):
-        # chunk-timeout / chunk-failure pseudo-records (issue #75): the
-        # row was never judged — surfaced as missing, with the reason
+        # chunk-timeout / chunk-failure pseudo-records: the row was never
+        # judged — surfaced as missing, with the reason
         return {"i": i, "status": "missing", "detail": rec["setup_error"]}
     if rec.get("unserializable"):
         return {"i": i, "status": "unserializable", "detail": rec.get("detail")}
@@ -1032,41 +1010,43 @@ def _corpus_row_status(i: int, rec: dict | None) -> dict:
             "detail": f"{err.get('type')}: {err.get('message')}"}
 
 
+def _fold_dry_run(side: _SideRunner, rows, chunk_rows: int):
+    """Dry-run every streamed row through ``side`` and fold: per-status
+    counts over every judged row, the reference-ok / setup-error facts for
+    the ground-truth block, and per-row status entries kept verbatim only
+    up to RETAIN_VERBATIM_ROWS."""
+    kept: list[dict] = []
+    truncated = 0
+    counts: dict[str, int] = {}
+    ref_ok = 0
+    setup_error: str | None = None
+    for chunk in _chunks(rows, chunk_rows):
+        for (i, _value), rec in zip(chunk, side.run_chunk(chunk)):
+            row = _corpus_row_status(i, rec)
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+            if rec is not None and rec.get("ok") is True:
+                ref_ok += 1
+            if setup_error is None and rec is not None and rec.get("setup_error"):
+                setup_error = rec["setup_error"]
+            if len(kept) < RETAIN_VERBATIM_ROWS:
+                kept.append(row)
+            else:
+                truncated += 1
+    return kept, truncated, counts, ref_ok, setup_error
+
+
 def cmd_corpus(args) -> int:
     """Dry-run ONE entry over a corpus: per-row status (ok / error /
     unserializable / missing) before you spend a judge run on it — a
     malformed corpus shows up as a wall of identical errors here, not as
     a hollow all-EQUIVALENT verdict from the judge."""
     corpus_path = Path(args.validate).resolve()
-    # issue #75: same streaming shape as judge — pre-flight refusals before
-    # any spawn, rows chunked through one child at a time, per-row status
-    # retained verbatim only up to RETAIN_VERBATIM_ROWS (counts always
-    # cover every judged row).
-    scan, total, rows_iter = _open_corpus(corpus_path, runs=args.runs,
-                                          max_corpus_mb=args.max_corpus_mb)
+    scan, total, rows = _open_corpus(corpus_path, runs=args.runs,
+                                     max_corpus_mb=args.max_corpus_mb)
     side = _SideRunner(args.entry, corpus_path.parent, args.timeout,
                        args.mem_limit_mb)
-    kept_rows: list[dict] = []
-    rows_truncated = 0
-    counts: dict[str, int] = {}
-    ref_ok = 0
-    first_setup: str | None = None
-    for chunk in _chunks(rows_iter, args.chunk_rows):
-        recs = side.run_chunk(chunk)
-        for (i, _value), rec in zip(chunk, recs):
-            row = _corpus_row_status(i, rec)
-            counts[row["status"]] = counts.get(row["status"], 0) + 1
-            if rec is not None:
-                if rec.get("ok") is True:
-                    ref_ok += 1
-                if first_setup is None and rec.get("setup_error"):
-                    first_setup = rec["setup_error"]
-            if len(kept_rows) < RETAIN_VERBATIM_ROWS:
-                kept_rows.append(row)
-            else:
-                rows_truncated += 1
-    corpus_digest = scan.sha256
-    setup_error = side.terminal_error or first_setup
+    kept_rows, rows_truncated, counts, ref_ok, first_setup = _fold_dry_run(
+        side, rows, args.chunk_rows)
 
     if side.terminal_error is not None and ref_ok == 0:
         # the entry failed before producing a single record — the whole
@@ -1074,7 +1054,7 @@ def cmd_corpus(args) -> int:
         human = f"corpus dry-run: entry failed to run: {side.terminal_error}"
         emit({
             "tool": TOOL, "version": VERSION, "entry": args.entry,
-            "corpus": {"path": str(corpus_path), "sha256": corpus_digest},
+            "corpus": {"path": str(corpus_path), "sha256": scan.sha256},
             "setup_error": side.terminal_error,
             "summary": {"exit_code": EXIT_SETUP, "human": human},
         }, human_flag=args.human)
@@ -1086,7 +1066,8 @@ def cmd_corpus(args) -> int:
     # the judge's ground-truth guard (issue #30) calls that INCOMPARABLE
     # and already warns here below the ok-fraction threshold (rule
     # defaults; the dry-run takes no manifest to override them)
-    gt = _ground_truth_from(ref_ok, setup_error, total, merge_rules({}))
+    gt = _ground_truth_from(ref_ok, side.terminal_error or first_setup,
+                            total, merge_rules({}))
     hollow = gt["degenerate"]
     if hollow:
         warning = (
@@ -1110,7 +1091,7 @@ def cmd_corpus(args) -> int:
     payload = {
         "tool": TOOL, "version": VERSION, "entry": args.entry,
         "corpus": {"path": str(corpus_path), "lines": total,
-                   "sha256": corpus_digest},
+                   "sha256": scan.sha256},
         "rows": kept_rows, "counts": dict(sorted(counts.items())),
         "ok": ok, "total": total,
         "hollow_equivalent_risk": hollow, "warning": warning,
@@ -1118,8 +1099,8 @@ def cmd_corpus(args) -> int:
         "summary": {"exit_code": code, "human": human},
     }
     if side.terminal_error is not None:
-        # a side that died mid-corpus (terminal chunk failure) with rows
-        # already judged — later rows report missing; this names the cause
+        # a side that died mid-corpus with rows already judged — later
+        # rows report missing; this names the cause
         payload["setup_error"] = side.terminal_error
     if rows_truncated:
         payload["rows_truncated"] = rows_truncated
@@ -1135,9 +1116,9 @@ def cmd_compare(args) -> int:
     rules = merge_rules(payload)
     ref_recs = _records_by_index(payload["reference"])
     cand_recs = _records_by_index(payload["candidate"])
-    # shadow mode judges a pre-captured file, so the record lists exist by
-    # construction — but the summary folds through the same _RunFold cap
-    # as the streamed judge (issue #75), keeping payloads uniform
+    # the record lists exist by construction here, but the summary folds
+    # through the same _RunFold retention cap as the streamed judge
+    # (issue #75), keeping payloads uniform
     fold = _RunFold()
     for i, run in enumerate(classify_runs(ref_recs, cand_recs, rules)):
         fold.add(run, ref_rec=ref_recs[i] if i < len(ref_recs) else None)
@@ -1156,21 +1137,17 @@ def _emit_runs_verdicts(*, unit, fold: _RunFold, rules, extra: dict,
                         human_flag: bool = False,
                         runs_requested: int | None = None,
                         corpus_path=None, corpus_sha: str | None = None) -> int:
-    """Emit the summary verdict payload from a folded judgment (issue #75)
-    — counts, histogram, digest and ground truth cover EVERY judged run;
-    ``fold.runs`` holds the first ``RETAIN_VERBATIM_RUNS`` entries verbatim
-    and summarized shadows beyond. ``runs_requested``/``corpus_path``/
-    ``corpus_sha`` are the streamed judge's facts (the compare path has
-    none of them: it judges a pre-captured file)."""
+    """Emit the summary verdict payload from a folded judgment: counts,
+    histogram, digest and ground truth cover EVERY judged run; ``fold.runs``
+    holds the verbatim-capped run entries. The streamed judge passes its
+    corpus facts; the compare path (a pre-captured runs file) has none."""
     counts = fold.counts
     total = fold.total
+    diff_kinds = fold.diff_kinds
     gt = _ground_truth_from(fold.ref_ok, fold.setup_error, total, rules)
     verdict = summary_verdict(counts, gt)
     code = {"equivalent": EXIT_OK, "divergent": EXIT_FINDINGS,
             "incomparable": EXIT_INCOMPARABLE}[verdict]
-
-    diff_kinds = fold.diff_kinds
-    verdicts_digest = fold.verdicts_digest
 
     human = (
         f"unit={unit or '-'}: {counts['equivalent']}/{total} equivalent, "
@@ -1188,7 +1165,7 @@ def _emit_runs_verdicts(*, unit, fold: _RunFold, rules, extra: dict,
         "tool": TOOL, "version": VERSION, "unit": unit, "verdict": verdict,
         "counts": counts, "total": total, "runs": fold.runs,
         "diff_kind_histogram": dict(sorted(diff_kinds.items())),
-        "verdicts_digest": verdicts_digest,
+        "verdicts_digest": fold.verdicts_digest,
         "ground_truth": gt,
         "normalization": _rules_public(rules),
         "summary": {"exit_code": code, "human": human},
