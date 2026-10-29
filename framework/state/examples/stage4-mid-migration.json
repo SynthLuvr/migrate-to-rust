@@ -88,7 +88,8 @@
           "role": "reviewer",
           "outcome": "FIX then APPROVE"
         }
-      ]
+      ],
+      "k": 3
     },
     {
       "id": "u-index-2",
@@ -151,7 +152,8 @@
           "role": "reviewer",
           "outcome": "ESCALATE"
         }
-      ]
+      ],
+      "k": 1
     },
     {
       "id": "u-rank-3",

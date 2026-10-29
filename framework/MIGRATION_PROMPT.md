@@ -69,8 +69,18 @@ operate a pipeline; the gates decide, not you.
    order.** One unit = one module/class/function with a recorded contract.
    Never batch across hidden dependencies.
 4. **The oracle ranks, not the model.** Generate K candidates per unit and
-   select by parity results. Model confidence correlates poorly with
-   correctness (VERT: differential-test feedback lifted pass rates 31% → 54%).
+   select by parity results — K set by *policy*, not judgment
+   ([`autonomy/policy.json`](autonomy/policy.json) `candidates` block,
+   `policy:CAND-1`, issue #59): K=3 below the size threshold (cheap to
+   parallelize, big variance payoff); K=1 + bounded repair rounds
+   (MAX_ROUNDS) above it, or when run-level token budget remaining is
+   below the floor fraction. Repair rounds count as candidates for the
+   oracle ranking, so this rule holds by construction at any K —
+   `tools/delegate.py run-candidates` resolves and enforces the schedule
+   by default, and the decision is journaled as a policy id, never a
+   "budget-driven deviation" note. Model confidence correlates poorly
+   with correctness (VERT: differential-test feedback lifted pass rates
+   31% → 54%).
 5. **The Python API is frozen.** Callers must not change. Ship as a PyO3
    wheel via maturin — "Rust where hot, Python everywhere else."
 6. **Every loop is bounded.** Max fix-rounds and a token/time budget per unit;
@@ -121,7 +131,11 @@ Detailed checklists: load `stages/<n>-<name>.md` on stage entry.
 ```
 for unit in backlog (dependency order, leaf-first):
     contract    = state.units[unit].contract          # tests, types, invariants
-    candidates  = [translate(unit, contract, knowledge) for _ in 0..K]  # K=3
+    candidates  = [translate(unit, contract, knowledge) for _ in 0..K]
+    #   K is policy, not judgment (issue #59): autonomy/policy.json
+    #   'candidates' (policy:CAND-1) — 3 below the size threshold,
+    #   1 + bounded repair rounds above it / under the budget floor;
+    #   delegate.py run-candidates resolves and enforces it.
     candidates  = [fix_imports(c) for c in candidates]
     #   >50% of "hallucinated crates" are real modules wrongly imported —
     #   a mechanical fixer removes most compile failures before any repair.
@@ -142,6 +156,12 @@ mechanical import fix, compile gates with verbatim feedback, oracle
 ranking, and the winner's verdict pack for `state.py` — is mechanized as
 one command by [`tools/delegate.py`](tools/delegate.py)
 `run-candidates` (issue #33); delegates report, the orchestrator records.
+K itself is resolved and enforced by that same command from the policy
+schedule (issue #59) — the verdict pack carries the `policy:CAND-1`
+decision with its inputs (unit LOC, budget remaining), and the
+orchestrator's `state.py` commands record it as `units[u].k` plus the
+policy id in the journal note, so no run re-improvises the K-vs-budget
+tradeoff.
 The runner also owns **build isolation** (issue #55): every candidate's
 gates and the wheel build run in a per-candidate sandbox copy of the
 crate with the sibling candidates stripped, under the unit's own

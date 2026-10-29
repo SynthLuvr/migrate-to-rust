@@ -168,8 +168,13 @@ read_new () {        # $1 session id  $2 cursor (messages already held)
 
 Per unit, in leaf-first dependency order:
 
-1. Start K=3 translator sessions (name suffixes `-c1`…`-c3`), each in
-   its own worktree.
+1. Start K translator sessions (name suffixes `-c1`…`-cK`), each in
+   its own worktree. K is policy, not judgment (issue #59): the
+   `candidates` schedule in `autonomy/policy.json` (`policy:CAND-1`)
+   sets K=3 below the unit size threshold and K=1 + bounded repair
+   rounds above it or under the run-budget floor —
+   `delegate.py run-candidates` resolves it mechanically; never pick K
+   by feel.
 2. `wait_settled` each — a `202` deadline just means loop again. On
    `completed`, page the transcript with `after=` and extract the best
    candidate + the reported per-run verdicts. On `error`/`stopped`,

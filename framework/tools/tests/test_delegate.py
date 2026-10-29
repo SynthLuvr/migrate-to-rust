@@ -216,6 +216,7 @@ def test_end_to_end_scaffold_to_verdict_pack(monkeypatch, capsys, tmp_path):
     cmds = out["state_commands"]
     assert any("parity=" in c for c in cmds)
     assert any("--status ported" in c for c in cmds)
+    assert any("units[u-foo].k=3" in c for c in cmds)
     state_py = str(TOOLS / "state.py")
     for c in cmds:
         argv = shlex.split(c)
@@ -229,6 +230,7 @@ def test_end_to_end_scaffold_to_verdict_pack(monkeypatch, capsys, tmp_path):
     assert unit["parity"]["last_verdict"] == "equivalent"
     assert unit["parity"]["equivalent"] == unit["parity"]["runs"]
     assert unit["rust_path"].endswith("u_foo_c1.rs")
+    assert unit["k"] == 3
 
 
 def test_divergent_winner_is_findings_and_suggests_escalation(
@@ -410,6 +412,115 @@ def test_candidate_paths_follow_the_recorded_rust_dir(monkeypatch, capsys,
     assert code == 0
     assert out["candidates"][0]["rust_file_rel"] == \
         "crates/demo-core/src/units/u_foo_c1.rs"
+
+
+# ---------------------------------------------------------- K policy (#59) --
+
+def _dry(monkeypatch, capsys, state, proj, *extra):
+    return run_tool(monkeypatch, capsys, "delegate.py", [
+        "run-candidates", "--state", str(state), "--unit", "u-foo",
+        "--target-root", str(proj), "--dry-run", *extra])
+
+
+def test_k_default_is_the_policy_schedule_for_a_small_unit(monkeypatch, capsys,
+                                                           tmp_path):
+    """No --k flag: the runner resolves K from autonomy/policy.json
+    (policy:CAND-1) — enforcement, not trust in the orchestrator."""
+    proj, state, runs = _world(tmp_path)     # src/demo/foo.py: ~10 LOC
+    code, out = _dry(monkeypatch, capsys, state, proj)
+    assert code == 0
+    assert out["k"] == 3
+    kp = out["k_policy"]
+    assert kp["citation"] == "policy:CAND-1"
+    assert kp["k"] == 3 and kp["k_used"] == 3 and kp["source"] == "policy"
+    assert kp["rounds_as_candidates"] is False
+    assert kp["inputs"]["unit_loc"] <= kp["inputs"]["size_threshold_loc"]
+    assert any("<= size_threshold_loc" in b for b in kp["basis"])
+    assert [c["candidate"] for c in out["candidates"]] == ["c1", "c2", "c3"]
+    assert "policy:CAND-1" in out["summary"]["human"]
+
+
+def test_k_policy_drops_to_one_above_the_size_threshold(monkeypatch, capsys,
+                                                        tmp_path):
+    proj, state, runs = _world(tmp_path)
+    (proj / "src" / "demo" / "foo.py").write_text("x = 1\n" * 200)
+    code, out = _dry(monkeypatch, capsys, state, proj)
+    assert code == 0
+    assert out["k"] == 1 and len(out["candidates"]) == 1
+    kp = out["k_policy"]
+    assert kp["k"] == 1 and kp["rounds_as_candidates"] is True
+    assert kp["inputs"]["unit_loc"] == 200
+    assert any("> size_threshold_loc" in b for b in kp["basis"])
+
+
+def test_k_policy_budget_floor_outranks_unit_size(monkeypatch, capsys,
+                                                  tmp_path):
+    proj, state, runs = _world(tmp_path)     # small unit…
+    st = json.loads(state.read_text())       # …but 90% of the run budget spent
+    st["autonomy"] = {"level": "L2", "budget": {"max_tokens": 1000}}
+    st["budget_ledger"] = {"tokens_total": 900}
+    state.write_text(json.dumps(st))
+    code, out = _dry(monkeypatch, capsys, state, proj)
+    assert code == 0 and out["k"] == 1
+    kp = out["k_policy"]
+    assert kp["inputs"]["remaining_fraction"] == 0.1
+    assert any("< floor" in b for b in kp["basis"])
+
+
+def test_explicit_k_is_a_journaled_deviation_from_policy(monkeypatch, capsys,
+                                                         tmp_path):
+    proj, state, runs = _world(tmp_path)
+    (proj / "src" / "demo" / "foo.py").write_text("x = 1\n" * 200)
+    code, out = _dry(monkeypatch, capsys, state, proj, "--k", "3")
+    assert code == 0 and out["k"] == 3
+    kp = out["k_policy"]
+    assert kp["k"] == 1                          # what policy said
+    assert kp["source"] == "flag override"
+    assert "overrides policy:CAND-1" in kp["deviation"]
+    assert "policy said K=1" in kp["deviation"]
+
+
+def test_only_restart_widens_a_smaller_policy_k(monkeypatch, capsys, tmp_path):
+    """--only restarts re-run a prior run's candidates; a policy K that has
+    since shrunk (budget floor crossed between runs) widens to cover them —
+    recorded, never a silent refusal."""
+    proj, state, runs = _world(tmp_path)
+    (proj / "src" / "demo" / "foo.py").write_text("x = 1\n" * 200)
+    code, out = _dry(monkeypatch, capsys, state, proj, "--only", "c2,c3")
+    assert code == 0 and out["k"] == 3
+    kp = out["k_policy"]
+    assert kp["k"] == 1 and "widened" in kp["restart_widening"]
+    plan = {p["candidate"]: p["run"] for p in out["candidates"]}
+    assert plan == {"c1": False, "c2": True, "c3": True}
+
+
+def test_k1_policy_run_records_the_decision_in_pack_and_commands(
+        monkeypatch, capsys, tmp_path):
+    """End to end at K=1: the ranked table cites the policy id, the state
+    commands record units[].k, and the journal note carries policy:CAND-1
+    where a 'budget-driven deviation' note used to carry prose."""
+    proj, state, runs = _world(tmp_path)
+    (proj / "src" / "demo" / "foo.py").write_text("x = 1\n" * 200)
+    agent_cmd, gate_cmd = _scripts(tmp_path)
+    code, out = _run(monkeypatch, capsys, state, proj, agent_cmd, gate_cmd,
+                     None, mode="always")          # no --k: policy decides
+    assert code == 2 and out["winner"] == "c1"    # green but unjudged
+    assert out["k"] == 1 and out["k_policy"]["k"] == 1
+    assert "policy:CAND-1" in out["summary"]["human"]
+    assert "repair rounds count as candidates" in out["summary"]["human"]
+    cmds = out["state_commands"]
+    assert any("units[u-foo].k=1" in c for c in cmds)
+    assert any("policy:CAND-1" in c for c in cmds if "--note" in c)
+    # the k set command validates against the schema via the real writer
+    set_k = next(c for c in cmds if "units[u-foo].k=1" in c)
+    state_py = str(TOOLS / "state.py")
+    argv = shlex.split(set_k)
+    argv[argv.index("framework/tools/state.py")] = state_py
+    rc, res = run_tool(monkeypatch, capsys, "state.py",
+                       argv[argv.index(state_py) + 1:])
+    assert rc == 0, res
+    assert next(u for u in json.loads(state.read_text())["units"]
+                if u["id"] == "u-foo")["k"] == 1
 
 
 def test_cargo_dep_parser_handles_target_tables_and_dashes(tmp_path):

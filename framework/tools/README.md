@@ -267,9 +267,18 @@ delegate hitting its turn cap mid-unit):
 
 ```console
 python framework/tools/delegate.py run-candidates \
-  --state runs/<project>/migration-state.json --unit u-foo --k 3 \
+  --state runs/<project>/migration-state.json --unit u-foo \
   --agent-cmd 'goose session run {brief_file} {feedback_file}'
 ```
+
+K comes from **policy**, not judgment (issue #59): the `candidates`
+block in `autonomy/policy.json` (`policy:CAND-1`) sets K=3 below the
+unit size threshold and K=1 + bounded repair rounds above it or when
+run-level budget remaining < the floor fraction — the runner resolves
+and enforces that schedule by default, journals the decision (inputs
+included) in the verdict pack, and cites it by id wherever a note used
+to carry prose; an explicit `--k` is an operator override, recorded as
+a deviation from the policy decision.
 
 Per unit it: computes the per-candidate target paths
 (`src/u_<unit>_c1.rs` … `_cK`, following the unit's recorded `rust_path`
@@ -456,11 +465,13 @@ python framework/tools/pipeline.py run state.json \
 python framework/tools/pipeline.py resolve-gates state.json   # policy only, no agent
 python framework/tools/pipeline.py status|report state.json
 
-# the stage-4 candidate runner (issue #33): K translators, partitioned
-# files, bounded verbatim-feedback repair rounds, oracle ranking, verdict
-# pack — one command per unit; the state file stays orchestrator-only
+# the stage-4 candidate runner (issue #33): K translators (K from the
+# policy schedule, issue #59 — delegate.py resolves policy:CAND-1),
+# partitioned files, bounded verbatim-feedback repair rounds, oracle
+# ranking, verdict pack — one command per unit; the state file stays
+# orchestrator-only
 python framework/tools/delegate.py run-candidates --state state.json --unit u-foo \
-  --k 3 --agent-cmd 'goose session run {brief_file} {feedback_file}' \
+  --agent-cmd 'goose session run {brief_file} {feedback_file}' \
   --target-root /abs/target \
   --candidate-module 'mycrate.units.u_foo_{candidate}'   # scaffolded manifest
 python framework/tools/delegate.py run-candidates --state state.json --unit u-foo \
