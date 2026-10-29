@@ -193,11 +193,7 @@ def _dotted(node) -> str | None:
 
 
 def _is_dataclass_decorator(dec) -> bool:
-    # `@dataclass` and `@dataclass(...)` — the argument-carrying form
-    # (`frozen=True, slots=True`) is the modern convention and must not
-    # bail projects to hand-completion (found porting a target whose
-    # convention is `@dataclass(frozen=True, slots=True)`).
-    while isinstance(dec, ast.Call):
+    while isinstance(dec, ast.Call):  # @dataclass(frozen=True, ...) — unwrap the call
         dec = dec.func
     return ((isinstance(dec, ast.Name) and dec.id == "dataclass")
             or (isinstance(dec, ast.Attribute) and dec.attr == "dataclass"))

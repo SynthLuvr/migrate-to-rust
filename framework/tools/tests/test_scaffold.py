@@ -31,6 +31,7 @@ silent [] nor per-row noise masquerading as divergence.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
@@ -971,21 +972,11 @@ def test_int_float_distinction_survives_the_adapter(monkeypatch, capsys, tmp_pat
 
 
 def test_dataclass_decorator_with_arguments_is_recognized():
-    """`@dataclass(frozen=True, slots=True)` — the argument-carrying form —
-    must count as a dataclass decorator. Found porting a target whose
-    house style is exactly that; the bare-name check bailed every unit to
-    hand-completion (framework fix during the wicksmith run, 2026-10-29)."""
-    import ast
-    import importlib.util
-    from pathlib import Path as _Path
-
-    tool_path = _Path(__file__).resolve().parent.parent / "scaffold.py"
-    spec = importlib.util.spec_from_file_location("scaffold_tool", tool_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
+    """`@dataclass(frozen=True, slots=True)` must count as a dataclass
+    decorator — the bare-name-only check used to bail every unit of such
+    a project to hand-completion."""
+    tool = _load_module(Path(__file__).resolve().parent.parent / "scaffold.py")
     source = (
-        "from dataclasses import dataclass\n"
         "@dataclass(frozen=True, slots=True)\n"
         "class Bar:\n"
         "    date: str\n"
@@ -996,17 +987,10 @@ def test_dataclass_decorator_with_arguments_is_recognized():
         "class NotOne:\n"
         "    pass\n"
     )
-    decorated = {}
-    for node in ast.parse(source).body:
-        if isinstance(node, ast.ClassDef):
-            decorated[node.name] = any(
-                mod._is_dataclass_decorator(dec) for dec in node.decorator_list
-            )
-    assert decorated == {
-        "Bar": True,       # @dataclass(frozen=True, slots=True)
-        "Plain": True,     # bare @dataclass (existing behavior)
-        "NotOne": False,   # no decorator at all
+    decorated = {
+        node.name: any(tool._is_dataclass_decorator(d) for d in node.decorator_list)
+        for node in ast.parse(source).body if isinstance(node, ast.ClassDef)
     }
-    # An ALIASED argument-carrying import (`import dataclass as dc`) is not
-    # recognized by name — it conservatively flags for hand-completion
-    # (never guessed), which is the safe direction; not a regression.
+    assert decorated == {"Bar": True, "Plain": True, "NotOne": False}
+    # Aliased imports (`from dataclasses import dataclass as dc`) stay
+    # unrecognized: flagging for hand-completion is the safe direction.
