@@ -4,33 +4,44 @@ Status: accepted · 2026-10-29 · supersedes the agent-driven "orchestrator
 session" run model · amended in-review: the binding unit is the operator's
 **prompt** (criterion 1), the GLV successor chain is on the critical path
 (criterion 2), and the driver is the single-process variant of the same
-guarantee
+guarantee · amended (2), 2026-10-30: **succession is session-driven** —
+the live orchestrator hands itself off via `succession.py handoff` at
+~half its context window; the parked chain harness is an optional
+watchdog, not the operator path (see *Amendment 2* below)
 
 ## Acceptance criteria (binding)
 
 1. **One prompt takes a migration start to finish — and the prompt is
-   yours.** The operator hands the framework one prompt —
-   `succession.py chain --target <project> --prompt-file <prompt>` — and
-   the migration reaches a terminal state (`complete` / `no_go_measured` /
-   `budget_exhausted` / `failed_safely`) with no human interaction
-   anywhere in between. Session 1 receives that prompt **verbatim**: the
-   protocol never authors the task prompt — no header, no briefing, no
-   default (R7). With no state file yet, `--target` boots the run
-   itself (package derived, autonomy L2) — that is mechanics, and
+   yours.** The operator starts ONE agent session with one prompt (any
+   GLV entry: the web UI, the `glv` CLI, or the `succession.py chain
+   --target <project> --prompt-file <prompt>` one-liner, which also
+   boots the state from `--target`) and the migration reaches a terminal
+   state (`complete` / `no_go_measured` / `budget_exhausted` /
+   `failed_safely`) with no human interaction anywhere in between.
+   Session 1 receives that prompt **verbatim**: the protocol never
+   authors the task prompt — no header, no briefing, no default (R7).
+   With no state file yet, the session boots the run itself (stage-0
+   preflight/`--target` boot, autonomy L2) — that is mechanics, and
    mechanics is all the protocol writes. If the run stops and needs to
    be "resumed", the implementation is broken — by definition.
-2. **A filling context is a scheduling event, never a stop.** When a
-   session's context gives out, the session settles and the harness
-   starts the successor automatically over the GLV API
-   (`POST /api/sessions`) with a full resume brief composed from the
-   state file. The whole mechanism is one rule — *settled session +
-   non-terminal state ⇒ succeed* — guarded by the chain guardrails
-   (depth cap, monotonic progress). No token thresholds, no preemptive
-   stops, no second signal to maintain: the session knows its context
-   is filling (the framework prompt binds it to record
-   `budget_exhausted` and stop), and any session that settles without
-   recording a terminal state is succeeded anyway. The operator is
-   informed by a journaled stop-notice — never involved.
+2. **A filling context is a scheduling event, never a stop.** At ~half
+   its context window the session records everything through `state.py`
+   and runs `succession.py handoff` — one command that classifies the
+   chain guardrails from the state file, verifies resume hygiene, spawns
+   the successor over the GLV API (`POST /api/sessions`) with a full
+   resume brief, journals a stop-notice, resets `run_status` to
+   `running`, and exits; the caller stops itself. A session that dies
+   before handing off does not stall the run: the same one command —
+   with `--adopt` when the session is truly gone — recovers from the
+   state file with zero lost work. The whole mechanism is one rule —
+   *a session done working + non-terminal state ⇒ a successor exists* —
+   guarded by the chain guardrails (depth cap, monotonic progress, the
+   run-level ceilings). GLV carries the sessions, their concurrency, and
+   the queue; it does not watch context or respawn (verified against its
+   own docs, 2026-10-30) — the settle rule lives in this tool, called by
+   the session that owes the handoff. The optional `chain` watchdog
+   enforces the same rule from outside for unattended runs; the operator
+   is informed by a journaled stop-notice — never involved.
 3. **Runs are day-scale.** Real migrations take days of wall clock
    (think multi-days, not 3 hours). Any mechanism that caps a run at a
    few hours is a defect, not a safety feature.
@@ -78,10 +89,16 @@ agent exited, or a unit failed; the stage machine, gates, budgets, and
 `run_status` live above all of them. Two run models, one guarantee:
 
 - **The one-prompt chain (the acceptance path for criteria 1–2):**
-  `succession.py chain` wraps the whole run in GLV orchestrator
-  sessions — session 1 rides the operator's prompt verbatim, every
-  succession spawns the successor over the GLV API, and the run-level
-  ceilings bind the entire chain.
+  `succession.py handoff` is the primary mechanism (amendment 2): the
+  live orchestrator session calls it itself at ~half context —
+  guardrails classify from the state file, hygiene verifies, the
+  successor spawns over the GLV API with the composed resume brief, the
+  stop-notice journals, and the command exits; the caller stops itself.
+  `succession.py chain` remains as the optional external watchdog that
+  enforces the same rule from outside (and the `--target` boot
+  one-liner). Either way, session 1 rides the operator's prompt
+  verbatim, every succession spawns the successor over the GLV API, and
+  the run-level ceilings bind the entire chain.
 - **The single-process driver (the same guarantee, one process):**
   `pipeline.py run` owns the stage machine in-process and recycles an
   agent context per chunk; no GLV on that path, and no session-level
@@ -150,6 +167,56 @@ is no human around to author it. Pointing a session at the framework
 checkout is the operator's prompt's business, per
 `MIGRATION_PROMPT.md` § Path resolution — the documented convention.
 
+## Amendment 2 — session-driven succession (2026-10-30)
+
+The pre-amendment design parked a monitor process (`succession.py
+chain`) that waited out every session and spawned successors itself.
+That works, but it makes the operator babysit a second long-running
+process for days, and it duplicates a decision the session is better
+placed to make — it knows its own context is filling before anything
+external does. Verified against GLV's own documentation (2026-10-30):
+GLV drives sessions (start / queued follow-ups / stop / fork /
+six-slot concurrency / scheduled runs), exposes per-session token
+counts, and contains every run in its own process group and memory
+scope — but it has **no context watcher and no auto-respawn**. Queued
+follow-ups chain only when a caller queues them; a missed scheduled
+moment stays missed. "GLV handles succession" is not a fact to lean
+on: the settle rule must live in code *someone* executes — the session
+itself is the right someone.
+
+What changed:
+
+- **`succession.py handoff` is the primary succession mechanism.** The
+  live orchestrator runs it at ~half its context window (after
+  recording everything through `state.py`). It is the chain harness's
+  brain extracted from its loop: the same guardrail classification
+  (genuine terminals, run-level ceilings, monotonic progress, depth
+  cap), the same resume hygiene, the same composed resume brief, the
+  same `POST /api/sessions` spawn, the same journaled stop-notice and
+  `run_status` reset — then it exits and the caller stops itself. No
+  parked process anywhere.
+- **The session-driven start is first-class.** Session 1 may be started
+  by the operator directly (GLV UI / `glv` / any agent); at its
+  handoff, `handoff` adopts it into `session_chain.sessions[]`
+  (index 1) so the guardrails, wall-clock sum, and audit trail stay
+  coherent. `chain --target --prompt-file` remains the one-liner that
+  boots GLV + state + session 1 — and may then be left running as the
+  optional watchdog or simply not used.
+- **The settle rule becomes the rescue rule.** A session that dies
+  without handing off is recovered by the same one command: `handoff`
+  checks GLV liveness for the unsettled session (refusing while it is
+  genuinely live — two live orchestrators would clobber the
+  single-writer state file), `--adopt` stops it and takes the run
+  over, and `--self` is the documented agent path when the session's
+  own GLV id is unknown. Crash windows are bounded by the half-context
+  trigger: a session that hands off at half context never dies *of*
+  context exhaustion.
+- **Parallelism stays delegate-level.** The orchestrator spins up
+  translator/reviewer GLV sessions concurrently (six-slot queue,
+  worktree per delegate, per-session memory scopes —
+  `tools/glv-subagents.md`); the state file stays orchestrator-only,
+  so concurrency never collides on the single writer.
+
 ## Consequences
 
 - `runs/` wiping between runs stays fully supported: a wipe means
@@ -175,7 +242,11 @@ checkout is the operator's prompt's business, per
   the context ceiling always wins eventually.
 - **Keeping the orchestrator session + auto-resume prompts** — a parked
   session is still a stopped run; "resume" is the failure mode this ADR
-  forbids.
+  forbids. (Amendment 2 narrows this rejection: the orchestrator
+  session is retained, but it never leaves a "resume me" note — it
+  *spawns a real successor over the GLV API* before it stops. The
+  failure mode forbidden here is exactly the one `handoff` exists to
+  prevent.)
 - **Driver-only, with the chain demoted off the critical path** (the
   pre-amendment draft of this ADR) — rejected: it made criterion 2
   untrue. The driver never fills a context, so it never exercises GLV

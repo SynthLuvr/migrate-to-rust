@@ -8,7 +8,9 @@ on:
 # design/0001: no agent-specific packaging — CI pins both run models
 # without LLM calls or a live GLV: the deterministic driver end-to-end
 # against a stub agent, and the one-prompt chain (boot + verbatim brief)
-# via --dry-run plus its FakeGlv acceptance suite in tests/test_succession.py.
+# via --dry-run plus its FakeGlv acceptance suite in tests/test_succession.py
+# (chain auto-succession and the session-driven `handoff` path — adopt,
+# self-handoff, crash rescue, guardrails).
 
 jobs:
   json-and-links:

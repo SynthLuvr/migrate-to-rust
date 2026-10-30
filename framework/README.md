@@ -10,17 +10,22 @@ All relative paths in these artifacts — `stages/<n>-*.md`, `roles/*.md`,
 `state/migration-state.schema.json` — live in **this framework checkout**,
 not in the repo being migrated.
 
-1. **One prompt (recommended, design/0001)** — write ONE prompt and the
-   framework runs the migration start to finish, unattended, for as many
-   days as it takes. `succession.py chain` wraps the run in GLV
-   orchestrator sessions: session 1 receives **your prompt verbatim**
-   (the protocol never authors the task prompt), and when a session's
-   context gives out the successor spawns automatically over the GLV API
-   with a full resume brief composed from the state file. The harness
-   bootstraps GLV itself (`glv serve` + one named token per session, no
-   human provisioning). Run from the **root of this `migrate-to-rust`
-   checkout**, pointing `--target` at the project elsewhere on disk
-   (absolute path):
+1. **One prompt (recommended, design/0001)** — write ONE prompt and start
+   ONE agent session with it (GLV UI, `glv` CLI — or the
+   `succession.py chain` one-liner below). The framework runs the
+   migration start to finish, unattended, for as many days as it takes.
+   The orchestrator runs as a series of GLV sessions: session 1 receives
+   **your prompt verbatim** (the protocol never authors the task
+   prompt), and at ~half its context window each session hands itself
+   off — `succession.py handoff` enforces the chain guardrails, composes
+   the successor's full resume brief from the state file, spawns it
+   over the GLV API, and exits; no monitor process parks anywhere. A
+   session that dies without handing off is recovered by the same one
+   command (`--adopt`). The tool bootstraps GLV itself (`glv serve` +
+   one named token per session, no human provisioning). To boot GLV +
+   state + session 1 in one line, run from the **root of this
+   `migrate-to-rust` checkout**, pointing `--target` at the project
+   elsewhere on disk (absolute path):
 
    ```console
    python framework/tools/succession.py chain \
@@ -32,6 +37,9 @@ not in the repo being migrated.
    (`runs/<name>/migration-state.json`, autonomy L2 — gates resolve by
    policy in code, publish disabled; never a mid-run question). A fresh
    chain without `--prompt-file` refuses: the prompt is yours to write.
+   (Leave `chain` running and it doubles as the optional watchdog that
+   spawns successors itself; stop it and the sessions still hand
+   themselves off.)
 
 2. **The driver (the same guarantee in one process)** — one command,
    start to finish, no human interaction, day-scale runs. The driver
@@ -132,11 +140,11 @@ not in the repo being migrated.
 | Path | Role |
 |---|---|
 | `MIGRATION_PROMPT.md` | The distilled harness: 10 hard rules, pipeline table, repair-loop spec, escalation policy, failure-mode table. **This is "the prompt."** |
-| `design/0001-single-session-run.md` | The run model: one prompt (yours, verbatim), start to finish, day-scale — the GLV successor chain for context-full sessions, unit-granular driver chunks, context recycling, day-scale budgets, no agent-specific packaging |
+| `design/0001-single-session-run.md` | The run model: one prompt (yours, verbatim), start to finish, day-scale — session-driven GLV succession at half context (amendment 2), unit-granular driver chunks, context recycling, day-scale budgets, no agent-specific packaging |
 | `stages/0..7-*.md` | Per-stage checklists: purpose, steps, **exit criteria**, escalation triggers |
 | `roles/translator.md` | Subagent instructions for mechanical per-unit translation |
 | `roles/reviewer.md` | Subagent instructions for adversarial parity + PyO3-FFI review |
-| `tools/*.py` + `tools/README.md` | The 8 deterministic helpers — implemented, stdlib-only, JSON-in/JSON-out, acceptance-tested in `tools/tests/` — plus `tools/pipeline.py`, the deterministic driver for unattended L2+ runs (issue #22), and `tools/succession.py`, the session-chain harness that auto-spawns successor GLV sessions on session-level budget exhaustion so a run finishes from one prompt (issue #25); specs, conventions, and quick reference in `tools/README.md` |
+| `tools/*.py` + `tools/README.md` | The 8 deterministic helpers — implemented, stdlib-only, JSON-in/JSON-out, acceptance-tested in `tools/tests/` — plus `tools/pipeline.py`, the deterministic driver for unattended L2+ runs (issue #22), and `tools/succession.py`, the session-succession tool — `handoff` (the live orchestrator hands itself off at ~half context, successor spawns over the GLV API) and the optional `chain` watchdog — so a run finishes from one prompt (issue #25); specs, conventions, and quick reference in `tools/README.md` |
 | `autonomy/policy.json` | The autonomy policy layer (issue #22): levels L0–L3 and one machine-decidable rule per gate with conservative defaults — evaluated only in code, journaled, never LLM self-approval. Default level L2; the agent never asks a human mid-run at any level (at L0/L1 gates stay open and the run ends with the dossier for between-runs operator review) |
 | `knowledge/substitutions.json` | Machine-readable crate mapping + no-equivalent zones (from `research/5`) |
 | `state/migration-state.schema.json` | The dual-build state manager schema — the resumable, per-unit-reversible record |

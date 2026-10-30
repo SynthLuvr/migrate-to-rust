@@ -27,24 +27,37 @@ operate a pipeline; the gates decide, not you.
 
 **Who runs the loop.** Two operating modes (issue #22):
 
-- **Chained (the one-prompt acceptance path — design/0001 criteria 1–2)** —
-  when the run is started by
-  [`tools/succession.py chain`](tools/succession.py) (issue #25), the
-  orchestrator role itself runs as a series of GLV sessions: session 1
-  rides the operator's prompt **verbatim** (the protocol never authors
-  the task prompt). If your session's context budget exhausts before the
-  run reaches a terminal state, record `budget_exhausted` and stop — the
-  harness composes the successor's resume brief from the state file
-  (position, dossier, journal tail, budget remaining, GLV bootstrap
-  pointer) and spawns it automatically; a session that settles without
-  recording a terminal state is succeeded too. The harness bootstraps
-  GLV itself (issue #47) — it ensures `glv serve` is up and mints one
-  named token (`run-<project>-s<n>`) per chain session; see
+- **Chained (the one-prompt acceptance path — design/0001 criteria 1–2,
+  amendment 2)** — the orchestrator role runs as a series of GLV
+  sessions: session 1 is started by the operator with **their** prompt
+  **verbatim** (the protocol never authors the task prompt) — via the
+  GLV UI, the `glv` CLI, or the
+  [`tools/succession.py chain --target … --prompt-file …`](tools/succession.py)
+  one-liner. **At roughly HALF your context window** (and earlier if a
+  huge tool output is about to land), record everything you have
+  verified through `tools/state.py`, then run
+  `python framework/tools/succession.py handoff <state-file> --self` —
+  one command that enforces the chain guardrails (depth cap, monotonic
+  progress, run-level ceilings), verifies resume hygiene, composes the
+  successor's full resume brief from the state file (position, dossier,
+  journal tail, budget remaining, GLV bootstrap pointer), spawns it
+  over the GLV API, journals a stop-notice, resets `run_status` to
+  `running`, and exits. Then **stop** — record nothing more; the
+  successor continues the run. Exit `0` with `handed_off: false` means
+  the run is already terminal: stop normally. Spin up concurrent
+  translator/reviewer delegate sessions per
+  [`tools/glv-subagents.md`](tools/glv-subagents.md) to parallelize —
+  worktree per delegate, the state file stays yours alone. GLV carries
+  the sessions; it never respawns on its own, so the handoff is YOUR
+  move, and if a session ever dies without one, the same `handoff`
+  command (with `--adopt` for a truly gone session) recovers from the
+  state file with zero lost work. The tool bootstraps GLV itself
+  (issue #47) — it ensures `glv serve` is up and mints one named token
+  (`run-<project>-s<n>`) per chain session; see
   [`tools/glv-subagents.md`](tools/glv-subagents.md) § "GLV bootstrap",
   the runbook section every session runs before any role or chain work.
   A run then finishes from one human prompt with zero manual restarts;
-  the run-level ceilings and the chain guardrails (depth cap, monotonic
-  progress) bound everything.
+  the run-level ceilings and the chain guardrails bound everything.
 - **Driver-driven (L2/L3, the single-process variant — design/0001)** — the
   deterministic driver [`tools/pipeline.py`](tools/pipeline.py) owns the
   run start to finish (stage order, exit-criteria verification, gate
@@ -219,12 +232,13 @@ Divergent / Incomparable`; every Divergent carries a written explanation.
   still judges; GLV only carries the roles. GLV also carries the
   **orchestrator chain**
   ([`tools/succession.py`](tools/succession.py), issue #25) — the
-  one-prompt acceptance path of design/0001: `succession.py chain
-  --target <project> --prompt-file <your-prompt>` runs the whole
-  migration through GLV sessions, your prompt verbatim in session 1,
-  and a session whose context gives out is succeeded automatically over
-  this API. The single-process driver variant recycles contexts per
-  chunk in one process instead of chaining sessions.
+  one-prompt acceptance path of design/0001 (amendment 2): your prompt
+  verbatim in session 1, and at half context each session hands itself
+  off with `succession.py handoff` — the successor spawns automatically
+  over this API with a full resume brief; the optional `chain` watchdog
+  does the same from outside. The single-process driver variant
+  recycles contexts per chunk in one process instead of chaining
+  sessions.
 
 ## Gates — autonomy levels and policy resolution (issue #22)
 

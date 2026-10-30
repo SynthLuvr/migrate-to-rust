@@ -9,7 +9,7 @@ A research-grounded design for a framework that helps **AI agents migrate Python
 | **[SUMMARY.md](SUMMARY.md)** | The research synthesis: verified case studies with numbers, the 10 evidence-backed requirements, the framework architecture, honest caveats |
 | **[TOOLCHAIN.md](TOOLCHAIN.md)** | The tool list, organized by pipeline stage — what to adopt off-the-shelf vs what the framework must build |
 | **[research/](research/)** | 6 source files (~1,100 lines): case studies, manual-migration lessons, tool catalog with maintenance verification, academic literature, idiom/ecosystem mapping — every quantitative claim carries its source URL; unverifiable claims are flagged |
-| **[framework/](framework/)** | The executable packaging of the research: agent prompt, the one-prompt GLV session chain + the deterministic driver (design/0001), 8 stage checklists, translator/reviewer roles, 8 gap-tool specs, the GLV subagent-transport guide, crate-substitution knowledge, the migration state schema, and a [worked example](framework/examples/) showing the artifacts a real run leaves behind |
+| **[framework/](framework/)** | The executable packaging of the research: agent prompt, the one-prompt GLV session chain (session-driven handoff at half context + the optional watchdog) + the deterministic driver (design/0001), 8 stage checklists, translator/reviewer roles, 8 gap-tool specs, the GLV subagent-transport guide, crate-substitution knowledge, the migration state schema, and a [worked example](framework/examples/) showing the artifacts a real run leaves behind |
 | **[scripts/](scripts/)** | CI checker scripts (stdlib-only): `check_json.py` parse-checks every JSON file, `check_links.py` resolves every relative markdown link (plus an optional `--external` citation URL spot-check) |
 
 ## The one-paragraph thesis
@@ -18,7 +18,7 @@ Successful AI-driven ports (Volatility3: 29k LOC in 68 h for ~$3k of tokens at 6
 
 ## CI
 
-Every push and PR ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs, with no LLM calls: a full driver acceptance run against a stub agent (boots from `--target`, reaches `complete`, recycles Stage-4 unit contexts, escalates a stuck unit instead of halting), a one-prompt chain boot check (`succession.py chain --target --dry-run`), JSON parse checks, JSON Schema validation of the state file (including rejecting deliberately incomplete units), an internal-markdown-link check, and the tools test-suite (GLV-chain succession included — one-prompt boot, verbatim-prompt pinning, mid-run auto-succession — behind a scripted fake transport). A best-effort, non-blocking citation URL spot-check runs alongside.
+Every push and PR ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs, with no LLM calls: a full driver acceptance run against a stub agent (boots from `--target`, reaches `complete`, recycles Stage-4 unit contexts, escalates a stuck unit instead of halting), a one-prompt chain boot check (`succession.py chain --target --dry-run`), JSON parse checks, JSON Schema validation of the state file (including rejecting deliberately incomplete units), an internal-markdown-link check, and the tools test-suite (GLV-chain succession included — one-prompt boot, verbatim-prompt pinning, mid-run auto-succession, and the session-driven `handoff` path: adopt, self-handoff, crash rescue, guardrails — behind a scripted fake transport). A best-effort, non-blocking citation URL spot-check runs alongside.
 
 ## What the evidence flatly rules out
 

@@ -26,6 +26,21 @@ the outcome from the state file (the single source of truth — sessions
 write it only through ``state.py``), and on session-level exhaustion
 spawns the successor itself.
 
+**Amendment 2 (design/0001, session-driven succession — the default).**
+The live orchestrator session now does this itself, with no parked
+monitor process: at ~half its context window it records everything
+through ``state.py`` and calls ``succession.py handoff`` — one shot:
+guardrails classify from the state file, resume hygiene runs, the
+successor spawns over the GLV API with the composed resume brief, the
+stop-notice journals, run_status resets to running, and the command
+exits; the caller stops itself. The same one command is the crash
+rescue for a session that died without handing off (``--adopt``; a
+still-live session is refused without it). ``chain`` remains as the
+OPTIONAL external watchdog (unattended belt-and-braces; also the
+boot-from-``--target`` one-liner) — GLV carries sessions, concurrency,
+and the queue, but it does not watch context or respawn: the settle
+rule is enforced by this tool, not by the server.
+
   1. **Auto-succession.** ``run_status=budget_exhausted`` (or a session
      that settled without recording any terminal state) under the
      run-level ceilings → compose the full resume brief, spawn the
@@ -76,6 +91,9 @@ re-classifies before spawning anything.
 Subcommands
 -----------
   chain    drive the run as a successor-session chain over GLV (above)
+  handoff  one-shot succession for a session-driven run (amendment 2):
+           the live session calls it itself at ~half context; also the
+           crash rescue (--adopt) for a session that died un-handed-off
   brief    compose (and print, no side effects) the brief the next
            session — first or successor — would receive
   hygiene   verify/repair the state file's recorded paths (issue #25
@@ -232,6 +250,12 @@ class GlvClient:
 
     def stop(self, session_id: str) -> dict:
         return self._request("POST", f"/api/sessions/{session_id}/stop")
+
+    def session_status(self, session_id: str) -> dict:
+        """Meta-only read (``fields=meta`` omits the transcript entirely);
+        used by the handoff to tell a dead session from one still live."""
+        return self._request("GET",
+                             f"/api/sessions/{session_id}?fields=meta")
 
 
 # ---------------------------------------- self-bootstrap (issue #47) ------
@@ -507,6 +531,9 @@ class GlvTransport:
 
     def stop(self, session_id: str) -> dict:
         return self._call("stop", session_id)
+
+    def session_status(self, session_id: str) -> dict:
+        return self._call("session_status", session_id)
 
     def public(self) -> dict:
         """Audit-trail view for the tool's JSON output — token NAMES
@@ -1143,6 +1170,24 @@ def _start_session(state: dict, path: Path, transport: GlvTransport,
     return _append_session(state, path, entry, events, max_depth), index
 
 
+def _record_settled(state: dict, path: Path, index: int, events: list, *,
+                    glv_status: str | None = None) -> dict:
+    """Settle bookkeeping for one session entry, without waiting on the
+    transport (the chain's `_settle` calls this after its wait; the
+    handoff calls it for the caller itself, or for a dead predecessor)."""
+    updates: dict = {"settled_at": now_iso()}
+    if glv_status:
+        updates["glv_status"] = glv_status
+    state = _update_session(state, path, index, updates, events)
+    state = _accumulate_wall_clock(state, path, index, events)
+    state = _update_session(state, path, index,
+                            {"outcome": state.get("run_status")}, events)
+    events.append({"event": "session-settled", "index": index,
+                   "glv_status": glv_status,
+                   "outcome": state.get("run_status")})
+    return state
+
+
 def _settle(state: dict, path: Path, transport: GlvTransport, index: int,
             events: list) -> dict:
     session = _chain_session(state, index) or {}
@@ -1150,16 +1195,8 @@ def _settle(state: dict, path: Path, transport: GlvTransport, index: int,
     # the session JUST wrote the state file (its last act); re-read before
     # journaling the settle bookkeeping or this write would clobber it
     state = _load_state(path)
-    state = _update_session(state, path, index,
-                            {"settled_at": now_iso(),
-                             "glv_status": settled.get("status")}, events)
-    state = _accumulate_wall_clock(state, path, index, events)
-    state = _update_session(state, path, index,
-                            {"outcome": state.get("run_status")}, events)
-    events.append({"event": "session-settled", "index": index,
-                   "glv_status": settled.get("status"),
-                   "outcome": state.get("run_status")})
-    return state
+    return _record_settled(state, path, index, events,
+                           glv_status=settled.get("status"))
 
 
 def _refusal(reason: str, human_flag: bool, **extra) -> int:
@@ -1443,6 +1480,174 @@ def cmd_chain(args) -> int:
 
 # ------------------------------------------------------------- commands ---
 
+def cmd_handoff(args) -> int:
+    """The session-driven succession (design/0001 amendment 2). Called by
+    the LIVE orchestrator session at ~half its context window: guardrails
+    classify from the state file, resume hygiene runs, the successor
+    spawns over the GLV API with the composed resume brief, the
+    stop-notice journals, run_status resets to running — and this process
+    exits. The caller stops itself; no monitor parks anywhere. The same
+    one command is the crash rescue for a session that died without
+    handing off (--adopt takes it over; a still-live session is refused
+    without it, since two live orchestrators would clobber the state)."""
+    policy = pipeline_tool.load_policy(args.policy)
+    path = Path(args.state)
+    state = _load_state(path)
+    events: list[dict] = []
+    project = (state.get("project") or {}).get("name") or "project"
+    transport = GlvTransport(base_url=args.glv_url, token=args.glv_token,
+                             project=project, events=events)
+
+    def result(code: int, human: str, **extra) -> int:
+        report = pipeline_tool.build_report(state, policy)
+        report_path = pipeline_tool.report_path_for(path)
+        report_path.write_text(report, encoding="utf-8")
+        payload = {"tool": TOOL, "version": VERSION, "file": str(path),
+                   "handed_off": extra.pop("handed_off", False),
+                   "containment": self_containment(),
+                   "glv": transport.public(),
+                   "chain": _public_chain(state),
+                   "run_status": state.get("run_status"),
+                   "events": events, "report_path": str(report_path),
+                   "summary": {"exit_code": code, "human": human}}
+        payload.update(extra)
+        emit(payload, human_flag=args.human)
+        return code
+
+    sessions = _chain_block(state).get("sessions") or []
+    last = sessions[-1] if sessions else None
+    _, _, max_depth = _ceilings(state, policy, args)
+
+    # A finished run is never handed off — but its final session had
+    # nobody parked to settle it: record the bookkeeping here so the
+    # chain record stays coherent, then report done (a result, not a stop).
+    if state.get("run_status") in FINISHED_RUN_STATUSES:
+        if last and not last.get("settled_at"):
+            state = _record_settled(state, path, last["index"], events)
+        return result(EXIT_OK,
+                      f"nothing to hand off: run_status="
+                      f"{state.get('run_status')} is terminal — the run "
+                      f"ended; stop normally",
+                      handed_off=False, classification={"kind": "terminal"})
+
+    # Resolve the CALLING session's entry before classifying:
+    #  - no entries at all: session 1 was started by the operator (GLV UI,
+    #    the glv CLI, any agent) — adopt it now, at its own handoff;
+    #  - last entry unsettled with our --session-id: a self-handoff
+    #    mid-chain — settle without a liveness check (the caller IS the
+    #    live session; it stops itself right after this returns);
+    #  - last entry unsettled with another id: a session died without
+    #    handing off — the crash this command also rescues. Check GLV
+    #    liveness first: while it is still live, refuse (two live
+    #    orchestrators would clobber the single-writer state file)
+    #    unless --adopt explicitly takes the run over.
+    if not sessions:
+        state = _append_session(
+            state, path,
+            {"index": 1, "id": args.session_id or "adopted-external-s1",
+             "name": f"run-{project}-s1", "succession_reason": None,
+             "progress_snapshot": _progress_snapshot(state)},
+            events, max_depth)
+        events.append({"event": "session-adopted", "index": 1,
+                       "detail": "session 1 was started by the operator, "
+                                 "not a harness — adopted at its handoff"})
+        state = _record_settled(state, path, 1, events)
+    elif not (last or {}).get("settled_at"):
+        index = (last or {}).get("index")
+        self_handoff = bool(args.self) or (
+            args.session_id is not None
+            and args.session_id == last.get("id"))
+        if not self_handoff:
+            transport.begin_session(
+                name=last.get("name") or f"run-{project}-s{index or 1}")
+            status, liveness_error = None, None
+            try:
+                meta = transport.session_status(str(last.get("id") or ""))
+                status = ((meta.get("session") or meta).get("status")
+                          if isinstance(meta, dict) else None)
+            except (GlvError, ToolError) as e:
+                liveness_error = str(e)
+            live = status in GLV_LIVE_STATUSES
+            if (live or status is None) and not args.adopt:
+                if live:
+                    detail = (f"session s{index} ({last.get('id')}) is "
+                              f"still live in GLV")
+                else:
+                    detail = (f"could not determine whether session s"
+                              f"{index} ({last.get('id')}) is still live"
+                              + (f" ({liveness_error})" if liveness_error
+                                 else ""))
+                return result(
+                    EXIT_FINDINGS,
+                    f"handoff refused: {detail} — two live orchestrators "
+                    f"would clobber the state file; if you ARE that live "
+                    f"session handing yourself off, re-run with --self; "
+                    f"if it is gone or stuck, take the run over with "
+                    f"--adopt",
+                    handed_off=False)
+            glv_status = None
+            if live and args.adopt:
+                transport.stop(str(last.get("id") or ""))
+                events.append({"event": "predecessor-adopted",
+                               "id": last.get("id")})
+                glv_status = "stopped"
+            elif status:
+                glv_status = status
+            state = _record_settled(state, path, index, events,
+                                    glv_status=glv_status)
+        else:
+            state = _record_settled(state, path, index, events)
+
+    # the same classification the chain uses — pure function of state +
+    # ceilings; succeed spawns, everything else ends with the reason
+    state = _load_state(path)
+    max_tokens, max_minutes, max_depth = _ceilings(state, policy, args)
+    decision = _classify(state, max_tokens=max_tokens,
+                         max_minutes=max_minutes, max_depth=max_depth)
+    events.append({"event": "classified", "kind": decision["kind"],
+                   "reason": decision["reason"]})
+    state, ending = _apply_decision(decision, state, path, events)
+    if ending is not None:
+        code = (EXIT_FINDINGS if state.get("run_status") == "failed_safely"
+                else EXIT_OK)
+        return result(code, f"no successor spawned: {decision['reason']}",
+                      handed_off=False, classification=decision)
+
+    # succeed: hygiene -> brief -> spawn -> stop-notice + reset -> exit
+    state, findings = resume_hygiene(state, path)
+    events += [{"event": "hygiene-repaired", **f}
+               for f in findings if f.get("action") == "repaired"]
+    brief, index = _next_brief(state, path, policy=policy, args=args,
+                               hygiene_findings=findings)
+    predecessor = _chain_session(
+        state, len(_chain_block(state).get("sessions") or [])) or {}
+    working_dir = (args.working_dir
+                   or ((state.get("preflight") or {}).get("target") or {})
+                   .get("root") or str(path.parent))
+    try:
+        state, index = _start_session(
+            state, path, transport, brief, events, project=project,
+            working_dir=working_dir, model=args.model, max_depth=max_depth,
+            succession_reason=decision["reason"],
+            snapshot=_progress_snapshot(state))
+    except ToolError as e:
+        state = _load_state(path)
+        state, reason = _park_transport_dead(state, path, e, events)
+        return result(EXIT_FINDINGS, reason, handed_off=False,
+                      classification=decision)
+    successor = _chain_session(state, index) or {}
+    state = _record_succession(state, path, predecessor, successor, events)
+    return result(
+        EXIT_OK,
+        f"successor {successor.get('name')} ({successor.get('id')}) "
+        f"spawned with the full resume brief — record nothing more and "
+        f"stop; it continues the run",
+        handed_off=True,
+        successor={"index": successor.get("index"), "id": successor.get("id"),
+                   "name": successor.get("name")},
+        classification=decision)
+
+
 def cmd_brief(args) -> int:
     policy = pipeline_tool.load_policy(args.policy)
     path = Path(args.state)
@@ -1529,6 +1734,51 @@ def main(argv=None) -> int:
                    help="compose the next session's brief + guardrail plan "
                         "without contacting GLV or writing anything")
     p.set_defaults(func=cmd_chain)
+
+    p = sub.add_parser("handoff",
+                       help="one-shot succession for a session-driven run "
+                            "(design/0001 amendment 2): the live session "
+                            "calls this itself at ~half its context — "
+                            "guardrails classify, hygiene verifies, the "
+                            "successor spawns over the GLV API with the "
+                            "full resume brief, then the caller stops; "
+                            "also the crash rescue (--adopt) for a session "
+                            "that died without handing off")
+    p.add_argument("state")
+    p.add_argument("--session-id",
+                   help="this session's GLV id — recorded on the adopted "
+                        "entry; when it matches the last unsettled chain "
+                        "entry, the handoff is a self-handoff (no "
+                        "liveness check, no stop)")
+    p.add_argument("--self", action="store_true",
+                   help="you ARE the live session handing yourself off: "
+                        "settle your own entry with no liveness check and "
+                        "no stop, then spawn the successor (the documented "
+                        "agent path when the GLV session id is unknown)")
+    p.add_argument("--adopt", action="store_true",
+                   help="crash rescue: take over a session that settled "
+                        "without a handoff — stops it in GLV if still "
+                        "live, then spawns the successor from the state "
+                        "file")
+    p.add_argument("--working-dir",
+                   help="GLV working_dir for the successor (default: the "
+                        "preflight-recorded target root, else the state "
+                        "file's directory)")
+    p.add_argument("--model", help="GLV model pin (resolve pins via "
+                                   "GET /api/models, never free-typed)")
+    p.add_argument("--max-depth", type=int,
+                   help="chain depth cap (default: autonomy.budget."
+                        "max_chain_depth, policy default 10)")
+    p.add_argument("--policy", help="override autonomy/policy.json")
+    p.add_argument("--glv-url", help="override GLV_BASE_URL (default: the "
+                                     "transport self-bootstraps — probe/"
+                                     "start `glv serve` per tools/"
+                                     "glv-subagents.md § GLV bootstrap)")
+    p.add_argument("--glv-token", help="override GLV_API_TOKEN (default: "
+                                       "mint run-<project>-s<n> per chain "
+                                       "session — the `glv token list` "
+                                       "audit trail)")
+    p.set_defaults(func=cmd_handoff)
 
     p = sub.add_parser("brief",
                        help="compose the next session's brief (first or "
