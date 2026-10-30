@@ -578,25 +578,55 @@ def _strip_mod_lines(text: str, modules: set[str]) -> str:
     return "".join(kept)
 
 
+def _strip_register_blocks(text: str, modules: set[str]) -> str:
+    """Drop each `crate::ffi::register_submodule(...)?;` statement wiring
+    one of `modules` into the crate root (#83): stripping only the `mod`
+    line used to leave the call dangling — E0433 on every gate round, which
+    the candidate is forbidden to fix (translator rule 9), so the repair
+    loop could never converge."""
+    for pattern in (_register_block_re(m) for m in modules):
+        text = pattern.sub("", text)
+    return text
+
+
+def _register_block_re(module: str) -> re.Pattern:
+    """The `crate::ffi::register_submodule(...)?;` statement that wires a
+    candidate's submodule into lib.rs's register() — hand-written by the
+    agent (the brief's "module-registration line(s)"), so both the one-line
+    and the multi-line form must match. `(?:(?!;).)` cannot cross a `;`, so
+    a lib.rs registering several candidates only loses the one naming
+    `module` (#83)."""
+    return re.compile(
+        r"^[ \t]*crate::ffi::register_submodule\((?:(?!;).)*?"
+        rf'"{re.escape(module)}"(?:(?!;).)*?\)\?;[ \t]*\r?\n',
+        re.M | re.S)
+
+
 def _strip_candidate(sandbox: Path, entry: dict,
                      rust_files: list[Path]) -> bool:
     """Remove one non-kept candidate from a sandbox copy: delete its file
-    and the `mod` line wiring it. Returns whether the sandbox carried
-    either."""
+    and every wiring of it — the `mod <m>;` line AND the
+    `crate::ffi::register_submodule(...)?;` block in the crate root (#83;
+    leaving the latter dangling made every sibling sandbox fail E0433,
+    which the candidate itself may not fix — translator rule 9 — so the
+    repair loop burned to MAX_ROUNDS on the identical error). Returns
+    whether the sandbox carried any of it."""
     path = sandbox / entry["rust_file_rel"]
     found = path.exists()
     if found:
         path.unlink()
     pattern = _mod_line_re(entry["module"])
+    register = _register_block_re(entry["module"])
     wired = False
     for rs in rust_files:
         try:
             text = rs.read_text(encoding="utf-8")
         except OSError:
             continue
-        if pattern.search(text):
+        if pattern.search(text) or register.search(text):
             wired = True
-            rs.write_text(_strip_mod_lines(text, {entry["module"]}),
+            text = _strip_mod_lines(text, {entry["module"]})
+            rs.write_text(_strip_register_blocks(text, {entry["module"]}),
                           encoding="utf-8")
     return found or wired
 
