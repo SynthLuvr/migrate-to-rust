@@ -24,20 +24,23 @@ Terminal-state discipline: a run ALWAYS ends in ``complete`` /
 report incl. the escalation dossier, state file, journal). Safety rests on
 the existing dual-build design: per-unit Python fallback, one-env-var shim,
 rollback pin — every autonomous decision stays reversible per unit.
-Session-level ``budget_exhausted`` (the orchestrator session's context
-window, not these run-level ceilings) is handled by ``succession.py``
-(issue #25), which chains successor GLV sessions automatically and
-bootstraps GLV itself (issue #47: serve + its own named token — no
-alternate transport); this driver's own ``budget_exhausted`` exit
-therefore means the run-level bound hit — the pre-authorized budget is
-spent, and raising it is the operator's between-runs decision.
+Escalations defer with the Python fallback live (ESC-1), no-equivalent
+dependencies descope (DEP-1), and a NO-GO projection is a successful
+``no_go_measured`` exit.
+
+Single-session run model (design/0001): one invocation of ``run`` is the
+session. The driver process owns the run start-to-finish; agent contexts
+are disposable work buffers recycled per chunk (per unit at Stage 4), so
+no context window bounds the run — only the policy budget does (day-scale
+ceilings, policy v1.4.0).
 
 Autonomy levels (pre-authorized BEFORE the run; zero mid-run questions at
-any level — the agent never asks): L0 supervised (gates are hard stops: the
-agent-driven recipe leaves the gate open and ends the run with the dossier
-for the operator; this driver refuses to run it) · L1 agent proposes into
-the dossier, operator decides between runs (also refused here) · L2 all
-gates policy-resolved, publish disabled · L3 full autopilot incl. cutover.
+any level — the agent never asks): L0 supervised (gates are hard stops:
+the agent-driven mode leaves the gate open and ends the run with the
+dossier for the operator; this driver refuses to run it) · L1 agent
+proposes into the dossier, operator decides between runs (also refused
+here) · L2 all gates policy-resolved, publish disabled · L3 full
+autopilot incl. cutover.
 
 Subcommands
 -----------
@@ -110,6 +113,11 @@ LAST_STAGE = 7
 # gates the driver itself opens at a stage boundary when the worker did not
 # (gate ownership moves to code at L2+; the worker records the *data*)
 STAGE_GATES = {0: ["go_no_go"], 6: ["cutover"]}
+
+# The statuses that end a unit's Stage-4 loop (verify_stage_exit's stage-4
+# rule is "no pending units"); anything else leaves the unit chunk open.
+UNIT_TERMINAL_STATUSES = ("ported", "divergent_explained", "escalated",
+                          "fallback_python")
 # evaluation order: descoping (DEP-1) must clear the scope before GO-1 reads it
 GATE_ORDER = {"no_equivalent_dependency": 0, "go_no_go": 1}
 UNDECIDABLE = "undecidable"
@@ -1467,15 +1475,19 @@ class _Terminal(Exception):
 
 
 def _invoke_agent(cmd_template: str, stage: int, state_path: Path,
-                  mem_limit_mb: int | None = None) -> tuple[int, str]:
+                  mem_limit_mb: int | None = None,
+                  unit: str | None = None,
+                  brief_file: Path | None = None) -> tuple[int, str]:
     """The stage worker rides _common.run_child — the harness's single
     child-process choke point (issue #74) — for the fixed env, captured
     output, hard timeout, and (when mem_limit_mb is set) the per-child
-    cgroup memory scope."""
+    cgroup memory scope. Unit chunks (design/0001) pass ``unit`` +
+    ``brief_file`` on top of the stage placeholders."""
     cmd = cmd_template.format(
         stage=stage, state=str(state_path),
         stage_file=str(FRAMEWORK / "stages" / STAGE_FILES[stage]),
-        framework=str(FRAMEWORK))
+        framework=str(FRAMEWORK), unit=unit or "",
+        brief_file=str(brief_file or ""))
     try:
         rc, out, err = run_child(shlex.split(cmd), timeout=3600,
                                  mem_limit_mb=mem_limit_mb)
@@ -1551,6 +1563,169 @@ def _execute_stage(args, path: Path, stage: int, events: list,
                             f"{attempts} attempt(s): {failures}", state=state)
 
 
+def _next_eligible_unit(units: list) -> tuple[str | None, list[str]]:
+    """The first pending unit (by ``order``) whose deps are all terminal —
+    the driver's chunk schedule (design/0001 R2). Returns (uid|None,
+    blocked pending uids) — blocked = pending units whose deps are still
+    open (a dependency cycle or a dep the worker must descope)."""
+    by_id = {u.get("id"): u for u in units}
+    pending = sorted((u for u in units if u.get("status") == "pending"),
+                     key=lambda u: (u.get("order", 0), u.get("id", "")))
+    blocked = [u["id"] for u in pending
+               if any((by_id.get(d) or {}).get("status") not in
+                      UNIT_TERMINAL_STATUSES for d in u.get("deps", []))]
+    for u in pending:
+        if u["id"] not in blocked:
+            return u["id"], blocked
+    return None, blocked
+
+
+def _write_unit_brief(state_path: Path, uid: str) -> Path:
+    """The per-unit chunk brief (design/0001 R2): small, deterministic, and
+    pointer-based — the worker context reads the binding files itself, so
+    the brief stays a few KB no matter how long the run has been going."""
+    state = _load_state(state_path)
+    unit = next((u for u in state.get("units", []) if u.get("id") == uid), None)
+    brief_dir = state_path.parent / "delegates" / uid
+    brief_dir.mkdir(parents=True, exist_ok=True)
+    brief = brief_dir / "driver-brief.md"
+    deps = ", ".join(unit.get("deps", [])) or "(none)"
+    rust_path = unit.get("rust_path") or "(scaffold at Stage 3 records it)"
+    brief.write_text(f"""# Stage-4 worker brief — unit {uid} (chunk {uid}; fresh context)
+
+You are the Stage-4 translator/reviewer worker for exactly ONE unit. The
+driver owns the run: never touch gates, `stage`, or `run_status` — record
+only this unit's data through `tools/state.py`.
+
+## Binding reading order
+1. `framework/MIGRATION_PROMPT.md` — its hard rules bind you.
+2. `framework/stages/4-translate.md` — the stage checklist you are executing.
+3. `framework/roles/translator.md`, then `framework/roles/reviewer.md` —
+   translate, then review, before recording any verdict.
+
+## This unit (from {state_path})
+- id: {uid}
+- python source (the spec): {unit.get('python_path')}
+- rust target: {rust_path}
+- deps (all terminal, per the driver): {deps}
+- contract.covering_tests: {', '.join((unit.get('contract') or {}).get('covering_tests', [])) or '(see state file)'}
+
+## The loop (bounded by your own context, not the run's)
+Translate → compile/fmt/clippy/test gates → oracle judge against the
+contract corpus (fresh seed included) → review → `state.py set` the parity /
+attribution evidence → `state.py mark --unit {uid} --status <ported|
+divergent_explained|fallback_python>`. Exit 0 only after the unit's status
+is recorded.
+
+## If your context is running out
+Record what you verified through `state.py` (notes count), then just exit —
+the driver starts a fresh context on this same brief with the previous
+attempt's output tail appended below. Do NOT wrap up the run; the run is
+not yours to end.
+""", encoding="utf-8")
+    return brief
+
+
+def _escalate_unit(state: dict, path: Path, uid: str, unit: dict,
+                   attempts: int, rc: int, events: list, policy: dict,
+                   ctx: dict) -> dict:
+    """ESC-1 defer: mark the unit escalated (Python fallback stays live),
+    resolve the single unit_escalation gate, and let the backlog continue."""
+    changes: list = []
+    gate = state_tool.find_gate(state, "unit_escalation")
+    if gate is None:
+        _open_gate(state, "unit_escalation",
+                   f"unit {uid}: chunk failed {attempts} fresh "
+                   f"context(s) (last rc={rc})", changes)
+        gate = state_tool.find_gate(state, "unit_escalation")
+    else:  # one gate record accumulates every escalated unit
+        state_tool.record_gate_fields(gate, {
+            "note": gate.get("note", "") + f" [unit={uid}]"}, changes)
+    old = unit.get("status")
+    unit["status"] = "escalated"
+    changes.append((uid, f"units[{uid}].status", old, "escalated"))
+    decision_note = "deferred"
+    if gate.get("state") == "open":
+        decisions, gate_changes = resolve_open_gates(
+            state, policy, ctx, only="unit_escalation")
+        changes.extend(gate_changes)
+        if decisions:
+            decision_note = decisions[0].get("decision", decision_note)
+    try:
+        state_tool.save_validated(state, path, actor=TOOL, changes=changes)
+    except (ValueError, ToolError) as e:
+        raise _Terminal(
+            "failed_safely",
+            f"stage 4: escalating {uid} would leave the state "
+            f"invalid ({e}); state file left as-is") from e
+    events.append({"stage": 4, "event": "unit-escalated",
+                   "unit": uid, "attempts": attempts,
+                   "gate": "unit_escalation",
+                   "decision": decision_note})
+    return state
+
+
+def _drive_unit(args, path: Path, uid: str, events: list, policy: dict,
+                ctx: dict, mem_limit_mb: int | None,
+                max_unit_retries: int) -> dict:
+    """Drive ONE unit to a terminal status in fresh agent contexts: any
+    chunk exit that does not record one (non-zero rc, timeout, or a clean
+    exit with the unit still pending) retries the chunk with the failed
+    attempt's output tail appended to the brief verbatim; a unit that
+    exhausts its retries escalates instead of stopping the run."""
+    brief = _write_unit_brief(path, uid)
+    attempts = 0
+    while True:
+        rc, tail = _invoke_agent(args.agent_cmd, 4, path,
+                                 mem_limit_mb=mem_limit_mb,
+                                 unit=uid, brief_file=brief)
+        state = _load_state(path)
+        unit = next((u for u in state.get("units", [])
+                     if u.get("id") == uid), None)
+        if unit is not None and unit.get("status") in UNIT_TERMINAL_STATUSES:
+            events.append({"stage": 4, "event": "unit-chunk-done",
+                           "unit": uid, "status": unit["status"],
+                           "attempts": attempts + 1})
+            return state
+        attempts += 1
+        events.append({"stage": 4, "event": "unit-chunk-retry",
+                       "unit": uid, "rc": rc, "tail": tail[-400:]})
+        with brief.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n## Previous attempt {attempts} (rc={rc}) — "
+                     f"output tail\n```\n{tail[-2000:]}\n```\n")
+        if attempts > max_unit_retries:
+            if unit is None:  # the worker dropped the record itself
+                raise _Terminal(
+                    "failed_safely",
+                    f"stage 4: unit {uid} vanished from the state file "
+                    f"after {attempts} chunk attempt(s)")
+            return _escalate_unit(state, path, uid, unit, attempts, rc,
+                                  events, policy, ctx)
+
+
+def _drive_units(args, path: Path, events: list, policy: dict, ctx: dict,
+                 mem_limit_mb: int | None) -> dict:
+    """Stage-4's unit-granular loop (design/0001 R2-R4): per pending unit,
+    fresh agent contexts until the unit records a terminal status; a unit
+    that exhausts its retries is escalated (ESC-1 defer — Python fallback
+    stays live) and the backlog continues. A unit can never stop the run."""
+    max_unit_retries = int((policy.get("budget") or {})
+                           .get("max_agent_retries_per_unit", 3))
+    while True:
+        state = _load_state(path)
+        pending = [u["id"] for u in state.get("units", [])
+                   if u.get("status") == "pending"]
+        if not pending:
+            return state
+        uid, blocked = _next_eligible_unit(state.get("units", []))
+        if uid is None:  # every remaining pending unit is dep-blocked
+            events.append({"stage": 4, "event": "units-blocked",
+                           "pending": pending, "blocked": blocked})
+            return state  # the stage worker gets a turn at unblocking
+        state = _drive_unit(args, path, uid, events, policy, ctx,
+                            mem_limit_mb, max_unit_retries)
+
+
 def _enter_terminal_status(state: dict, path: Path, terminal: _Terminal,
                            events: list) -> dict:
     """Journal the terminal run_status; on an invalid resulting state keep
@@ -1585,8 +1760,77 @@ def _stage_worker_memory(args, policy: dict) -> dict:
     return decision
 
 
+def _derive_python_path(root: Path) -> str | None:
+    """--target boot (design/0001 R6): the importable package under the
+    project root — src-layout first, then a single top-level package.
+    None ⇒ ambiguous; the boot refuses (machine-readable) rather than ask."""
+    src = root / "src"
+    if src.is_dir():
+        pkgs = sorted(p.name for p in src.iterdir()
+                      if (p / "__init__.py").is_file())
+        if len(pkgs) == 1:
+            return f"src/{pkgs[0]}"
+    top = sorted(p.name for p in root.iterdir()
+                 if p.is_dir() and (p / "__init__.py").is_file()
+                 and p.name not in ("tests", "docs", "benches"))
+    if len(top) == 1:
+        return top[0]
+    return None
+
+
+def boot_target(target: str, runs_dir: str, policy: dict) -> Path:
+    """Resolve the state path for a ``--target`` project; init a fresh run
+    when absent (the shared boot of ``run`` and ``succession.py chain``).
+    Wiping runs/ between runs is the operator's normal reset — a wiped
+    tree simply means the next invocation boots fresh (design/0001)."""
+    root = Path(target).expanduser().resolve()
+    if not (root / "pyproject.toml").is_file() and \
+            not (root / "__init__.py").is_file():
+        raise ToolError(f"--target {root}: not a Python project root "
+                        f"(no pyproject.toml or package)", kind="usage")
+    python_path = _derive_python_path(root)
+    if python_path is None:
+        raise ToolError(f"--target {root}: could not derive the package "
+                        f"(need src/<pkg>/__init__.py or one top-level "
+                        f"package); pass an explicit state file instead",
+                        kind="usage")
+    path = Path(runs_dir) / root.name / "migration-state.json"
+    if path.exists():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    level = policy.get("default_level") or "L2"
+    state = {
+        "project": {"name": root.name, "python_path": python_path},
+        "stage": 0,
+        "units": [],
+        "human_gates": [],
+        "journal": [],
+        "budget_ledger": {"tokens_total": 0, "hours_human_total": 0.0,
+                          "regression_triage_hours": 0.0},
+        "autonomy": state_tool.autonomy_block(level),
+        "run_status": "pending",
+    }
+    state_tool.append_transitions(
+        state, [(None, "project", None, state["project"]),
+                (None, "stage", None, 0),
+                (None, "autonomy", None, state["autonomy"]),
+                (None, "run_status", None, "pending")], actor=TOOL)
+    state_tool.write_json_atomic(path, state)
+    return path
+
+
 def cmd_run(args) -> int:
     policy = load_policy(args.policy)
+    if args.state is None and args.target is None:
+        return _emit_refusal(
+            "nothing to drive: pass a state file, or --target <python "
+            "project> to boot a fresh run (design/0001)", args.human)
+    if args.state is None:
+        try:
+            path = boot_target(args.target, args.runs_dir, policy)
+        except ToolError as e:
+            return _emit_refusal(e.detail, args.human)
+        args.state = str(path)
     path = Path(args.state)
     state = _load_state(path)
     if args.autonomy:
@@ -1600,7 +1844,7 @@ def cmd_run(args) -> int:
     if level not in state_tool.DRIVER_LEVELS:
         return _emit_refusal(
             f"autonomy={level}: the deterministic driver runs L2+ only. At "
-            f"L0/L1 the agent-driven recipe never asks either — it leaves the "
+            f"L0/L1 the agent-driven mode never asks either — it leaves the "
             f"gate open and ends the run with the dossier for the operator "
             f"(decided between runs). Pre-authorize autonomy BEFORE the run: "
             f"--autonomy L2|L3 here, or state.py init --autonomy-level "
@@ -1659,7 +1903,15 @@ def cmd_run(args) -> int:
             if stage > LAST_STAGE:
                 raise _Terminal("complete", f"stage {stage} beyond {LAST_STAGE}")
 
-            # 1. stage worker (any CLI agent), verified, with bounded retries
+            # 1. stage worker (any CLI agent), verified, with bounded retries.
+            #    Stage 4 is unit-granular first (design/0001): the driver
+            #    cycles fresh agent contexts per pending unit — a context
+            #    exhaustion retries the chunk, an exhausted unit escalates
+            #    (ESC-1 defer) — before the stage worker's wrap-up pass.
+            if stage == 4 and not args.dry_run:
+                state = _drive_units(args, path, events, policy, ctx,
+                                     mem_limit_mb=memory_policy["limits"]
+                                     ["gate_child_mb"])
             state, open_changes = _execute_stage(
                 args, path, stage, events, max_retries,
                 mem_limit_mb=memory_policy["limits"]["gate_child_mb"])
@@ -1712,11 +1964,10 @@ def cmd_run(args) -> int:
              + (f" — {terminal.reason}" if terminal is not None else
                 f" (--once: resume with another pipeline.py run)")
              + f"; report: {rp}"
-             + ("; the run-level budget is spent: session-level exhaustion "
-                "never appears as a run result (tools/succession.py chains "
-                "GLV successor sessions automatically and bootstraps GLV "
-                "itself, issues #25/#47); raising autonomy.budget is an "
-                "operator decision between runs, never a mid-run ask"
+             + ("; the run-level budget is spent (design/0001: with "
+                "unit-chunk context recycling, this ceiling is the only "
+                "thing that can stop a healthy run); raising autonomy.budget "
+                "is an operator decision between runs, never a mid-run ask"
                 if run_status == "budget_exhausted" else ""))
     emit({"tool": TOOL, "version": VERSION, "file": str(path),
           "run_status": run_status, "stage": state.get("stage"),
@@ -1865,11 +2116,24 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_preflight)
 
     p = sub.add_parser("run", help="drive stages 0->7 to a terminal state (L2+)")
-    p.add_argument("state")
+    p.add_argument("state", nargs="?",
+                   help="state file to drive; omit when --target boots a "
+                        "fresh run (design/0001)")
+    p.add_argument("--target",
+                   help="path to the Python project under migration — the "
+                        "single-command entrypoint: boots runs/<name>/"
+                        "migration-state.json (state.py init equivalent, "
+                        "L2 by default) when absent, then drives it to a "
+                        "terminal state")
+    p.add_argument("--runs-dir", default="runs",
+                   help="directory for --target-booted state files "
+                        "(default: runs/ under the working directory)")
     p.add_argument("--agent-cmd",
-                   help="CLI agent invoked per stage; placeholders {stage} {state} "
-                        "{stage_file} {framework}, e.g. "
-                        "'goose run --recipe {framework}/recipe.yaml'")
+                   help="CLI agent invoked per chunk; placeholders {stage} "
+                        "{state} {stage_file} {framework} {unit} "
+                        "{brief_file} — any CLI agent fits (goose, Claude "
+                        "Code, Codex, ...); the agent reads the brief and "
+                        "records through tools/state.py")
     p.add_argument("--autonomy", choices=sorted(state_tool.POLICY_LEVELS),
                    help="set the pre-authorized level before starting (journaled)")
     p.add_argument("--policy", help="override autonomy/policy.json")

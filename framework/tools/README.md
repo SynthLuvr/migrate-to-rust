@@ -167,7 +167,7 @@ loop:
 - **Autonomy levels** (`--autonomy L0..L3`, pre-authorized before the run):
   L2 (the default for new runs) resolves every gate by policy, publish
   disabled; L3 adds cutover/publish. L0/L1 stay with the agent-driven
-  recipe, which never asks either: the gate stays open, the run ends with
+  mode, which never asks either: the gate stays open, the run ends with
   the dossier, and the operator decides between runs (the driver refuses
   these levels). Zero mid-run questions at any level.
 - **Terminal-state discipline**: a run always ends in `complete` /
@@ -200,60 +200,97 @@ loop:
   explicit warning (the offline corner); the target root is recorded, so
   re-runs need no flag.
 
-## The session-chain harness — `succession.py` (issue #25)
+## The session-succession tool — `succession.py` (issue #25, design/0001 amendment 2)
 
-Also a composition layer, not a ninth gap-tool: it wraps a whole run in a
-**chain of GLV orchestrator sessions** so that `budget_exhausted` at the
-*session* level (the orchestrator's context window — the motivating run
-died at stage 4/7 with ~600k of 5M run tokens spent, and a human had to
-notice and restart by hand) becomes a scheduling event in code instead of
-"awaiting input":
+Also a composition layer, not a ninth gap-tool: it makes `budget_exhausted`
+at the *session* level (the orchestrator's context window — the motivating
+run died at stage 4/7 with ~600k of 5M run tokens spent, and a human had
+to notice and restart by hand) a scheduling event in code instead of
+"awaiting input". **`handoff` is the primary mechanism (amendment 2): the
+live orchestrator session calls it itself at ~half its context window** —
+one shot, no monitor process parks anywhere:
 
 ```console
-python framework/tools/succession.py chain \
-  --state runs/<project>/migration-state.json \
-  --prompt-file runs/<project>/first-prompt.md
+# the session's own move at half context (after recording through state.py):
+python framework/tools/succession.py handoff \
+  runs/<project>/migration-state.json --self
+# a session that died without handing off — same one command, takeover:
+python framework/tools/succession.py handoff \
+  runs/<project>/migration-state.json --adopt
 ```
 
-The harness bootstraps GLV itself as its first act (issue #47): it
+It classifies the chain guardrails from the state file (genuine terminals,
+run-level ceilings, monotonic progress, depth cap), runs **resume hygiene**
+(every unit's recorded paths verified against the target root; a mismatch
+with exactly one candidate on disk is repaired through `state.py`,
+journaled — the `crates/<crate>/src/u.rs` vs `src/u.rs` trap of run
+20261028_4), composes the successor's full resume brief (state file path,
+position, escalation dossier, journal tail, run-budget remaining, chain
+history, hygiene findings), spawns the successor (`run-<project>-s<n>`)
+over the GLV API, journals a **stop-notice** (operator informed, not
+involved), resets `run_status` to `running`, and exits — the caller stops
+itself. A handoff on a run with no chain record **adopts session 1** (the
+operator started it directly); `--self` settles the caller's own entry
+with no liveness check; a second party's handoff on an unsettled session
+checks `GET /api/sessions/:id?fields=meta` first and **refuses while it
+is genuinely live** — two live orchestrators would clobber the
+single-writer state file — while `--adopt` stops it and takes the run
+over. A finished run is never handed off (the final session's settle
+bookkeeping is recorded, then "nothing to hand off"). Guardrails: a
+**depth cap** (`budget.max_chain_depth`, policy default 10) and a
+**monotonic-progress guard** (each successor must advance the stage or
+decide ≥1 unit vs. the snapshot taken at its spawn); either violated →
+`failed_safely` with the dossier — never an infinite resume loop. The
+**run-level ceilings bind the whole chain**: token spend sums through the
+single state file, wall clock sums over sessions — successors get a
+fresh session budget, never a fresh run budget. Only genuine terminals
+(`complete` / `no_go_measured` / `failed_safely`) — or the run-level
+ceilings themselves, the one honest `budget_exhausted` — end the chain.
+
+The transport bootstraps GLV itself as its first act (issue #47): it
 probes `GET /api/openapi.json`, starts `glv serve` in the background
 when nothing answers, mints one token per chain session
 (`glv token create --name run-<project>-s<n>` — `glv token list` is
 the audit trail), and exports `GLV_BASE_URL`/`GLV_API_TOKEN` itself.
-A sudden run of 401s re-mints without stopping; a mid-chain connection
-loss revives the server and retries; only a transport that cannot be
-revived ends the chain — `failed_safely` with a journaled stop-notice
+A sudden run of 401s re-mints without stopping; a connection loss
+revives the server and retries; only a transport that cannot be
+revived ends the run — `failed_safely` with a journaled stop-notice
 (a genuine terminal with the dossier, never a park).
 
-Per session it: starts the GLV session with the brief (session 1 rides the
-operator's single prompt; successors get a composed resume brief — state
-file path, position, escalation dossier, journal tail, run-budget
-remaining, chain history, hygiene findings), parks on
-`GET /api/sessions/:id/wait` until it settles, and classifies from the
+**`chain` is the optional external watchdog** for operators who want the
+same rule enforced from outside (unattended belt-and-braces — or the
+`--target` boot one-liner). It wraps the whole run in a chain of GLV
+orchestrator sessions:
+
+```console
+# one prompt, start to finish (design/0001): your prompt, verbatim,
+# drives session 1; --target boots the fresh run
+python framework/tools/succession.py chain \
+  --target /absolute/path/to/myproject \
+  --prompt-file my-prompt.md
+# existing state file? pass it instead of --target
+python framework/tools/succession.py chain \
+  runs/<project>/migration-state.json \
+  --prompt-file my-prompt.md
+```
+
+The prompt is yours: session 1 receives it byte for byte — no header, no
+briefing, no default (design/0001 R7). A fresh chain without
+`--prompt-file` refuses rather than invent one; the protocol authors only
+the mechanics (the `--target` state boot, and each successor's resume
+brief, composed from the state file because no human is around to write
+it). Per session it: starts the GLV session with the brief, parks on
+`GET /api/sessions/:id/wait` until it settles, classifies from the
 state file (sessions write it only through `state.py`; GLV only carries
-the sessions). On session-level exhaustion — `run_status=budget_exhausted`
-under the run-level ceilings, or a session that settled without recording
-a terminal state — it runs **resume hygiene** (every unit's recorded
-paths verified against the target root; a mismatch with exactly one
-candidate on disk is repaired through `state.py`, journaled — the
-`crates/<crate>/src/u.rs` vs `src/u.rs` trap of run 20261028_4), spawns
-the successor (`run-<project>-s<n>`), stops the predecessor if still
-live, journals a **stop-notice** (operator informed, not involved), and
-resets `run_status` to `running`. Guardrails: a **depth cap**
-(`budget.max_chain_depth`, policy default 10) and a **monotonic-progress
-guard** (each successor must advance the stage or decide ≥1 unit vs. the
-snapshot taken at its spawn); either violated → `failed_safely` with the
-dossier — never an infinite resume loop. The **run-level ceilings bind
-the whole chain**: token spend sums through the single state file, wall
-clock sums over sessions — successors get a fresh session budget, never a
-fresh run budget. Only genuine terminals (`complete` / `no_go_measured` /
-`failed_safely`) — or the run-level ceilings themselves, the one honest
-`budget_exhausted` — end the chain. Restartable
-anywhere: a re-invocation adopts a recorded-but-unsettled session,
-re-bootstrapping the transport on the way.
-`succession.py hygiene` runs the resume-path check standalone (exit 2
-while unresolved); `succession.py brief` prints the next session's brief
-without side effects.
+the sessions), and on session-level exhaustion spawns the successor with
+the same guardrails and stop-notice discipline as `handoff`.
+Restartable anywhere: a re-invocation adopts a recorded-but-unsettled
+session, re-bootstrapping the transport on the way.
+
+Both commands share the auxiliary surface: `succession.py hygiene` runs
+the resume-path check standalone (exit 2 while unresolved);
+`succession.py brief` prints the next session's brief without side
+effects.
 
 ## The stage-4 candidate runner — `delegate.py` (issue #33)
 
@@ -495,8 +532,19 @@ python framework/tools/state.py validate|journal|show|migrate state.json
 # oracle self-test 5/5, rust-template HEAD SHA, toolchain, target
 # venv/PYO3_PYTHON, substitutions freshness -> one journaled block + report
 python framework/tools/pipeline.py preflight state.json --target-root /abs/target
+# one-prompt entrypoint (design/0001 criteria 1-2): your prompt verbatim
+# drives session 1; --target boots the run; a session whose context gives
+# out is succeeded automatically over the GLV API
+python framework/tools/succession.py chain --target /abs/target \
+  --prompt-file my-prompt.md
+# single-process driver variant (design/0001): boots the state from
+# --target when absent, then drives start to finish — day-scale budgets,
+# unit-chunk contexts, any CLI agent behind --agent-cmd, no GLV
+python framework/tools/pipeline.py run --target /abs/target \
+  --agent-cmd '<any CLI agent> {stage} {state} {stage_file} {framework} {unit} {brief_file}' \
+  --autonomy L2
 python framework/tools/pipeline.py run state.json \
-  --agent-cmd 'goose run --recipe {framework}/recipe.yaml' --autonomy L2
+  --agent-cmd '<any CLI agent> {stage} {state} {stage_file} {framework} {unit} {brief_file}' --autonomy L2
 python framework/tools/pipeline.py resolve-gates state.json   # policy only, no agent
 python framework/tools/pipeline.py status|report state.json
 

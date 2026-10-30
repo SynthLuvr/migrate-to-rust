@@ -42,6 +42,7 @@ class FakeGlv:
         self.started = []            # [{id, name, prompt, working_dir}]
         self.stopped = []
         self.waits = []
+        self.statuses = {}           # session_id → GLV status (liveness)
 
     def start_session(self, *, name, prompt, working_dir=None, model=None):
         self.started.append({"id": f"sess_fake_s{len(self.started) + 1}",
@@ -61,6 +62,13 @@ class FakeGlv:
     def stop(self, session_id):
         self.stopped.append(session_id)
         return {"status": "stopped"}
+
+    def session_status(self, session_id, **_):
+        """Meta-only liveness read (GET /api/sessions/:id?fields=meta);
+        scripted per id via .statuses (default: settled/completed)."""
+        return {"session": {"id": session_id,
+                            "status": self.statuses.get(session_id,
+                                                        "completed")}}
 
 
 def _wire_fake(monkeypatch, fake):
@@ -154,6 +162,27 @@ def _session_exhausts(**kwargs):
 def _session_completes(**kwargs):
     kwargs.setdefault("stage", 7)
     return _session_run("complete", **kwargs)
+
+
+def _session_boots_and_exhausts():
+    """Session 1 of a --target-booted run: real stage 0->4 work (go
+    decision, unit plan, stage advance) journaled through state.py,
+    then self-reports budget_exhausted — the chain must succeed it."""
+    def mutate(state):
+        changes = []
+        old_count = len(state.get("units") or [])
+        state["units"] = [_unit("u1"), _unit("u2")]
+        changes.append(_set("units", None, f"<list:{old_count} items>",
+                            "<list:2 items>"))
+        state.setdefault("go_no_go", {})["decision"] = "go"
+        changes.append(_set("go_no_go.decision", None, None, "go"))
+        changes.append(_set("stage", None, state.get("stage"), 4))
+        state["stage"] = 4
+        changes.append(_set("run_status", None, state.get("run_status"),
+                            "budget_exhausted"))
+        state["run_status"] = "budget_exhausted"
+        return changes
+    return mutate
 
 
 def _session_noop_exhausts():
@@ -302,11 +331,10 @@ def test_chain_reaches_complete_from_one_prompt_with_mid_run_succession(
         ["run-demo-s1", "run-demo-s2"]
     assert all(s["working_dir"] == str(target) for s in fake.started)
 
-    # session 1 rode the operator's single prompt + chain context
+    # session 1 rode the operator's prompt VERBATIM — the protocol never
+    # authors the task prompt (design/0001 R7): no header, no briefing
     first = fake.started[0]["prompt"]
-    assert "Migrate demo per the framework prompt" in first
-    assert str(p) in first and "successor session" in first.lower()
-    assert "GLV bootstrap" in first        # issue #47: bootstrap first act
+    assert first == prompt.read_text(encoding="utf-8")
 
     # the successor's brief is the full resume context (issue #25 list)
     brief = fake.started[1]["prompt"]
@@ -415,6 +443,272 @@ def test_chain_monotonic_progress_guard_kills_resume_loops(
     assert code == 2 and out["run_status"] == "failed_safely"
     assert len(fake.started) == 2  # no third session without progress
     assert "no observable state" in out["summary"]["human"]
+
+
+# --------------------------------- session-driven handoff (amendment 2) ----
+
+def _live_work(p, *, stage=None, ledger=None, unit_status=None,
+               final_status="budget_exhausted"):
+    """The live session's work between two handoffs, journaled through
+    state.py exactly like the scripted chain sessions."""
+    mutate = _session_run(final_status, stage=stage, ledger=ledger,
+                          unit_status=unit_status)
+    state = json.loads(Path(p).read_text())
+    changes = mutate(state) or []
+    state_tool.save_validated(state, Path(p), actor="live-orchestrator",
+                              changes=changes)
+
+
+def test_handoff_spawns_the_successor_from_the_operators_session(
+        monkeypatch, capsys, tmp_path):
+    """Amendment 2 acceptance: session 1 was started by the OPERATOR (GLV
+    UI, glv CLI, any agent) — no harness, no chain record. At half context
+    the session records its work and calls handoff ITSELF: s1 is adopted,
+    the guardrails classify, the successor spawns over the GLV API with
+    the full resume brief, the stop-notice journals, run_status resets —
+    and the command EXITS. Nothing waits on the successor: no monitor."""
+    target = tmp_path / "target"
+    (target / "src" / "demo").mkdir(parents=True)
+    (target / "src" / "demo" / "__init__.py").write_text("")
+    (target / "src" / "demo" / "u1.py").write_text("x = 1\n")
+    p = _midrun_state(tmp_path, run_status="running", stage=4,
+                      extra={"preflight": {"ok": True,
+                                           "target": {"root": str(target)}}})
+    _live_work(p, ledger=600_000, unit_status={"u1": "ported"})
+
+    fake = FakeGlv(p, [])
+    _wire_fake(monkeypatch, fake)
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["handoff", str(p), "--self",
+                          "--session-id", "sess_operator_s1",
+                          "--working-dir", str(target)])
+    assert code == 0, out
+    assert out["handed_off"] is True
+    assert out["successor"]["name"] == "run-demo-s2"
+
+    # the successor was STARTED — and nothing waits on it: the monitor is
+    # gone; the successor runs on its own
+    assert [s["name"] for s in fake.started] == ["run-demo-s2"]
+    assert all(s["working_dir"] == str(target) for s in fake.started)
+    assert fake.waits == []
+
+    # the successor's brief is the full resume context
+    brief = fake.started[0]["prompt"]
+    assert "Successor session 2" in brief
+    assert str(p) in brief                      # state file path
+    assert "Escalation dossier" in brief
+    assert "GLV bootstrap" in brief             # re-bootstrap from cold start
+    assert "never asks a human" in brief
+
+    # s1 adopted as the operator-started session, settled at the handoff
+    st = _load(p)
+    sessions = st["session_chain"]["sessions"]
+    assert [s["name"] for s in sessions] == ["run-demo-s1", "run-demo-s2"]
+    assert sessions[0]["id"] == "sess_operator_s1"
+    assert sessions[0]["settled_at"]
+    assert sessions[0]["succession_reason"] is None
+    assert sessions[1]["succession_reason"]     # the spawn has a reason
+
+    # stop-notice journaled (operator informed, not involved); run_status
+    # reset to running so the successor records into the same run
+    assert len(st["session_chain"]["notices"]) == 1
+    assert "stop-notice" in st["session_chain"]["notices"][0]
+    assert st["run_status"] == "running"
+    assert any(e["event"] == "session-adopted" for e in out["events"])
+    assert any(e["event"] == "succession" for e in out["events"])
+    # the finished state stays schema-coherent
+    code, out = run_tool(monkeypatch, capsys, "state.py", ["validate", str(p)])
+    assert code == 0, out["invariant_errors"]
+
+
+def test_session_driven_run_reaches_complete_without_a_monitor(
+        monkeypatch, capsys, tmp_path):
+    """The full session-driven loop: the operator's session hands off at
+    half context, the successor works and hands off in turn (a self-
+    handoff — its entry is unsettled because nothing parks to settle it),
+    the final session records `complete`, and its handoff call reports
+    'nothing to hand off'. Three invocations, zero parked processes."""
+    p = _midrun_state(tmp_path, run_status="running", stage=4)
+    fake = FakeGlv(p, [])
+    _wire_fake(monkeypatch, fake)
+
+    # s1 (the operator's) works, then hands off
+    _live_work(p, stage=4, ledger=600_000, unit_status={"u1": "ported"})
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["handoff", str(p), "--self"])
+    assert code == 0 and out["handed_off"] is True, out
+    s2 = fake.started[0]["id"]
+
+    # s2 works, then hands ITSELF off by its GLV id: settle + classify +
+    # spawn, no liveness call, no stop
+    _live_work(p, stage=5, ledger=900_000, unit_status={"u2": "ported"})
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["handoff", str(p), "--self", "--session-id", s2])
+    assert code == 0 and out["handed_off"] is True, out
+    s3 = fake.started[1]["id"]
+    st = _load(p)
+    assert st["session_chain"]["sessions"][1]["id"] == s2
+    assert "glv_status" not in st["session_chain"]["sessions"][1]
+    assert st["session_chain"]["sessions"][1]["outcome"] == \
+        "budget_exhausted"
+
+    # s3 finishes the run — complete recorded through state.py — and its
+    # handoff call settles the final bookkeeping without spawning
+    _live_work(p, stage=7, ledger=1_200_000,
+               unit_status={"u3": "fallback_python"}, final_status="complete")
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["handoff", str(p), "--self", "--session-id", s3])
+    assert code == 0 and out["handed_off"] is False, out
+    assert "nothing to hand off" in out["summary"]["human"]
+
+    st = _load(p)
+    assert st["run_status"] == "complete"
+    sessions = st["session_chain"]["sessions"]
+    assert [s["name"] for s in sessions] == \
+        ["run-demo-s1", "run-demo-s2", "run-demo-s3"]
+    assert [s["outcome"] for s in sessions] == \
+        ["budget_exhausted", "budget_exhausted", "complete"]
+    assert len(st["session_chain"]["notices"]) == 2      # two successions
+    assert fake.waits == []                    # never a parked process
+    statuses = [(e["to"], e.get("actor")) for e in st["journal"]
+                if e["field"] == "run_status"]
+    assert statuses == [("budget_exhausted", "live-orchestrator"),
+                        ("running", "succession.py"),       # succession 1
+                        ("budget_exhausted", "live-orchestrator"),
+                        ("running", "succession.py"),       # succession 2
+                        ("complete", "live-orchestrator")]
+    code, out = run_tool(monkeypatch, capsys, "state.py", ["validate", str(p)])
+    assert code == 0, out["invariant_errors"]
+
+
+def test_handoff_enforces_the_run_level_ceiling(monkeypatch, capsys,
+                                                tmp_path):
+    """The guardrails bind the session-driven chain too: at the run-level
+    token ceiling the handoff refuses to spawn and budget_exhausted is the
+    honest terminal (exit 0 — a result, not a failure)."""
+    p = _midrun_state(tmp_path, run_status="running",
+                      budget={"max_tokens": 5000,
+                              "max_wall_clock_minutes": 720,
+                              "max_chain_depth": 10})
+    _live_work(p, ledger=6000, unit_status={"u1": "ported"})
+    fake = FakeGlv(p, [])
+    _wire_fake(monkeypatch, fake)
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["handoff", str(p), "--self"])
+    assert code == 0 and out["handed_off"] is False, out
+    assert out["classification"]["kind"] == "run_level_exhausted"
+    assert fake.started == []                  # no successor spawns
+    assert _load(p)["run_status"] == "budget_exhausted"
+
+
+def test_handoff_respects_the_depth_cap(monkeypatch, capsys, tmp_path):
+    p = _midrun_state(tmp_path, run_status="budget_exhausted",
+                      budget={"max_tokens": 5_000_000,
+                              "max_wall_clock_minutes": 720,
+                              "max_chain_depth": 1},
+                      extra={"session_chain": {
+                          "depth": 0, "max_depth": 1,
+                          "wall_clock_minutes": 3.0,
+                          "sessions": [{"index": 1, "id": "sess_fake_s1",
+                                        "name": "run-demo-s1",
+                                        "settled_at": "2026-10-29T13:00:00Z",
+                                        "outcome": "budget_exhausted",
+                                        "progress_snapshot": {
+                                            "stage": 4,
+                                            "unit_status": {"pending": 3},
+                                            "tokens_spent": 0}}]}})
+    _live_work(p, unit_status={"u1": "ported"})
+    fake = FakeGlv(p, [])
+    _wire_fake(monkeypatch, fake)
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["handoff", str(p), "--self"])
+    assert code == 2 and out["handed_off"] is False, out
+    assert out["classification"]["kind"] == "depth_cap"
+    assert fake.started == []
+    assert _load(p)["run_status"] == "failed_safely"
+
+
+def test_handoff_refuses_a_live_session_then_adopt_rescues(
+        monkeypatch, capsys, tmp_path):
+    """A run whose last session died WITHOUT handing off (the harness that
+    spawned it is gone too): a second party's handoff is REFUSED while GLV
+    still shows the session live — two live orchestrators would clobber
+    the single-writer state file. --adopt is the takeover: stop it, settle
+    it, spawn the successor from the state file. Zero lost work either
+    way; glv itself never respawns anything."""
+    p = _midrun_state(tmp_path, run_status="running",
+                      budget={"max_tokens": 5_000_000,
+                              "max_wall_clock_minutes": 10080,
+                              "max_chain_depth": 10},
+                      extra={"session_chain": {
+                          "depth": 1, "max_depth": 10,
+                          "wall_clock_minutes": 180.0,
+                          "sessions": [
+                              {"index": 1, "id": "sess_fake_s1",
+                               "name": "run-demo-s1",
+                               "started_at": "2026-10-29T10:00:00Z",
+                               "settled_at": "2026-10-29T13:00:00Z",
+                               "outcome": "budget_exhausted",
+                               "progress_snapshot": {
+                                   "stage": 4,
+                                   "unit_status": {"pending": 3},
+                                   "tokens_spent": 0}},
+                              {"index": 2, "id": "sess_fake_s2",
+                               "name": "run-demo-s2",
+                               "started_at": "2026-10-29T13:05:00Z"}]}})
+    _live_work(p, stage=5, unit_status={"u1": "ported"})
+    fake = FakeGlv(p, [])
+    fake.statuses = {"sess_fake_s2": "running"}
+    _wire_fake(monkeypatch, fake)
+
+    # refused while live: no spawn, state untouched
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["handoff", str(p)])
+    assert code == 2 and out["handed_off"] is False, out
+    assert "still live" in out["summary"]["human"]
+    assert "--self" in out["summary"]["human"]
+    assert fake.started == [] and fake.stopped == []
+    st = _load(p)
+    assert st["session_chain"]["sessions"][1].get("settled_at") is None
+
+    # --adopt: stop the live session, settle it, spawn the successor
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["handoff", str(p), "--adopt"])
+    assert code == 0 and out["handed_off"] is True, out
+    assert fake.stopped == ["sess_fake_s2"]
+    st = _load(p)
+    assert st["session_chain"]["sessions"][1]["glv_status"] == "stopped"
+    assert st["session_chain"]["sessions"][2]["name"] == "run-demo-s3"
+
+
+def test_handoff_refuses_when_liveness_is_unknown(monkeypatch, capsys,
+                                                  tmp_path):
+    """The GLV read itself fails (server down, 401 storm): the handoff
+    refuses rather than guess — spawning blind could duplicate a live
+    orchestrator. The refusal names the escape hatches."""
+    p = _midrun_state(tmp_path, run_status="running",
+                      extra={"session_chain": {
+                          "depth": 0, "max_depth": 10,
+                          "sessions": [{"index": 1, "id": "sess_fake_s1",
+                                        "name": "run-demo-s1",
+                                        "started_at": "2026-10-29T10:00:00Z"}
+                                       ]}})
+    fake = FakeGlv(p, [])
+
+    def dead_status(self, session_id, **_):
+        raise succession_tool.GlvUnreachableError("no answer from the server")
+
+    monkeypatch.setattr(succession_tool, "GlvClient",
+                        lambda url, token: fake)
+    monkeypatch.setattr(FakeGlv, "session_status", dead_status)
+    monkeypatch.setenv("GLV_BASE_URL", "http://glv.test")
+    monkeypatch.setenv("GLV_API_TOKEN", "glv_at_test")
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["handoff", str(p)])
+    assert code == 2 and out["handed_off"] is False, out
+    assert "could not determine" in out["summary"]["human"]
+    assert fake.started == []
+    assert _load(p)["session_chain"]["sessions"][0].get("settled_at") is None
 
 
 # ---------------------------------------------- GLV self-bootstrap (#47) ----
@@ -931,8 +1225,10 @@ def test_chained_resume_does_not_warn_but_plain_resume_still_does(
 def test_pipeline_budget_exhausted_points_at_the_chain(monkeypatch, capsys,
                                                        tmp_path):
     """pipeline.py's own budget_exhausted exit is the RUN-level bound; its
-    summary says the session-level case chains automatically and never
-    presents a human resume path as the expected outcome (issue #47)."""
+    summary names it as the only thing that can stop a healthy run (ADR
+    design/0001 — contexts are recycled per unit chunk, so a ceiling stop
+    is a budget decision, never a resume path) and never presents a human
+    resume as the expected outcome (issue #47)."""
     p = _midrun_state(tmp_path, run_status="pending",
                       budget={"max_tokens": 5000,
                               "max_wall_clock_minutes": 720,
@@ -943,8 +1239,8 @@ def test_pipeline_budget_exhausted_points_at_the_chain(monkeypatch, capsys,
     code, out = run_tool(monkeypatch, capsys, "pipeline.py",
                          ["run", str(p), "--dry-run"])
     assert code == 0 and out["run_status"] == "budget_exhausted"
-    assert "succession.py" in out["summary"]["human"]
-    assert "session-level" in out["summary"]["human"]
+    assert "run-level budget is spent" in out["summary"]["human"]
+    assert "design/0001" in out["summary"]["human"]
     assert "manual" not in out["summary"]["human"]
 
 
@@ -989,3 +1285,63 @@ def test_no_degraded_mode_or_fallback_wording_remains():
         text = path.read_text(encoding="utf-8").lower()
         for phrase in banned:
             assert phrase not in text, f"{phrase!r} still in {path}"
+
+
+# ------------------------- design/0001: one user-driven prompt, fresh boot
+
+def test_chain_boots_from_target_and_completes_from_one_prompt(
+        monkeypatch, capsys, tmp_path):
+    """design/0001 criterion 1: ONE user-authored prompt, no state file —
+    `chain --target` boots the run (autonomy L2, package derived) and the
+    chain of GLV sessions drives it to `complete` with no human anywhere.
+    Session 1 receives the operator's prompt VERBATIM (R7)."""
+    proj = tmp_path / "widgetpro"
+    (proj / "src" / "widgetpro").mkdir(parents=True)
+    (proj / "src" / "widgetpro" / "__init__.py").write_text("")
+    (proj / "pyproject.toml").write_text('[project]\nname = "widgetpro"\n')
+    prompt = tmp_path / "my-prompt.md"
+    prompt_text = ("Migrate widgetpro per the framework prompt "
+                   "(checkout: this repo). One prompt; finish unattended.\n")
+    prompt.write_text(prompt_text)
+    state_path = tmp_path / "runs" / "widgetpro" / "migration-state.json"
+    fake = FakeGlv(state_path, [
+        _session_boots_and_exhausts(),
+        _session_completes(unit_status={"u1": "ported", "u2": "ported"},
+                           parity_for=("u1", "u2")),
+    ])
+    _wire_fake(monkeypatch, fake)
+
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["chain", "--target", str(proj),
+                          "--runs-dir", str(tmp_path / "runs"),
+                          "--prompt-file", str(prompt)])
+    assert code == 0, out
+    assert out["run_status"] == "complete"
+    st = _load(state_path)
+    assert st["project"] == {"name": "widgetpro",
+                             "python_path": "src/widgetpro"}
+    assert st["autonomy"]["level"] == "L2"
+    assert [s["name"] for s in fake.started] == \
+        ["run-widgetpro-s1", "run-widgetpro-s2"]
+    # the prompt is the user's, byte for byte — nothing prepended
+    assert fake.started[0]["prompt"] == prompt_text
+    # working_dir is the target project, not the runs dir
+    assert fake.started[0]["working_dir"] == str(proj)
+
+
+def test_chain_without_the_users_prompt_refuses(monkeypatch, capsys,
+                                                tmp_path):
+    """R7: a fresh chain cannot start without the operator's prompt —
+    the protocol refuses rather than invent one."""
+    p = _midrun_state(tmp_path)
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["chain", str(p)])
+    assert code == 2
+    assert "--prompt-file" in out["error"]
+    assert "yours to write" in out["error"]
+
+
+def test_chain_without_state_or_target_refuses(monkeypatch, capsys):
+    code, out = run_tool(monkeypatch, capsys, "succession.py", ["chain"])
+    assert code == 2
+    assert "--target" in out["error"]

@@ -10,35 +10,69 @@ All relative paths in these artifacts — `stages/<n>-*.md`, `roles/*.md`,
 `state/migration-state.schema.json` — live in **this framework checkout**,
 not in the repo being migrated.
 
-1. **goose (recommended)** — `goose run --recipe framework/recipe.yaml`
-   The recipe is the orchestrator; it enforces stage order, gate resolution
-   per the pre-authorized autonomy level, and
-   the state file. Adjust `settings:` to your provider/model. Run it from
-   the **root of this `migrate-to-rust` checkout** — the recipe references
-   `framework/...`, `SUMMARY.md`, `TOOLCHAIN.md`, and `research/...`
-   relative to that root — and point at a target project elsewhere on disk
-   via the recipe's `TARGET_PYTHON_PROJECT` parameter (absolute path), not
-   by `cd`-ing into the target repo.
-   **Unattended runs (autonomy L2/L3, issue #22)** — put the deterministic
-   driver in charge instead; it owns the loop and shells out to any CLI
-   agent (goose included) as the per-stage worker, resolving every gate by
-   [`autonomy/policy.json`](autonomy/policy.json) in code:
+1. **One prompt (recommended, design/0001)** — write ONE prompt and start
+   ONE agent session with it (GLV UI, `glv` CLI — or the
+   `succession.py chain` one-liner below). The framework runs the
+   migration start to finish, unattended, for as many days as it takes.
+   The orchestrator runs as a series of GLV sessions: session 1 receives
+   **your prompt verbatim** (the protocol never authors the task
+   prompt), and at ~half its context window each session hands itself
+   off — `succession.py handoff` enforces the chain guardrails, composes
+   the successor's full resume brief from the state file, spawns it
+   over the GLV API, and exits; no monitor process parks anywhere. A
+   session that dies without handing off is recovered by the same one
+   command (`--adopt`). The tool bootstraps GLV itself (`glv serve` +
+   one named token per session, no human provisioning). To boot GLV +
+   state + session 1 in one line, run from the **root of this
+   `migrate-to-rust` checkout**, pointing `--target` at the project
+   elsewhere on disk (absolute path):
+
+   ```console
+   python framework/tools/succession.py chain \
+     --target /absolute/path/to/myproject \
+     --prompt-file my-prompt.md
+   ```
+
+   `--target` boots a fresh run when no state file exists
+   (`runs/<name>/migration-state.json`, autonomy L2 — gates resolve by
+   policy in code, publish disabled; never a mid-run question). A fresh
+   chain without `--prompt-file` refuses: the prompt is yours to write.
+   (Leave `chain` running and it doubles as the optional watchdog that
+   spawns successors itself; stop it and the sessions still hand
+   themselves off.)
+
+2. **The driver (the same guarantee in one process)** — one command,
+   start to finish, no human interaction, day-scale runs. The driver
+   process owns the stage machine, gates, and budgets; it recycles an
+   agent context per chunk (per unit at Stage 4), so no LLM context
+   window bounds the run — only the policy budget does, and no GLV is
+   involved. Any CLI agent works behind `--agent-cmd` (goose, Claude
+   Code, Codex, ...):
+
+   ```console
+   python framework/tools/pipeline.py run \
+     --target /absolute/path/to/myproject \
+     --agent-cmd '<any CLI agent> {brief_file}'
+   ```
+
+   `--target` boots a fresh run when no state file exists (`runs/<name>/
+   migration-state.json`, `state.py`-equivalent init, autonomy L2 by
+   default — a state file without an autonomy block reads as the
+   supervised L0, issue #27); an existing state file is driven in place.
+   Wiping `runs/` between runs is the normal reset — the next invocation
+   boots fresh. Stage-by-stage, the same thing spelled out:
 
    ```console
    python framework/tools/state.py init framework/state/migration-state.json \
      --name myproject --python-path src/myproject --autonomy-level L2
-   # --autonomy-level defaults to L2 — shown for clarity. A state file
-   # without an autonomy block (e.g. hand-written from the schema alone)
-   # reads as the supervised L0 (issue #27), so init with state.py.
    python framework/tools/pipeline.py run framework/state/migration-state.json \
-     --agent-cmd 'goose run --recipe {framework}/recipe.yaml'
+     --agent-cmd '<any CLI agent> {stage} {state} {stage_file} {framework}'
    ```
 
    **Memory containment for unattended runs (issue #74)** — bound the
    whole run independently of the session server with the shipped user
-   slice, so a ballooning run dies alone (attributable scope unit) and
-   session exhaustion flows through the successor chain instead of a
-   service crash-restart loop (the failure mode behind #73):
+   slice, so a ballooning run dies alone (attributable scope unit) instead
+   of taking the machine down (the failure mode behind #73):
 
    ```console
    mkdir -p ~/.config/systemd/user
@@ -47,8 +81,9 @@ not in the repo being migrated.
    systemd-run --user --slice=migration.slice --scope \
      -p MemoryHigh=6G -p MemoryMax=8G -p MemorySwapMax=0 \
      --unit=migration-myproject \
-     python framework/tools/pipeline.py run framework/state/migration-state.json \
-       --agent-cmd 'goose run --recipe {framework}/recipe.yaml'
+     python framework/tools/pipeline.py run \
+       --target /absolute/path/to/myproject \
+       --agent-cmd '<any CLI agent> {brief_file}'
    ```
 
    Per-child ceilings (judge children, gates, delegate agents, stage
@@ -105,11 +140,11 @@ not in the repo being migrated.
 | Path | Role |
 |---|---|
 | `MIGRATION_PROMPT.md` | The distilled harness: 10 hard rules, pipeline table, repair-loop spec, escalation policy, failure-mode table. **This is "the prompt."** |
-| `recipe.yaml` | goose orchestrator recipe wrapping the same rules — never prompts and never asks for human input: gates resolve in code (`pipeline.py resolve-gates`), a missing target ends the run `failed_safely`, and new runs default to autonomy L2 |
+| `design/0001-single-session-run.md` | The run model: one prompt (yours, verbatim), start to finish, day-scale — session-driven GLV succession at half context (amendment 2), unit-granular driver chunks, context recycling, day-scale budgets, no agent-specific packaging |
 | `stages/0..7-*.md` | Per-stage checklists: purpose, steps, **exit criteria**, escalation triggers |
 | `roles/translator.md` | Subagent instructions for mechanical per-unit translation |
 | `roles/reviewer.md` | Subagent instructions for adversarial parity + PyO3-FFI review |
-| `tools/*.py` + `tools/README.md` | The 8 deterministic helpers — implemented, stdlib-only, JSON-in/JSON-out, acceptance-tested in `tools/tests/` — plus `tools/pipeline.py`, the deterministic driver for unattended L2+ runs (issue #22), and `tools/succession.py`, the session-chain harness that auto-spawns successor GLV sessions on session-level budget exhaustion so a run finishes from one prompt (issue #25); specs, conventions, and quick reference in `tools/README.md` |
+| `tools/*.py` + `tools/README.md` | The 8 deterministic helpers — implemented, stdlib-only, JSON-in/JSON-out, acceptance-tested in `tools/tests/` — plus `tools/pipeline.py`, the deterministic driver for unattended L2+ runs (issue #22), and `tools/succession.py`, the session-succession tool — `handoff` (the live orchestrator hands itself off at ~half context, successor spawns over the GLV API) and the optional `chain` watchdog — so a run finishes from one prompt (issue #25); specs, conventions, and quick reference in `tools/README.md` |
 | `autonomy/policy.json` | The autonomy policy layer (issue #22): levels L0–L3 and one machine-decidable rule per gate with conservative defaults — evaluated only in code, journaled, never LLM self-approval. Default level L2; the agent never asks a human mid-run at any level (at L0/L1 gates stay open and the run ends with the dossier for between-runs operator review) |
 | `knowledge/substitutions.json` | Machine-readable crate mapping + no-equivalent zones (from `research/5`) |
 | `state/migration-state.schema.json` | The dual-build state manager schema — the resumable, per-unit-reversible record |
@@ -146,7 +181,11 @@ not in the repo being migrated.
       runs them (Python ≥ 3.10, stdlib only) and re-run
       `python framework/tools/oracle.py self-test` — the parity oracle
       (gap #1) is non-negotiable before any translation
-- [ ] Point `recipe.yaml` at your target project and provider/model
+- [ ] Hand the framework one prompt against your target —
+      `python framework/tools/succession.py chain --target /abs/path/to/project
+      --prompt-file my-prompt.md` (your prompt, verbatim) — or the
+      single-process driver variant: `pipeline.py run --target /abs/path/to/project
+      --agent-cmd '<any CLI agent> {brief_file}'`
 - [ ] Confirm the target's test suite is green and substantive enough to act
       as the spec (Stage 2 will stop you if not)
 - [ ] Or machine-check the checklist items above in one command (issue #31):

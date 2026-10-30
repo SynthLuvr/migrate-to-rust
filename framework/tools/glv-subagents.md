@@ -115,7 +115,7 @@ journal, resolving as ESC-1 defer; per-side peak RSS rides the verdict
 payload's `resources.peak_rss_mb`.
 
 **Run-level slice (the launch path).** Per-child scopes bound each child;
-a whole unattended run (driver, chain, or recipe) is bounded independently
+a whole unattended run (driver or chain) is bounded independently
 of the session server by launching it inside a dedicated user slice — the
 ceiling is policy too: `memory.run_scope_mb` (`policy:MEM-1`, 8192 MB).
 Install the shipped slice once:
@@ -126,14 +126,14 @@ cp framework/tools/migration.slice ~/.config/systemd/user/migration.slice
 systemctl --user daemon-reload
 ```
 
-Then prefix the launch — the driver, the chain, or the goose recipe:
+Then prefix the launch — the driver or the chain:
 
 ```bash
 systemd-run --user --slice=migration.slice --scope \
   -p MemoryHigh=6G -p MemoryMax=8G -p MemorySwapMax=0 \
   --unit=migration-<project> \
-  python framework/tools/pipeline.py run framework/state/migration-state.json \
-    --agent-cmd 'goose run --recipe {framework}/recipe.yaml'
+  python framework/tools/pipeline.py run --target /abs/target \
+    --agent-cmd '<any CLI agent> {brief_file}'
 # chain harness:
 systemd-run --user --slice=migration.slice --scope ... --unit=migration-<project> \
   python framework/tools/succession.py chain framework/state/migration-state.json
@@ -175,27 +175,37 @@ Quick human lookups without HTTP: `glv sessions`, `glv view <id>`,
 
 ## One GLV session = one role invocation
 
-**Including the orchestrator itself.** When the chain harness
-(`tools/succession.py`, issue #25) drives a run, the orchestrator is a
+**Including the orchestrator itself.** The orchestrator is a
 *series* of GLV sessions — `run-<project>-s<n>` — so a whole migration
-finishes from one human prompt: the harness bootstraps GLV itself
-first (serve probe/start + one minted token per session, issue #47),
-session 1 rides the operator's prompt; when a session's context budget
-exhausts before the run reaches a terminal state, the harness composes
-the successor's resume brief from the state file (position, escalation
-dossier, journal tail, run-budget remaining, hygiene findings), starts
-the next session over this API, stops the predecessor if still live,
-journals a **stop-notice** (operator informed, not involved), and
-resets `run_status` to `running` — all through `state.py`. Guardrails:
+finishes from one human prompt. Succession is **session-driven**
+(design/0001 amendment 2): at ~half its context window the live session
+records everything through `state.py` and calls
+`succession.py handoff <state> --self` — guardrails classify from the
+state file, resume hygiene runs, the successor's resume brief is
+composed from the state file (position, escalation dossier, journal
+tail, run-budget remaining, hygiene findings), the successor starts
+over this API, the stop-notice journals, `run_status` resets to
+`running` — and the command exits; the caller stops itself. No monitor
+process parks anywhere. The same command rescues a session that died
+without handing off: it checks liveness first (`GET
+/api/sessions/:id?fields=meta` — refused while genuinely live, since
+two live orchestrators would clobber the state file), `--adopt` stops
+the gone/stuck session and takes the run over. GLV itself never
+respawns or watches context — the settle rule is the framework's,
+enforced by the session that owes the handoff. The optional
+`succession.py chain` watchdog enforces the same rule from outside
+(bootstraps GLV itself first — serve probe/start + one minted token per
+session, issue #47) for operators who want an unattended belt-and-
+braces. Guardrails either way:
 depth cap (`budget.max_chain_depth`, policy default 10) and a
 monotonic-progress guard (a successor that advances neither stage nor
 ≥1 decided unit ends the chain `failed_safely`); the run-level
 ceilings bind the *whole* chain (tokens sum through the single state
 file, wall clock sums over sessions). `budget_exhausted` survives as a
-final status only when the run-level ceilings hit; a mid-chain
-transport loss is self-healed (server revived, token re-minted on 401)
-and only an unrevivable transport ends the chain — `failed_safely`
-with the dossier.
+final status only when the run-level ceilings hit; a transport loss is
+self-healed (server revived, token re-minted on 401) and only an
+unrevivable transport ends the chain — `failed_safely` with the
+dossier.
 
 - **Name deterministically.** `unit-<unit-id>-translator-c<k>` and
   `unit-<unit-id>-reviewer-r<n>` (retries get a `-retry` suffix);

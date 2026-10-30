@@ -1,11 +1,11 @@
 {
   "$comment": "The autonomy policy layer (issue #22, proposal C): each former human gate becomes a machine-decidable rule with a conservative default, journaled and non-blocking. Evaluated only in code (tools/pipeline.py resolve-gates / tools/state.py resolve-gate) — never by LLM self-approval. Every decision records decided_by='policy:<rule-id>' + policy_version + evidence[] in migration-state.json. Levels: L0 = supervised (gates are hard stops — the agent never asks; it leaves the gate open and ends the run with the dossier for the operator to decide between runs); L1 = agent proposes into the dossier, operator decides between runs; L2 = all gates policy-resolved, publish disabled (the default — never asks); L3 = full autopilot incl. cutover. Operators pre-authorize the level BEFORE the run: there are zero mid-run questions at any level. The dual-build design is what makes autonomy safe — per-unit Python fallback, one-env-var shim, rollback pin; every autonomous decision stays reversible per unit.",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "default_level": "L2",
   "levels": {
     "L0": {
       "name": "supervised",
-      "gates": "hard stops, never questions — the agent (recipe.yaml / MIGRATION_PROMPT.md) drives, leaves the gate open with journaled evidence, and ends the run with the dossier; the operator decides between runs",
+      "gates": "hard stops, never questions — the agent (the stage checklists / MIGRATION_PROMPT.md) drives, leaves the gate open with journaled evidence, and ends the run with the dossier; the operator decides between runs",
       "publish_allowed": false,
       "driver": false
     },
@@ -29,10 +29,11 @@
     }
   },
   "budget": {
-    "$comment": "Global ceilings enforced by the driver (tools/pipeline.py run) — the run-level analogue of the per-unit MAX_ROUNDS budget. Copy into state.autonomy.budget at init time; the state block wins once present. max_chain_depth (issue #25): session-level budget_exhausted (the orchestrator session's context window) ALWAYS spawns a successor — the chain harness (tools/succession.py) bootstraps GLV itself (issue #47: it ensures `glv serve` is up and mints its own named token per session; no alternate transport, no human provisioning step); the cap bounds how many successions may chain (over it, or if a successor advances no observable state, the run ends failed_safely with the dossier). The ceilings bound the ENTIRE chain — token spend sums through the single migration-state.json, wall clock sums over sessions — so a fresh session budget never means a fresh run budget.",
-    "max_tokens": 5000000,
-    "max_wall_clock_minutes": 720,
+    "$comment": "Global ceilings enforced by the driver (tools/pipeline.py run) — the run-level analogue of the per-unit MAX_ROUNDS budget. Copy into state.autonomy.budget at init time; the state block wins once present. v1.4.0 (ADR design/0001, the single-session run model): these are the ONLY bounds that may stop a healthy run — a real migration is day-scale, so the ceilings are day-scale (7 days wall clock, 50M tokens). The driver recycles agent contexts per unit chunk, so no LLM context window ever bounds the run; max_agent_retries_per_unit bounds fresh-context retries of one unit chunk before ESC-1 defer. max_chain_depth (issue #25): session-level budget_exhausted under the GLV chain harness (tools/succession.py) ALWAYS spawns a successor — the harness bootstraps GLV itself (issue #47: it ensures `glv serve` is up and mints its own named token per session; no alternate transport, no human provisioning step); the cap bounds how many successions may chain (over it, or if a successor advances no observable state, the run ends failed_safely with the dossier). The ceilings bound the ENTIRE chain — token spend sums through the single migration-state.json, wall clock sums over sessions — so a fresh session budget never means a fresh run budget.",
+    "max_tokens": 50000000,
+    "max_wall_clock_minutes": 10080,
     "max_agent_retries_per_stage": 2,
+    "max_agent_retries_per_unit": 3,
     "max_chain_depth": 10
   },
   "candidates": {
