@@ -82,6 +82,8 @@ jobs:
           (proj / "pyproject.toml").write_text('[project]\nname = "acceptance-proj"\n')
           stub = tmp / "stub_agent.py"
           src = Path("framework/tools/tests/test_pipeline.py").read_text()
+          # the FIRST "STUB_AGENT = '''" block is the stage-granular stub
+          # (UNIT_STUB_AGENT below it also contains the marker string)
           stub.write_text(src.split("STUB_AGENT = '''")[1].split("'''")[0])
           cmd = (f"{sys.executable} {stub} "
                  f"{Path('framework/tools/state.py').resolve()} "

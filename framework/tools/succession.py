@@ -130,7 +130,6 @@ import urllib.request
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1407,10 +1406,8 @@ def cmd_chain(args) -> int:
                 "project> plus --prompt-file to boot a fresh run from your "
                 "prompt (design/0001)", args.human)
         try:
-            path, _booted = pipeline_tool._boot_target(
-                SimpleNamespace(target=args.target,
-                                runs_dir=args.runs_dir,
-                                policy=args.policy))
+            path = pipeline_tool.boot_target(args.target, args.runs_dir,
+                                              policy)
         except ToolError as e:
             return _refusal(e.detail, args.human)
         args.state = str(path)
@@ -1480,16 +1477,55 @@ def cmd_chain(args) -> int:
 
 # ------------------------------------------------------------- commands ---
 
+def _settle_unsettled_session(state: dict, path: Path,
+                              transport: GlvTransport, last: dict,
+                              events: list, *, project: str,
+                              adopt: bool) -> tuple[dict, str | None]:
+    """A third party hands off a run whose last session never settled —
+    the crash rescue. GLV liveness is checked first: while the session is
+    (or may be) still live the handoff is refused — two live orchestrators
+    would clobber the single-writer state file — unless ``adopt``
+    explicitly takes the run over (stopping the session in GLV). Returns
+    (state, refusal detail | None)."""
+    index = last.get("index")
+    transport.begin_session(
+        name=last.get("name") or f"run-{project}-s{index or 1}")
+    status, liveness_error = None, None
+    try:
+        meta = transport.session_status(str(last.get("id") or ""))
+        status = ((meta.get("session") or meta).get("status")
+                  if isinstance(meta, dict) else None)
+    except (GlvError, ToolError) as e:
+        liveness_error = str(e)
+    live = status in GLV_LIVE_STATUSES
+    if (live or status is None) and not adopt:
+        if live:
+            detail = (f"session s{index} ({last.get('id')}) is still "
+                      f"live in GLV")
+        else:
+            detail = (f"could not determine whether session s{index} "
+                      f"({last.get('id')}) is still live"
+                      + (f" ({liveness_error})" if liveness_error else ""))
+        return state, detail
+    glv_status = None
+    if live and adopt:
+        transport.stop(str(last.get("id") or ""))
+        events.append({"event": "predecessor-adopted", "id": last.get("id")})
+        glv_status = "stopped"
+    elif status:
+        glv_status = status
+    return _record_settled(state, path, index, events,
+                           glv_status=glv_status), None
+
+
 def cmd_handoff(args) -> int:
-    """The session-driven succession (design/0001 amendment 2). Called by
-    the LIVE orchestrator session at ~half its context window: guardrails
-    classify from the state file, resume hygiene runs, the successor
-    spawns over the GLV API with the composed resume brief, the
-    stop-notice journals, run_status resets to running — and this process
-    exits. The caller stops itself; no monitor parks anywhere. The same
-    one command is the crash rescue for a session that died without
-    handing off (--adopt takes it over; a still-live session is refused
-    without it, since two live orchestrators would clobber the state)."""
+    """One-shot succession (design/0001 amendment 2): the live session
+    calls this itself at ~half its context window — settle the caller's
+    chain entry, classify the guardrails from the state file, spawn the
+    successor over the GLV API with the composed resume brief, then exit;
+    the caller stops itself, no monitor parks anywhere. With --adopt the
+    same command is the crash rescue for a session that died without
+    handing off."""
     policy = pipeline_tool.load_policy(args.policy)
     path = Path(args.state)
     state = _load_state(path)
@@ -1531,16 +1567,13 @@ def cmd_handoff(args) -> int:
                       handed_off=False, classification={"kind": "terminal"})
 
     # Resolve the CALLING session's entry before classifying:
-    #  - no entries at all: session 1 was started by the operator (GLV UI,
-    #    the glv CLI, any agent) — adopt it now, at its own handoff;
-    #  - last entry unsettled with our --session-id: a self-handoff
-    #    mid-chain — settle without a liveness check (the caller IS the
-    #    live session; it stops itself right after this returns);
-    #  - last entry unsettled with another id: a session died without
-    #    handing off — the crash this command also rescues. Check GLV
-    #    liveness first: while it is still live, refuse (two live
-    #    orchestrators would clobber the single-writer state file)
-    #    unless --adopt explicitly takes the run over.
+    #  - no entries at all: session 1 was started by the operator (GLV
+    #    UI, the glv CLI, any agent) — adopt it now, at its own handoff;
+    #  - last entry unsettled, self-handoff (--self or a --session-id
+    #    matching the entry): settle with no liveness check — the caller
+    #    IS the live session and stops itself right after this returns;
+    #  - last entry unsettled, any other caller: the crash rescue —
+    #    _settle_unsettled_session checks liveness and refuses/adopts.
     if not sessions:
         state = _append_session(
             state, path,
@@ -1552,51 +1585,25 @@ def cmd_handoff(args) -> int:
                        "detail": "session 1 was started by the operator, "
                                  "not a harness — adopted at its handoff"})
         state = _record_settled(state, path, 1, events)
-    elif not (last or {}).get("settled_at"):
-        index = (last or {}).get("index")
+    elif not last.get("settled_at"):
         self_handoff = bool(args.self) or (
             args.session_id is not None
             and args.session_id == last.get("id"))
         if not self_handoff:
-            transport.begin_session(
-                name=last.get("name") or f"run-{project}-s{index or 1}")
-            status, liveness_error = None, None
-            try:
-                meta = transport.session_status(str(last.get("id") or ""))
-                status = ((meta.get("session") or meta).get("status")
-                          if isinstance(meta, dict) else None)
-            except (GlvError, ToolError) as e:
-                liveness_error = str(e)
-            live = status in GLV_LIVE_STATUSES
-            if (live or status is None) and not args.adopt:
-                if live:
-                    detail = (f"session s{index} ({last.get('id')}) is "
-                              f"still live in GLV")
-                else:
-                    detail = (f"could not determine whether session s"
-                              f"{index} ({last.get('id')}) is still live"
-                              + (f" ({liveness_error})" if liveness_error
-                                 else ""))
+            state, refusal = _settle_unsettled_session(
+                state, path, transport, last, events, project=project,
+                adopt=args.adopt)
+            if refusal is not None:
                 return result(
                     EXIT_FINDINGS,
-                    f"handoff refused: {detail} — two live orchestrators "
+                    f"handoff refused: {refusal} — two live orchestrators "
                     f"would clobber the state file; if you ARE that live "
                     f"session handing yourself off, re-run with --self; "
                     f"if it is gone or stuck, take the run over with "
                     f"--adopt",
                     handed_off=False)
-            glv_status = None
-            if live and args.adopt:
-                transport.stop(str(last.get("id") or ""))
-                events.append({"event": "predecessor-adopted",
-                               "id": last.get("id")})
-                glv_status = "stopped"
-            elif status:
-                glv_status = status
-            state = _record_settled(state, path, index, events,
-                                    glv_status=glv_status)
         else:
-            state = _record_settled(state, path, index, events)
+            state = _record_settled(state, path, last.get("index"), events)
 
     # the same classification the chain uses — pure function of state +
     # ceilings; succeed spawns, everything else ends with the reason
@@ -1689,14 +1696,32 @@ def main(argv=None) -> int:
                     help="echo human summary to stderr")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    # options shared by every subcommand that spawns a GLV session
+    spawn = argparse.ArgumentParser(add_help=False)
+    spawn.add_argument("--model", help="GLV model pin (resolve pins via "
+                                       "GET /api/models, never free-typed)")
+    spawn.add_argument("--max-depth", type=int,
+                       help="chain depth cap (default: autonomy.budget."
+                            "max_chain_depth, policy default 10)")
+    spawn.add_argument("--policy", help="override autonomy/policy.json")
+    spawn.add_argument("--glv-url", help="override GLV_BASE_URL (default: the "
+                                         "transport self-bootstraps — probe/"
+                                         "start `glv serve` per tools/"
+                                         "glv-subagents.md § GLV bootstrap)")
+    spawn.add_argument("--glv-token", help="override GLV_API_TOKEN (default: "
+                                           "mint run-<project>-s<n> per chain "
+                                           "session — the `glv token list` "
+                                           "audit trail)")
+
     p = sub.add_parser(
-        "chain", help="drive the run as a successor-session chain over GLV "
-                      "(issue #25): your prompt, verbatim, drives session 1 "
-                      "start to finish (design/0001) — boots the run from "
-                      "--target when no state file exists; a session whose "
-                      "context gives out is succeeded automatically over "
-                      "the GLV API; only genuine terminals — or the "
-                      "run-level ceilings — end the chain")
+        "chain", parents=[spawn],
+        help="drive the run as a successor-session chain over GLV "
+             "(issue #25): your prompt, verbatim, drives session 1 "
+             "start to finish (design/0001) — boots the run from "
+             "--target when no state file exists; a session whose "
+             "context gives out is succeeded automatically over "
+             "the GLV API; only genuine terminals — or the "
+             "run-level ceilings — end the chain")
     p.add_argument("state", nargs="?", default=None,
                    help="the migration state file (single source of truth); "
                         "omit when passing --target to boot a fresh run")
@@ -1716,26 +1741,12 @@ def main(argv=None) -> int:
                    help="GLV working_dir per session (default: the "
                         "preflight-recorded target root, else the state "
                         "file's directory)")
-    p.add_argument("--model", help="GLV model pin (resolve pins via "
-                                   "GET /api/models, never free-typed)")
-    p.add_argument("--max-depth", type=int,
-                   help="chain depth cap (default: autonomy.budget."
-                        "max_chain_depth, policy default 10)")
-    p.add_argument("--policy", help="override autonomy/policy.json")
-    p.add_argument("--glv-url", help="override GLV_BASE_URL (default: the "
-                                     "harness self-bootstraps — probe/start "
-                                     "`glv serve` per tools/"
-                                     "glv-subagents.md § GLV bootstrap)")
-    p.add_argument("--glv-token", help="override GLV_API_TOKEN (default: "
-                                       "mint run-<project>-s<n> per chain "
-                                       "session — the `glv token list` "
-                                       "audit trail)")
     p.add_argument("--dry-run", action="store_true",
                    help="compose the next session's brief + guardrail plan "
                         "without contacting GLV or writing anything")
     p.set_defaults(func=cmd_chain)
 
-    p = sub.add_parser("handoff",
+    p = sub.add_parser("handoff", parents=[spawn],
                        help="one-shot succession for a session-driven run "
                             "(design/0001 amendment 2): the live session "
                             "calls this itself at ~half its context — "
@@ -1764,20 +1775,6 @@ def main(argv=None) -> int:
                    help="GLV working_dir for the successor (default: the "
                         "preflight-recorded target root, else the state "
                         "file's directory)")
-    p.add_argument("--model", help="GLV model pin (resolve pins via "
-                                   "GET /api/models, never free-typed)")
-    p.add_argument("--max-depth", type=int,
-                   help="chain depth cap (default: autonomy.budget."
-                        "max_chain_depth, policy default 10)")
-    p.add_argument("--policy", help="override autonomy/policy.json")
-    p.add_argument("--glv-url", help="override GLV_BASE_URL (default: the "
-                                     "transport self-bootstraps — probe/"
-                                     "start `glv serve` per tools/"
-                                     "glv-subagents.md § GLV bootstrap)")
-    p.add_argument("--glv-token", help="override GLV_API_TOKEN (default: "
-                                       "mint run-<project>-s<n> per chain "
-                                       "session — the `glv token list` "
-                                       "audit trail)")
     p.set_defaults(func=cmd_handoff)
 
     p = sub.add_parser("brief",

@@ -24,10 +24,9 @@ Terminal-state discipline: a run ALWAYS ends in ``complete`` /
 report incl. the escalation dossier, state file, journal). Safety rests on
 the existing dual-build design: per-unit Python fallback, one-env-var shim,
 rollback pin — every autonomous decision stays reversible per unit.
-understood — the run always ends in a terminal state, never in a
-question; escalations defer with the Python fallback live (ESC-1),
-no-equivalent dependencies descope (DEP-1), and a NO-GO projection is a
-successful `no_go_measured` exit.
+Escalations defer with the Python fallback live (ESC-1), no-equivalent
+dependencies descope (DEP-1), and a NO-GO projection is a successful
+``no_go_measured`` exit.
 
 Single-session run model (design/0001): one invocation of ``run`` is the
 session. The driver process owns the run start-to-finish; agent contexts
@@ -36,11 +35,12 @@ no context window bounds the run — only the policy budget does (day-scale
 ceilings, policy v1.4.0).
 
 Autonomy levels (pre-authorized BEFORE the run; zero mid-run questions at
-any level — the agent never asks): L0 supervised (gates are hard stops: at those levels the driver refuses to
-run and the agent-driven mode ends the run with the dossier for the
-operator; this driver refuses to run them) · L1 agent proposes into
-the dossier, operator decides between runs (also refused here) · L2 all
-gates policy-resolved, publish disabled · L3 full autopilot incl. cutover.
+any level — the agent never asks): L0 supervised (gates are hard stops:
+the agent-driven mode leaves the gate open and ends the run with the
+dossier for the operator; this driver refuses to run it) · L1 agent
+proposes into the dossier, operator decides between runs (also refused
+here) · L2 all gates policy-resolved, publish disabled · L3 full
+autopilot incl. cutover.
 
 Subcommands
 -----------
@@ -1605,7 +1605,7 @@ only this unit's data through `tools/state.py`.
 
 ## This unit (from {state_path})
 - id: {uid}
-- python source (the spec): {unit.get('python_path') if unit else '?'}
+- python source (the spec): {unit.get('python_path')}
 - rust target: {rust_path}
 - deps (all terminal, per the driver): {deps}
 - contract.covering_tests: {', '.join((unit.get('contract') or {}).get('covering_tests', [])) or '(see state file)'}
@@ -1626,8 +1626,85 @@ not yours to end.
     return brief
 
 
-def _drive_units(args, path: Path, state: dict, events: list, policy: dict,
-                 ctx: dict, mem_limit_mb: int | None) -> dict:
+def _escalate_unit(state: dict, path: Path, uid: str, unit: dict,
+                   attempts: int, rc: int, events: list, policy: dict,
+                   ctx: dict) -> dict:
+    """ESC-1 defer: mark the unit escalated (Python fallback stays live),
+    resolve the single unit_escalation gate, and let the backlog continue."""
+    changes: list = []
+    gate = state_tool.find_gate(state, "unit_escalation")
+    if gate is None:
+        _open_gate(state, "unit_escalation",
+                   f"unit {uid}: chunk failed {attempts} fresh "
+                   f"context(s) (last rc={rc})", changes)
+        gate = state_tool.find_gate(state, "unit_escalation")
+    else:  # one gate record accumulates every escalated unit
+        state_tool.record_gate_fields(gate, {
+            "note": gate.get("note", "") + f" [unit={uid}]"}, changes)
+    old = unit.get("status")
+    unit["status"] = "escalated"
+    changes.append((uid, f"units[{uid}].status", old, "escalated"))
+    decision_note = "deferred"
+    if gate.get("state") == "open":
+        decisions, gate_changes = resolve_open_gates(
+            state, policy, ctx, only="unit_escalation")
+        changes.extend(gate_changes)
+        if decisions:
+            decision_note = decisions[0].get("decision", decision_note)
+    try:
+        state_tool.save_validated(state, path, actor=TOOL, changes=changes)
+    except (ValueError, ToolError) as e:
+        raise _Terminal(
+            "failed_safely",
+            f"stage 4: escalating {uid} would leave the state "
+            f"invalid ({e}); state file left as-is") from e
+    events.append({"stage": 4, "event": "unit-escalated",
+                   "unit": uid, "attempts": attempts,
+                   "gate": "unit_escalation",
+                   "decision": decision_note})
+    return state
+
+
+def _drive_unit(args, path: Path, uid: str, events: list, policy: dict,
+                ctx: dict, mem_limit_mb: int | None,
+                max_unit_retries: int) -> dict:
+    """Drive ONE unit to a terminal status in fresh agent contexts: any
+    chunk exit that does not record one (non-zero rc, timeout, or a clean
+    exit with the unit still pending) retries the chunk with the failed
+    attempt's output tail appended to the brief verbatim; a unit that
+    exhausts its retries escalates instead of stopping the run."""
+    brief = _write_unit_brief(path, uid)
+    attempts = 0
+    while True:
+        rc, tail = _invoke_agent(args.agent_cmd, 4, path,
+                                 mem_limit_mb=mem_limit_mb,
+                                 unit=uid, brief_file=brief)
+        state = _load_state(path)
+        unit = next((u for u in state.get("units", [])
+                     if u.get("id") == uid), None)
+        if unit is not None and unit.get("status") in UNIT_TERMINAL_STATUSES:
+            events.append({"stage": 4, "event": "unit-chunk-done",
+                           "unit": uid, "status": unit["status"],
+                           "attempts": attempts + 1})
+            return state
+        attempts += 1
+        events.append({"stage": 4, "event": "unit-chunk-retry",
+                       "unit": uid, "rc": rc, "tail": tail[-400:]})
+        with brief.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n## Previous attempt {attempts} (rc={rc}) — "
+                     f"output tail\n```\n{tail[-2000:]}\n```\n")
+        if attempts > max_unit_retries:
+            if unit is None:  # the worker dropped the record itself
+                raise _Terminal(
+                    "failed_safely",
+                    f"stage 4: unit {uid} vanished from the state file "
+                    f"after {attempts} chunk attempt(s)")
+            return _escalate_unit(state, path, uid, unit, attempts, rc,
+                                  events, policy, ctx)
+
+
+def _drive_units(args, path: Path, events: list, policy: dict, ctx: dict,
+                 mem_limit_mb: int | None) -> dict:
     """Stage-4's unit-granular loop (design/0001 R2-R4): per pending unit,
     fresh agent contexts until the unit records a terminal status; a unit
     that exhausts its retries is escalated (ESC-1 defer — Python fallback
@@ -1645,69 +1722,8 @@ def _drive_units(args, path: Path, state: dict, events: list, policy: dict,
             events.append({"stage": 4, "event": "units-blocked",
                            "pending": pending, "blocked": blocked})
             return state  # the stage worker gets a turn at unblocking
-        brief = _write_unit_brief(path, uid)
-        attempts = 0
-        while True:
-            rc, tail = _invoke_agent(args.agent_cmd, 4, path,
-                                     mem_limit_mb=mem_limit_mb,
-                                     unit=uid, brief_file=brief)
-            state = _load_state(path)
-            unit = next((u for u in state.get("units", [])
-                         if u.get("id") == uid), None)
-            if unit is not None and unit.get("status") in UNIT_TERMINAL_STATUSES:
-                events.append({"stage": 4, "event": "unit-chunk-done",
-                               "unit": uid, "status": unit["status"],
-                               "attempts": attempts + 1})
-                break
-            attempts += 1
-            events.append({"stage": 4, "event": "unit-chunk-retry",
-                           "unit": uid, "rc": rc, "tail": tail[-400:]})
-            # feed the failure back verbatim — the strongest signal
-            with brief.open("a", encoding="utf-8") as fh:
-                fh.write(f"\n## Previous attempt {attempts} (rc={rc}) — "
-                         f"output tail\n```\n{tail[-2000:]}\n```\n")
-            if attempts > max_unit_retries:
-                # ESC-1 defer: escalate the unit, keep the backlog moving.
-                if unit is None:  # worker dropped the record — restore it
-                    raise _Terminal(
-                        "failed_safely",
-                        f"stage 4: unit {uid} vanished from the state file "
-                        f"after {attempts} chunk attempt(s)")
-                changes: list = []
-                gate = state_tool.find_gate(state, "unit_escalation")
-                if gate is None:
-                    _open_gate(state, "unit_escalation",
-                               f"unit {uid}: chunk failed {attempts} fresh "
-                               f"context(s) (last rc={rc})", changes)
-                    gate = state_tool.find_gate(state, "unit_escalation")
-                else:  # reuse the single gate record; accumulate units
-                    state_tool.record_gate_fields(gate, {
-                        "note": gate.get("note", "") + f" [unit={uid}]"},
-                        changes)
-                old = unit.get("status")
-                unit["status"] = "escalated"
-                changes.append((uid, f"units[{uid}].status", old, "escalated"))
-                decision_note = "deferred"
-                if gate.get("state") == "open":
-                    decisions, gate_changes = resolve_open_gates(
-                        state, policy, ctx, only="unit_escalation")
-                    changes.extend(gate_changes)
-                    if decisions:
-                        decision_note = decisions[0].get("decision",
-                                                         decision_note)
-                try:
-                    state_tool.save_validated(state, path, actor=TOOL,
-                                              changes=changes)
-                except (ValueError, ToolError) as e:
-                    raise _Terminal(
-                        "failed_safely",
-                        f"stage 4: escalating {uid} would leave the state "
-                        f"invalid ({e}); state file left as-is") from e
-                events.append({"stage": 4, "event": "unit-escalated",
-                               "unit": uid, "attempts": attempts,
-                               "gate": "unit_escalation",
-                               "decision": decision_note})
-                break
+        state = _drive_unit(args, path, uid, events, policy, ctx,
+                            mem_limit_mb, max_unit_retries)
 
 
 def _enter_terminal_status(state: dict, path: Path, terminal: _Terminal,
@@ -1762,26 +1778,27 @@ def _derive_python_path(root: Path) -> str | None:
     return None
 
 
-def _boot_target(args) -> tuple[Path, bool]:
-    """Resolve the state path for --target; init a fresh run when absent.
+def boot_target(target: str, runs_dir: str, policy: dict) -> Path:
+    """Resolve the state path for a ``--target`` project; init a fresh run
+    when absent (the shared boot of ``run`` and ``succession.py chain``).
     Wiping runs/ between runs is the operator's normal reset — a wiped
     tree simply means the next invocation boots fresh (design/0001)."""
-    root = Path(args.target).expanduser().resolve()
-    if not (root / "__init__.py").is_file() and not (root / "pyproject.toml").is_file():
+    root = Path(target).expanduser().resolve()
+    if not (root / "pyproject.toml").is_file() and \
+            not (root / "__init__.py").is_file():
         raise ToolError(f"--target {root}: not a Python project root "
-                        f"(no pyproject.toml)", kind="usage")
+                        f"(no pyproject.toml or package)", kind="usage")
     python_path = _derive_python_path(root)
     if python_path is None:
         raise ToolError(f"--target {root}: could not derive the package "
                         f"(need src/<pkg>/__init__.py or one top-level "
                         f"package); pass an explicit state file instead",
                         kind="usage")
-    path = Path(args.runs_dir) / root.name / "migration-state.json"
+    path = Path(runs_dir) / root.name / "migration-state.json"
     if path.exists():
-        return path, False
+        return path
     path.parent.mkdir(parents=True, exist_ok=True)
-    policy = load_policy(args.policy) or {}
-    level = (policy.get("default_level") or "L2")
+    level = policy.get("default_level") or "L2"
     state = {
         "project": {"name": root.name, "python_path": python_path},
         "stage": 0,
@@ -1797,9 +1814,9 @@ def _boot_target(args) -> tuple[Path, bool]:
         state, [(None, "project", None, state["project"]),
                 (None, "stage", None, 0),
                 (None, "autonomy", None, state["autonomy"]),
-                (None, "run_status", None, "pending")], actor="pipeline.py")
+                (None, "run_status", None, "pending")], actor=TOOL)
     state_tool.write_json_atomic(path, state)
-    return path, True
+    return path
 
 
 def cmd_run(args) -> int:
@@ -1810,12 +1827,10 @@ def cmd_run(args) -> int:
             "project> to boot a fresh run (design/0001)", args.human)
     if args.state is None:
         try:
-            path, booted = _boot_target(args)
+            path = boot_target(args.target, args.runs_dir, policy)
         except ToolError as e:
             return _emit_refusal(e.detail, args.human)
         args.state = str(path)
-    else:
-        booted = False
     path = Path(args.state)
     state = _load_state(path)
     if args.autonomy:
@@ -1894,7 +1909,7 @@ def cmd_run(args) -> int:
             #    exhaustion retries the chunk, an exhausted unit escalates
             #    (ESC-1 defer) — before the stage worker's wrap-up pass.
             if stage == 4 and not args.dry_run:
-                state = _drive_units(args, path, state, events, policy, ctx,
+                state = _drive_units(args, path, events, policy, ctx,
                                      mem_limit_mb=memory_policy["limits"]
                                      ["gate_child_mb"])
             state, open_changes = _execute_stage(
