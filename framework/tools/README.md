@@ -210,10 +210,23 @@ notice and restart by hand) becomes a scheduling event in code instead of
 "awaiting input":
 
 ```console
+# one prompt, start to finish (design/0001): your prompt, verbatim,
+# drives session 1; --target boots the fresh run
+python framework/tools/succession.py chain \
+  --target /absolute/path/to/myproject \
+  --prompt-file my-prompt.md
+# existing state file? pass it instead of --target
 python framework/tools/succession.py chain \
   --state runs/<project>/migration-state.json \
-  --prompt-file runs/<project>/first-prompt.md
+  --prompt-file my-prompt.md
 ```
+
+The prompt is yours: session 1 receives it byte for byte — no header, no
+briefing, no default (design/0001 R7). A fresh chain without
+`--prompt-file` refuses rather than invent one; the protocol authors only
+the mechanics (the `--target` state boot, and each successor's resume
+brief, composed from the state file because no human is around to write
+it).
 
 The harness bootstraps GLV itself as its first act (issue #47): it
 probes `GET /api/openapi.json`, starts `glv serve` in the background
@@ -226,7 +239,7 @@ revived ends the chain — `failed_safely` with a journaled stop-notice
 (a genuine terminal with the dossier, never a park).
 
 Per session it: starts the GLV session with the brief (session 1 rides the
-operator's single prompt; successors get a composed resume brief — state
+operator's prompt verbatim; successors get a composed resume brief — state
 file path, position, escalation dossier, journal tail, run-budget
 remaining, chain history, hygiene findings), parks on
 `GET /api/sessions/:id/wait` until it settles, and classifies from the
@@ -495,9 +508,14 @@ python framework/tools/state.py validate|journal|show|migrate state.json
 # oracle self-test 5/5, rust-template HEAD SHA, toolchain, target
 # venv/PYO3_PYTHON, substitutions freshness -> one journaled block + report
 python framework/tools/pipeline.py preflight state.json --target-root /abs/target
-# single-session entrypoint (design/0001): boots the state from --target when
-# absent, then drives start to finish — day-scale budgets, unit-chunk
-# contexts, any CLI agent behind --agent-cmd
+# one-prompt entrypoint (design/0001 criteria 1-2): your prompt verbatim
+# drives session 1; --target boots the run; a session whose context gives
+# out is succeeded automatically over the GLV API
+python framework/tools/succession.py chain --target /abs/target \
+  --prompt-file my-prompt.md
+# single-process driver variant (design/0001): boots the state from
+# --target when absent, then drives start to finish — day-scale budgets,
+# unit-chunk contexts, any CLI agent behind --agent-cmd, no GLV
 python framework/tools/pipeline.py run --target /abs/target \
   --agent-cmd '<any CLI agent> {stage} {state} {stage_file} {framework} {unit} {brief_file}' \
   --autonomy L2

@@ -27,7 +27,25 @@ operate a pipeline; the gates decide, not you.
 
 **Who runs the loop.** Two operating modes (issue #22):
 
-- **Driver-driven (L2/L3, the acceptance path — design/0001)** — the
+- **Chained (the one-prompt acceptance path — design/0001 criteria 1–2)** —
+  when the run is started by
+  [`tools/succession.py chain`](tools/succession.py) (issue #25), the
+  orchestrator role itself runs as a series of GLV sessions: session 1
+  rides the operator's prompt **verbatim** (the protocol never authors
+  the task prompt). If your session's context budget exhausts before the
+  run reaches a terminal state, record `budget_exhausted` and stop — the
+  harness composes the successor's resume brief from the state file
+  (position, dossier, journal tail, budget remaining, GLV bootstrap
+  pointer) and spawns it automatically; a session that settles without
+  recording a terminal state is succeeded too. The harness bootstraps
+  GLV itself (issue #47) — it ensures `glv serve` is up and mints one
+  named token (`run-<project>-s<n>`) per chain session; see
+  [`tools/glv-subagents.md`](tools/glv-subagents.md) § "GLV bootstrap",
+  the runbook section every session runs before any role or chain work.
+  A run then finishes from one human prompt with zero manual restarts;
+  the run-level ceilings and the chain guardrails (depth cap, monotonic
+  progress) bound everything.
+- **Driver-driven (L2/L3, the single-process variant — design/0001)** — the
   deterministic driver [`tools/pipeline.py`](tools/pipeline.py) owns the
   run start to finish (stage order, exit-criteria verification, gate
   resolution via [`autonomy/policy.json`](autonomy/policy.json), budget
@@ -50,23 +68,6 @@ operate a pipeline; the gates decide, not you.
   dossier; the operator decides *between* runs, never mid-run. (The
   driver refuses these levels; they are the supervised exception, not the
   acceptance path.)
-- **Chained (any level, optional GLV transport)** — when the run is started
-  by [`tools/succession.py chain`](tools/succession.py) (issue #25), the
-  orchestrator role itself runs as a series of GLV sessions: if your
-  session's context budget exhausts before the run reaches a terminal
-  state, record `budget_exhausted` and stop — the harness spawns a
-  successor session with the full resume context (state file path,
-  dossier, journal tail, budget remaining, GLV bootstrap pointer)
-  automatically. The harness bootstraps GLV itself (issue #47) — it
-  ensures `glv serve` is up and mints one named token
-  (`run-<project>-s<n>`) per chain session; see
-  [`tools/glv-subagents.md`](tools/glv-subagents.md) § "GLV bootstrap",
-  the runbook section every session runs before any role or chain work.
-  A run then finishes from one human prompt with zero manual restarts;
-  the run-level ceilings and the chain guardrails (depth cap, monotonic
-  progress) bound everything. This is the OPTIONAL multi-process variant
-  of the same guarantee the driver already provides in one process
-  (design/0001) — not a prerequisite for it.
 
 ## Hard rules — violating any one fails the task
 
@@ -215,12 +216,15 @@ Divergent / Incomparable`; every Divergent carries a written explanation.
   start `glv serve` if nothing answers, mint your own token
   `glv token create --name run-<project>-s<n>`, export
   `GLV_BASE_URL`/`GLV_API_TOKEN`, re-mint on a 401 run). The oracle
-  still judges; GLV only carries the roles. GLV can also carry the
+  still judges; GLV only carries the roles. GLV also carries the
   **orchestrator chain**
-  ([`tools/succession.py`](tools/succession.py), issue #25) as the
-  optional multi-process variant; in the default single-process model
-  (design/0001) the driver itself recycles contexts per chunk, so one
-  human prompt — one command — finishes the run.
+  ([`tools/succession.py`](tools/succession.py), issue #25) — the
+  one-prompt acceptance path of design/0001: `succession.py chain
+  --target <project> --prompt-file <your-prompt>` runs the whole
+  migration through GLV sessions, your prompt verbatim in session 1,
+  and a session whose context gives out is succeeded automatically over
+  this API. The single-process driver variant recycles contexts per
+  chunk in one process instead of chaining sessions.
 
 ## Gates — autonomy levels and policy resolution (issue #22)
 

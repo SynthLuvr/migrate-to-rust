@@ -9,8 +9,14 @@ breaks the autonomy philosophy — "ask" is not one of the agent's moves —
 so this tool makes succession a *scheduling event in code*:
 
     python framework/tools/succession.py chain \
-        --state runs/<project>/migration-state.json \
-        --prompt-file runs/<project>/first-prompt.md
+        --target /absolute/path/to/project \
+        --prompt-file my-prompt.md
+
+The prompt is the operator's. Session 1 receives it VERBATIM — the
+protocol never authors the task prompt (no header, no briefing, no
+default); it authors only the mechanics around it: the state boot from
+``--target`` when no state file exists, and each successor's resume
+brief composed from the state file.
 
 It wraps the whole run in a **chain of GLV orchestrator sessions** (the
 HTTP transport ``tools/glv-subagents.md`` already defines for role
@@ -106,6 +112,7 @@ import urllib.request
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -137,9 +144,6 @@ SUCCEED_ELIGIBLE = (None, "pending", "running", "budget_exhausted")
 FINISHED_RUN_STATUSES = ("complete", "no_go_measured")
 GLV_LIVE_STATUSES = ("queued", "running")
 JOURNAL_TAIL_ENTRIES = 20
-DEFAULT_SESSION_ONE_PROMPT = (
-    "Run the Python->Rust migration per the framework's "
-    "MIGRATION_PROMPT.md; the state file path is recorded above.")
 
 
 # ------------------------------------------------------------ transport ----
@@ -1032,49 +1036,28 @@ def compose_resume_brief(*, state: dict, state_path: Path, successor_index: int,
     return "\n".join(lines)
 
 
-def compose_start_brief(*, prompt_text: str, state: dict, state_path: Path,
-                        max_depth: int, framework: Path = FRAMEWORK) -> str:
-    """Session 1 rides the operator's single prompt; the harness prepends
-    only the chain context every session shares."""
-    header = "\n".join([
-        "# Migration run — orchestrator session 1 of the successor chain",
-        "",
-        f"- state file (the single source of truth): `{state_path.resolve()}`",
-        f"- framework checkout: `{framework}`",
-        f"- first act, before any stage work: bootstrap GLV yourself per "
-        f"the runbook — `{framework / 'tools' / 'glv-subagents.md'}` § "
-        f"\"GLV bootstrap\" (ensure `glv serve` is up, mint this session's "
-        f"own token with `glv token create --name run-<project>-s1`, "
-        f"export GLV_BASE_URL/GLV_API_TOKEN, re-mint on a 401 run); GLV "
-        f"is the only transport",
-        f"- this run is chained (tools/succession.py, max depth {max_depth}): "
-        "if your session budget exhausts before the run reaches a terminal "
-        "state, record `budget_exhausted` and stop — a successor session "
-        "continues from this state file automatically; never ask a human",
-        "",
-        "---",
-        "",
-    ])
-    return header + prompt_text
-
-
 def _session_one_prompt(args) -> str:
+    """The operator's prompt, VERBATIM — the protocol never authors the
+    task prompt (design/0001 R7): no header, no briefing, no default.
+    A fresh chain without --prompt-file is a refusal, not an invention."""
     prompt_file = getattr(args, "prompt_file", None)
     if not prompt_file:
-        return DEFAULT_SESSION_ONE_PROMPT
+        raise ToolError(
+            "the run's prompt is yours to write: pass --prompt-file with "
+            "the prompt that should drive session 1 (design/0001 R7 — the "
+            "protocol composes successor resume briefs, never the task "
+            "prompt)", kind="usage")
     return Path(prompt_file).read_text(encoding="utf-8")
 
 
 def _next_brief(state: dict, state_path: Path, *, policy: dict, args,
                 hygiene_findings: list[dict] | None = None) -> tuple[str, int]:
-    """The brief for the NEXT session: fresh start (the operator's single
-    prompt) vs. successor resume (composed from the state file)."""
+    """The brief for the NEXT session: fresh start (the operator's prompt,
+    verbatim) vs. successor resume (composed from the state file)."""
     max_tokens, max_minutes, max_depth = _ceilings(state, policy, args)
     index = len(_chain_block(state).get("sessions") or []) + 1
     if index == 1:
-        return compose_start_brief(
-            prompt_text=_session_one_prompt(args), state=state,
-            state_path=state_path, max_depth=max_depth), index
+        return _session_one_prompt(args), index
     return compose_resume_brief(
         state=state, state_path=state_path, successor_index=index,
         max_depth=max_depth, max_tokens=max_tokens, max_minutes=max_minutes,
@@ -1380,6 +1363,20 @@ def _drive_chain(path: Path, transport: GlvTransport, policy: dict, args,
 
 def cmd_chain(args) -> int:
     policy = pipeline_tool.load_policy(args.policy)
+    if args.state is None:
+        if not args.target:
+            return _refusal(
+                "nothing to chain: pass a state file, or --target <python "
+                "project> plus --prompt-file to boot a fresh run from your "
+                "prompt (design/0001)", args.human)
+        try:
+            path, _booted = pipeline_tool._boot_target(
+                SimpleNamespace(target=args.target,
+                                runs_dir=args.runs_dir,
+                                policy=args.policy))
+        except ToolError as e:
+            return _refusal(e.detail, args.human)
+        args.state = str(path)
     path = Path(args.state)
     state = _load_state(path)
     sessions = _chain_block(state).get("sessions") or []
@@ -1391,13 +1388,23 @@ def cmd_chain(args) -> int:
             f"budget_exhausted/failed_safely/interrupted runs, not finished "
             f"ones", args.human, file=str(path))
 
+    if not sessions:
+        # the task prompt is the operator's: a fresh chain cannot start
+        # without one (the protocol never authors it — design/0001 R7)
+        try:
+            _session_one_prompt(args)
+        except ToolError as e:
+            return _refusal(e.detail, args.human, file=str(path))
+
     ceilings = _ceilings(state, policy, args)
     if args.dry_run:
         return _dry_run_chain(args, state, path, policy, ceilings)
 
     events: list[dict] = []
     project = (state.get("project") or {}).get("name") or "project"
-    working_dir = args.working_dir or \
+    target_root = (str(Path(args.target).expanduser().resolve())
+                   if args.target else None)
+    working_dir = args.working_dir or target_root or \
         (((state.get("preflight") or {}).get("target") or {}).get("root")
          or str(path.parent))
     _, _, max_depth = ceilings
@@ -1479,13 +1486,26 @@ def main(argv=None) -> int:
 
     p = sub.add_parser(
         "chain", help="drive the run as a successor-session chain over GLV "
-                      "(issue #25): session-level budget_exhausted spawns "
-                      "the successor automatically; only genuine terminals "
-                      "— or the run-level ceilings — end the chain")
-    p.add_argument("state")
+                      "(issue #25): your prompt, verbatim, drives session 1 "
+                      "start to finish (design/0001) — boots the run from "
+                      "--target when no state file exists; a session whose "
+                      "context gives out is succeeded automatically over "
+                      "the GLV API; only genuine terminals — or the "
+                      "run-level ceilings — end the chain")
+    p.add_argument("state", nargs="?", default=None,
+                   help="the migration state file (single source of truth); "
+                        "omit when passing --target to boot a fresh run")
+    p.add_argument("--target",
+                   help="one-prompt boot (design/0001): the Python project "
+                        "root; the state file is created at "
+                        "<runs-dir>/<name>/migration-state.json when absent")
+    p.add_argument("--runs-dir", default="runs",
+                   help="directory for --target-booted state files "
+                        "(default: runs/ under the working directory)")
     p.add_argument("--prompt-file",
-                   help="the operator's single prompt for session 1 "
-                        "(markdown); ignored once the chain exists — "
+                   help="YOUR prompt for session 1, passed verbatim — the "
+                        "protocol never authors the task prompt (design/"
+                        "0001 R7); ignored once the chain exists — "
                         "successor briefs are composed from the state file")
     p.add_argument("--working-dir",
                    help="GLV working_dir per session (default: the "

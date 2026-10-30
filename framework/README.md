@@ -10,14 +10,36 @@ All relative paths in these artifacts — `stages/<n>-*.md`, `roles/*.md`,
 `state/migration-state.schema.json` — live in **this framework checkout**,
 not in the repo being migrated.
 
-1. **The driver (recommended, design/0001)** — one command, start to
-   finish, no human interaction, day-scale runs. The driver process owns
-   the stage machine, gates, and budgets; it recycles an agent context per
-   chunk (per unit at Stage 4), so no LLM context window bounds the run —
-   only the policy budget does. Any CLI agent works behind `--agent-cmd`
-   (goose, Claude Code, Codex, ...); run from the **root of this
-   `migrate-to-rust` checkout** and point `--target` at the project
-   elsewhere on disk (absolute path), never by `cd`-ing into it:
+1. **One prompt (recommended, design/0001)** — write ONE prompt and the
+   framework runs the migration start to finish, unattended, for as many
+   days as it takes. `succession.py chain` wraps the run in GLV
+   orchestrator sessions: session 1 receives **your prompt verbatim**
+   (the protocol never authors the task prompt), and when a session's
+   context gives out the successor spawns automatically over the GLV API
+   with a full resume brief composed from the state file. The harness
+   bootstraps GLV itself (`glv serve` + one named token per session, no
+   human provisioning). Run from the **root of this `migrate-to-rust`
+   checkout**, pointing `--target` at the project elsewhere on disk
+   (absolute path):
+
+   ```console
+   python framework/tools/succession.py chain \
+     --target /absolute/path/to/myproject \
+     --prompt-file my-prompt.md
+   ```
+
+   `--target` boots a fresh run when no state file exists
+   (`runs/<name>/migration-state.json`, autonomy L2 — gates resolve by
+   policy in code, publish disabled; never a mid-run question). A fresh
+   chain without `--prompt-file` refuses: the prompt is yours to write.
+
+2. **The driver (the same guarantee in one process)** — one command,
+   start to finish, no human interaction, day-scale runs. The driver
+   process owns the stage machine, gates, and budgets; it recycles an
+   agent context per chunk (per unit at Stage 4), so no LLM context
+   window bounds the run — only the policy budget does, and no GLV is
+   involved. Any CLI agent works behind `--agent-cmd` (goose, Claude
+   Code, Codex, ...):
 
    ```console
    python framework/tools/pipeline.py run \
@@ -110,7 +132,7 @@ not in the repo being migrated.
 | Path | Role |
 |---|---|
 | `MIGRATION_PROMPT.md` | The distilled harness: 10 hard rules, pipeline table, repair-loop spec, escalation policy, failure-mode table. **This is "the prompt."** |
-| `design/0001-single-session-run.md` | The run model: one command, start to finish, day-scale — unit-granular chunks, context recycling, day-scale budgets, no agent-specific packaging |
+| `design/0001-single-session-run.md` | The run model: one prompt (yours, verbatim), start to finish, day-scale — the GLV successor chain for context-full sessions, unit-granular driver chunks, context recycling, day-scale budgets, no agent-specific packaging |
 | `stages/0..7-*.md` | Per-stage checklists: purpose, steps, **exit criteria**, escalation triggers |
 | `roles/translator.md` | Subagent instructions for mechanical per-unit translation |
 | `roles/reviewer.md` | Subagent instructions for adversarial parity + PyO3-FFI review |
@@ -151,8 +173,11 @@ not in the repo being migrated.
       runs them (Python ≥ 3.10, stdlib only) and re-run
       `python framework/tools/oracle.py self-test` — the parity oracle
       (gap #1) is non-negotiable before any translation
-- [ ] Boot the driver against your target — `python framework/tools/pipeline.py
-      run --target /abs/path/to/project --agent-cmd '<any CLI agent> {brief_file}'`
+- [ ] Hand the framework one prompt against your target —
+      `python framework/tools/succession.py chain --target /abs/path/to/project
+      --prompt-file my-prompt.md` (your prompt, verbatim) — or the
+      single-process driver variant: `pipeline.py run --target /abs/path/to/project
+      --agent-cmd '<any CLI agent> {brief_file}'`
 - [ ] Confirm the target's test suite is green and substantive enough to act
       as the spec (Stage 2 will stop you if not)
 - [ ] Or machine-check the checklist items above in one command (issue #31):

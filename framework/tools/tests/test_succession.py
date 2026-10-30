@@ -156,6 +156,27 @@ def _session_completes(**kwargs):
     return _session_run("complete", **kwargs)
 
 
+def _session_boots_and_exhausts():
+    """Session 1 of a --target-booted run: real stage 0->4 work (go
+    decision, unit plan, stage advance) journaled through state.py,
+    then self-reports budget_exhausted — the chain must succeed it."""
+    def mutate(state):
+        changes = []
+        old_count = len(state.get("units") or [])
+        state["units"] = [_unit("u1"), _unit("u2")]
+        changes.append(_set("units", None, f"<list:{old_count} items>",
+                            "<list:2 items>"))
+        state.setdefault("go_no_go", {})["decision"] = "go"
+        changes.append(_set("go_no_go.decision", None, None, "go"))
+        changes.append(_set("stage", None, state.get("stage"), 4))
+        state["stage"] = 4
+        changes.append(_set("run_status", None, state.get("run_status"),
+                            "budget_exhausted"))
+        state["run_status"] = "budget_exhausted"
+        return changes
+    return mutate
+
+
 def _session_noop_exhausts():
     """A successor that changes nothing and re-exhausts — the loop shape
     the monotonic-progress guard exists to kill."""
@@ -302,11 +323,10 @@ def test_chain_reaches_complete_from_one_prompt_with_mid_run_succession(
         ["run-demo-s1", "run-demo-s2"]
     assert all(s["working_dir"] == str(target) for s in fake.started)
 
-    # session 1 rode the operator's single prompt + chain context
+    # session 1 rode the operator's prompt VERBATIM — the protocol never
+    # authors the task prompt (design/0001 R7): no header, no briefing
     first = fake.started[0]["prompt"]
-    assert "Migrate demo per the framework prompt" in first
-    assert str(p) in first and "successor session" in first.lower()
-    assert "GLV bootstrap" in first        # issue #47: bootstrap first act
+    assert first == prompt.read_text(encoding="utf-8")
 
     # the successor's brief is the full resume context (issue #25 list)
     brief = fake.started[1]["prompt"]
@@ -991,3 +1011,63 @@ def test_no_degraded_mode_or_fallback_wording_remains():
         text = path.read_text(encoding="utf-8").lower()
         for phrase in banned:
             assert phrase not in text, f"{phrase!r} still in {path}"
+
+
+# ------------------------- design/0001: one user-driven prompt, fresh boot
+
+def test_chain_boots_from_target_and_completes_from_one_prompt(
+        monkeypatch, capsys, tmp_path):
+    """design/0001 criterion 1: ONE user-authored prompt, no state file —
+    `chain --target` boots the run (autonomy L2, package derived) and the
+    chain of GLV sessions drives it to `complete` with no human anywhere.
+    Session 1 receives the operator's prompt VERBATIM (R7)."""
+    proj = tmp_path / "widgetpro"
+    (proj / "src" / "widgetpro").mkdir(parents=True)
+    (proj / "src" / "widgetpro" / "__init__.py").write_text("")
+    (proj / "pyproject.toml").write_text('[project]\nname = "widgetpro"\n')
+    prompt = tmp_path / "my-prompt.md"
+    prompt_text = ("Migrate widgetpro per the framework prompt "
+                   "(checkout: this repo). One prompt; finish unattended.\n")
+    prompt.write_text(prompt_text)
+    state_path = tmp_path / "runs" / "widgetpro" / "migration-state.json"
+    fake = FakeGlv(state_path, [
+        _session_boots_and_exhausts(),
+        _session_completes(unit_status={"u1": "ported", "u2": "ported"},
+                           parity_for=("u1", "u2")),
+    ])
+    _wire_fake(monkeypatch, fake)
+
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["chain", "--target", str(proj),
+                          "--runs-dir", str(tmp_path / "runs"),
+                          "--prompt-file", str(prompt)])
+    assert code == 0, out
+    assert out["run_status"] == "complete"
+    st = _load(state_path)
+    assert st["project"] == {"name": "widgetpro",
+                             "python_path": "src/widgetpro"}
+    assert st["autonomy"]["level"] == "L2"
+    assert [s["name"] for s in fake.started] == \
+        ["run-widgetpro-s1", "run-widgetpro-s2"]
+    # the prompt is the user's, byte for byte — nothing prepended
+    assert fake.started[0]["prompt"] == prompt_text
+    # working_dir is the target project, not the runs dir
+    assert fake.started[0]["working_dir"] == str(proj)
+
+
+def test_chain_without_the_users_prompt_refuses(monkeypatch, capsys,
+                                                tmp_path):
+    """R7: a fresh chain cannot start without the operator's prompt —
+    the protocol refuses rather than invent one."""
+    p = _midrun_state(tmp_path)
+    code, out = run_tool(monkeypatch, capsys, "succession.py",
+                         ["chain", str(p)])
+    assert code == 2
+    assert "--prompt-file" in out["error"]
+    assert "yours to write" in out["error"]
+
+
+def test_chain_without_state_or_target_refuses(monkeypatch, capsys):
+    code, out = run_tool(monkeypatch, capsys, "succession.py", ["chain"])
+    assert code == 2
+    assert "--target" in out["error"]
