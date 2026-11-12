@@ -6,10 +6,13 @@ Across the corpus, at least one instance must exercise ``journal[]``, the
 ``scope_change`` gate, and per-unit ``notes``/``sessions[]`` together; at
 least one unit in each of the six statuses must appear (the worked example,
 ``framework/examples/migration-state.json``, exists precisely to cover
-them); and the schema must *constrain* those fields — malformed journal
-entries, session entries, gate values, and deliberately incomplete units
-(e.g. a unit missing ``status``) are rejected rather than merely tolerated
-by the schema's permissive default of allowing unspecified properties.
+them); a terminal-``complete`` instance must carry a verified ``adoption``
+block covering its rust-live units (issue #85 — ``complete`` means the
+migration happened); and the schema must *constrain* those fields —
+malformed journal entries, session entries, gate values, adoption records,
+and deliberately incomplete units (e.g. a unit missing ``status``) are
+rejected rather than merely tolerated by the schema's permissive default
+of allowing unspecified properties.
 
 Non-zero exit on any failure, so CI fails loudly.
 
@@ -278,6 +281,45 @@ def require_units_constrained(schema: dict) -> None:
     print("ok: unit required fields and the status enum are enforced")
 
 
+def require_adopted_complete_exercised(instances: list[dict], schema: dict) -> None:
+    """Issue #85 — the terminal invariant, exercised by the corpus and
+    constrained by the schema: some terminal-`complete` instance must
+    carry a verified `adoption` block covering its rust-live units (the
+    worked example does), and the schema must actually bite on malformed
+    adoption records."""
+    adoption_schema = schema["properties"]["adoption"]
+    complete_with_adoption = [
+        inst for inst in instances
+        if inst.get("run_status") == "complete"
+        and isinstance(inst.get("adoption"), dict)
+        and inst["adoption"].get("verified") is True
+        and any(u.get("status") in ("ported", "divergent_explained", "retired")
+                for u in inst.get("units", []))
+    ]
+    if not complete_with_adoption:
+        fail("no terminal-complete example carries a verified `adoption` "
+             "block covering rust-live units (issue #85 — see "
+             "framework/examples/migration-state.json)")
+
+    def record(unit="u-example-1", live_side="rust"):
+        return {"unit": unit, "module": "pkg.example", "live_side": live_side,
+                "rust_import": "example_core", "python_imports": ["pkg.example"]}
+    must_accept("a well-formed adoption unit record", adoption_schema["properties"]["units"],
+                [record()])
+    must_reject("an adoption unit record with a bogus live_side ('wheel')",
+                adoption_schema["properties"]["units"],
+                [record(live_side="wheel")])
+    must_reject("an adoption unit record missing 'module'",
+                adoption_schema["properties"]["units"],
+                [{k: v for k, v in record().items() if k != "module"}])
+    must_accept("an adoption block with the verified flag",
+                adoption_schema, {"verified": True, "units": [record()]})
+    must_reject("an adoption block missing 'verified'",
+                adoption_schema, {"units": [record()]})
+    print("ok: a terminal-complete example exercises the verified adoption "
+          "block and the schema constrains it")
+
+
 def main() -> None:
     schema = json.loads(SCHEMA_PATH.read_text())
     Draft202012Validator.check_schema(schema)
@@ -288,6 +330,7 @@ def main() -> None:
     require_autonomy_exercised(instances)
     require_all_statuses_exercised(instances, schema)
     require_memory_budget_exercised(instances)
+    require_adopted_complete_exercised(instances, schema)
     require_fields_constrained(schema)
     require_units_constrained(schema)
     print(f"validated {len(instances)} example instance(s) against the schema")

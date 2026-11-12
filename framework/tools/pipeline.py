@@ -32,15 +32,21 @@ Single-session run model (design/0001): one invocation of ``run`` is the
 session. The driver process owns the run start-to-finish; agent contexts
 are disposable work buffers recycled per chunk (per unit at Stage 4), so
 no context window bounds the run — only the policy budget does (day-scale
-ceilings, policy v1.4.0).
+ceilings, policy v1.5.0).
 
 Autonomy levels (pre-authorized BEFORE the run; zero mid-run questions at
 any level — the agent never asks): L0 supervised (gates are hard stops:
 the agent-driven mode leaves the gate open and ends the run with the
 dossier for the operator; this driver refuses to run it) · L1 agent
 proposes into the dossier, operator decides between runs (also refused
-here) · L2 all gates policy-resolved, publish disabled · L3 full
-autopilot incl. cutover.
+here) · L2 all gates policy-resolved, adoption pre-authorized, publish
+disabled · L3 as L2 plus publishing the wheel to an index. Issue #85:
+CUT-1 is correctness-only and governs ADOPTION (the reversible shim flip
+routing runtime imports to the wheel) at L2+; a measured below-bar speedup
+is recorded as gate evidence and never aborts it, and a run that cannot
+legally terminate adopted fails loudly before Stage 0 — ``complete`` is
+refused by the terminal invariant unless every unit is adopted (verified
+on the target repo) or carries a recorded reason to stay on Python.
 
 Subcommands
 -----------
@@ -64,6 +70,11 @@ Subcommands
                  + evidence; consumed in code as the default of every
                  --mem-limit-mb / --max-corpus-mb flag (judge children,
                  toolchain children, run slice, corpus pre-flight)
+  verify-adoption prove the target runtime actually runs the wheel and
+                 record the `adoption` block (issue #85): import routing +
+                 live-side wheel identity + the env-var rollback flip, per
+                 rust-live unit — the recorded block state.py's terminal
+                 invariant reads for every run_status=complete
   report         emit the run report (status, gate dossier, escalation
                  dossier, budget usage) — auto-written at every terminal exit
   status         one-JSON run summary
@@ -96,8 +107,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import state as state_tool  # noqa: E402  — the ONLY writer, composed not duplicated
 from _common import (  # noqa: E402
-    EXIT_FINDINGS, EXIT_OK, ToolError, emit, now_iso, python_version_string,
-    run_child, run_cli, self_containment,
+    EXIT_FINDINGS, EXIT_OK, ToolError, emit, import_candidates_of, now_iso,
+    python_version_string, run_child, run_cli, self_containment,
 )
 
 TOOL = "pipeline.py"
@@ -179,6 +190,12 @@ def _policy_structure_errors(policy: dict) -> list[str]:
     elif not all(isinstance(lv.get("publish_allowed"), bool)
                  for lv in levels.values() if isinstance(lv, dict)):
         errors.append("levels.*: publish_allowed (bool) required on every level")
+    elif not all(isinstance(lv.get("adopt_allowed"), bool)
+                 for lv in levels.values() if isinstance(lv, dict)):
+        errors.append("levels.*: adopt_allowed (bool) required on every level — "
+                      "adoption is the L2+ pre-authorization; a policy without "
+                      "it cannot legally terminate a run in an adopted state "
+                      "(issue #85)")
     rules = policy.get("rules")
     if not isinstance(rules, list) or not rules:
         errors.append("rules: non-empty list required")
@@ -200,8 +217,22 @@ def _policy_structure_errors(policy: dict) -> list[str]:
                 covered.add(r["gate"])
             if not isinstance(r.get("decides"), str) or not r.get("decides"):
                 errors.append(f"rule {rid}: 'decides' text required")
-            if not isinstance(r.get("params", {}), dict):
+            params = r.get("params", {})
+            if not isinstance(params, dict):
                 errors.append(f"rule {rid}: params must be an object")
+                params = {}
+            if r.get("gate") == "cutover":
+                floor = params.get("regression_floor_pct")
+                if not isinstance(floor, (int, float)) or isinstance(floor, bool):
+                    errors.append(
+                        f"rule {rid}: params.regression_floor_pct (number) "
+                        f"required — CUT-1 is correctness-only with a "
+                        f"regression floor, never a profit bar (issue #85)")
+                if not isinstance(params.get("rollback_test_required"), bool):
+                    errors.append(
+                        f"rule {rid}: params.rollback_test_required (bool) "
+                        f"required — adoption without a tested rollback is "
+                        f"the untested-rollback port issue #85 forbids")
         missing = sorted(set(state_tool.GATES) - covered)
         if missing:
             errors.append(f"rules: no rule covers gate(s) {missing} — every gate "
@@ -619,44 +650,80 @@ def _eval_scope_change(state, gate, rule, ctx):
 
 
 def _eval_cutover(state, gate, rule, ctx):
+    """CUT-1 is correctness-only (issue #85): the decision is whether the
+    port is SAFE to adopt — runtime shadow parity, a rollback that was
+    actually exercised, and not materially slower (regression floor). The
+    measured end-to-end saving rides every decision as evidence (the
+    honest-reporting rule: the operator reviews the value case between
+    runs); a below-bar speedup never aborts adoption and is never a valid
+    descope reason. Adoption is pre-authorized at L2+
+    (autonomy.adopt_allowed); publishing to an external index stays the
+    L3-only publish_allowed flag and is not this gate's decision."""
     params = rule.get("params", {})
     level = state_tool.autonomy_level(state)
-    publish_allowed = (state.get("autonomy") or {}).get("publish_allowed") is True
-    if not state_tool.publish_preauthorized(state):
-        return _decision("cutover", rule, "rejected",
-                         f"publish disabled at {level} — the run completes without "
-                         f"cutover; the dual-build stays intact (publish is an "
-                         f"L3-only pre-authorization)", [f"autonomy={level}",
-                         f"publish_allowed={str(publish_allowed).lower()}"])
+    adopt = state_tool.adoption_preauthorized(state)
     ev = parse_evidence(gate.get("evidence"))
+    # the measured speedup rides EVERY decision as evidence, never gates it
+    speedup = ev.get("end_to_end_saving_pct")
+    if speedup is None:
+        speedup_evidence = ("end_to_end_saving_pct=unrecorded (run "
+                            "tools/bench_ab.py --gate cutover; unmeasured "
+                            "does not block adoption)")
+    else:
+        speedup_evidence = (f"end_to_end_saving_pct={speedup} (measured, "
+                            f"bench-ab — recorded as evidence, never an "
+                            f"adoption bar; issue #85)")
+    if not adopt:
+        return _decision(
+            "cutover", rule, "rejected",
+            f"adoption not pre-authorized at {level} — the operator decides "
+            f"cutover between runs (at L0/L1 the gate stays open with this "
+            f"evidence; at L2+ adoption is pre-authorized via "
+            f"autonomy.adopt_allowed). Publishing to an index remains the "
+            f"separate L3-only publish_allowed flag",
+            [f"autonomy={level}",
+             f"adopt_allowed={str((state.get('autonomy') or {}).get('adopt_allowed')).lower()}",
+             speedup_evidence])
     rate = _num(ev.get("shadow_diff_rate"))
     samples = _num(ev.get("shadow_samples"), int)
-    canary = _num(ev.get("canary_green_minutes"), int)
     rollback = ev.get("rollback_tested", "").lower() == "true"
+    floor = float(params.get("regression_floor_pct", -5.0))
+    measured = _num(speedup)
     checks = [
         (rate is not None and rate <= float(params.get("max_shadow_diff_rate", 0.0)),
          f"shadow_diff_rate={ev.get('shadow_diff_rate', 'unrecorded')} "
-         f"(<= {params.get('max_shadow_diff_rate', 0.0)})"),
+         f"(<= {params.get('max_shadow_diff_rate', 0.0)} — runtime parity)"),
         (samples is not None and samples >= int(params.get("min_shadow_samples", 1000)),
          f"shadow_samples={ev.get('shadow_samples', 'unrecorded')} "
          f"(>= {params.get('min_shadow_samples', 1000)})"),
-        (canary is not None and canary >= int(params.get("min_canary_green_minutes", 60)),
-         f"canary_green_minutes={ev.get('canary_green_minutes', 'unrecorded')} "
-         f"(>= {params.get('min_canary_green_minutes', 60)})"),
         (rollback or not params.get("rollback_test_required", True),
          f"rollback_tested={ev.get('rollback_tested', 'unrecorded')} "
          f"(deploys the old pin, verifies, returns)"),
+        (measured is None or measured >= floor,
+         f"regression_floor_pct={floor} vs end_to_end_saving_pct="
+         f"{speedup if speedup is not None else 'unrecorded'} "
+         f"(adopt unless the port is materially slower than {floor}%)"),
     ]
     evidence = [text for _, text in checks]
+    canary = ev.get("canary_green_minutes")
+    if canary is not None:
+        evidence.append(f"canary_green_minutes={canary} (operational evidence, "
+                        f"not a decision input)")
+    evidence.append(speedup_evidence)
     if all(ok for ok, _ in checks):
         return _decision("cutover", rule, "approved",
-                         "cutover approved: shadow diff clean over the sample "
-                         "floor, canary green past the window, rollback tested "
-                         "(publish pre-authorized at L3)", evidence)
+                         "cutover approved — ADOPT: the port is correct (runtime "
+                         "parity over the sample floor), the rollback was "
+                         "actually tested, and the measured speedup is recorded "
+                         "above as evidence "
+                         f"({speedup if speedup is not None else 'unmeasured'}), "
+                         "not held against adoption (issue #85)", evidence)
     failed = [text for ok, text in checks if not ok]
     return _decision("cutover", rule, "rejected",
-                     "cutover evidence below bar — no cutover, the run continues "
-                     "safely on the Python fallback: " + "; ".join(failed), evidence)
+                     "cutover rejected — the port is not proven safe to adopt; "
+                     "the target stays on its tested Python fallback (correctness "
+                     "or regression-floor failure only — never a below-bar "
+                     "speedup): " + "; ".join(failed), evidence)
 
 
 EVALUATORS = {
@@ -755,6 +822,11 @@ def apply_gate_decision(state: dict, decision: dict, policy: dict,
             if dropped:
                 state_tool.record_gate_fields(gate, {
                     "note": gate["note"] + f" [descoped units: {', '.join(dropped)}]",
+                    # unit= evidence is what the terminal invariant reads as a
+                    # python-staying unit's recorded descope reason (issue #85)
+                    "evidence": state_tool.merge_evidence(
+                        gate.get("evidence"),
+                        [f"unit={uid}" for uid in dropped]),
                 }, changes)
     if name == "go_no_go":
         gng = state.get("go_no_go")
@@ -809,6 +881,16 @@ def verify_stage_exit(state: dict, stage: int, *, run_selftest: bool = True) -> 
     failures: list[str] = []
     units = state.get("units", [])
     if stage == 0:
+        # issue #85: a run that cannot legally terminate adopted must fail
+        # here, before any translation — never run to a hollow "complete"
+        if not state_tool.adoption_preauthorized(state):
+            failures.append(
+                "this run cannot legally terminate in an adopted state "
+                f"(autonomy.level={state_tool.autonomy_level(state)}, "
+                f"adopt_allowed={(state.get('autonomy') or {}).get('adopt_allowed')}) "
+                f"— adoption is the purpose of the run: pre-authorize it "
+                f"(policy levels.<level>.adopt_allowed / state autonomy "
+                f"block) BEFORE running, or record NO-GO (issue #85)")
         gng = state.get("go_no_go") or {}
         if gng.get("decision") not in ("go", "no-go"):
             failures.append("go_no_go.decision must be recorded (go or no-go) — "
@@ -868,10 +950,26 @@ def verify_stage_exit(state: dict, stage: int, *, run_selftest: bool = True) -> 
         if bad:
             failures.append(f"attribution gate not green for: {bad}")
     elif stage == 6:
-        if state_tool.find_gate(state, "cutover") is None:
+        cutover = state_tool.find_gate(state, "cutover")
+        if cutover is None:
             failures.append("cutover gate absent — Stage 6 must surface the "
                             "cutover decision (approved OR rejected; either is "
                             "a decision, open is not)")
+        elif cutover.get("state") == "approved":
+            # the gate is approved but the adoption block does not prove the
+            # runtime is actually on the wheel (issue #85)
+            adoption_errors = state_tool.complete_adoption_errors(state)
+            if adoption_errors:
+                failures.append("cutover approved but adoption not verified — run "
+                                "tools/pipeline.py verify-adoption and record the "
+                                "adoption block (run_status=complete requires the "
+                                "target runtime on the wheel, issue #85): "
+                                + "; ".join(adoption_errors))
+    elif stage == 7:
+        # the terminal invariant as exit criteria: the driver retries the
+        # worker on failure and only then ends failed_safely — `complete` is
+        # never journaled over an uncompleted migration (issue #85)
+        failures.extend(state_tool.complete_adoption_errors(state))
     return failures
 
 
@@ -1350,6 +1448,226 @@ def cmd_preflight(args) -> int:
     return code
 
 
+# --------------------------------------------------------------- adoption --
+# Issue #85: run_status=complete must mean the target actually RUNS the
+# wheel, and verify-adoption makes that assertion executable on the target
+# repo. For every rust-live unit it proves, through the shim's own
+# switching code run inside the target interpreter (one child per unit,
+# cwd=target root): the module callers import resolves to a state.py shim
+# (routing), the shim's rust side is the installed wheel (live-side wheel
+# identity), and flipping the env var restores the preserved Python
+# original (the rollback path, live). The recorded `adoption` block is what
+# state.py's terminal invariant reads for every `complete`.
+_LIVE_PROBE = r'''
+import importlib, json, os, sys
+
+candidates = json.loads(sys.argv[1])
+env = sys.argv[2]
+rust_import = sys.argv[3]
+target_root = sys.argv[4]
+result = {"module": None, "is_shim": False, "live": False,
+          "rust": None, "python": None, "errors": {}}
+mod = None
+for name in candidates:
+    try:
+        mod = importlib.import_module(name)
+        result["module"] = name
+        break
+    except Exception as e:  # noqa: BLE001 — the probe reports, never raises
+        result["errors"][name] = f"{type(e).__name__}: {e}"
+if mod is not None:
+    result["module_file"] = getattr(mod, "__file__", None)
+    result["is_shim"] = (getattr(mod, "_ENV", None) == env
+                         and all(hasattr(mod, a) for a in ("impl", "_rust", "_python")))
+    result["live"] = bool(result["is_shim"] and getattr(mod, "_RUST_LIVE", False))
+    if result["is_shim"]:
+        os.environ.pop(env, None)
+        try:
+            rust_mod = mod._rust()
+            f = getattr(rust_mod, "__file__", None) or ""
+            result["rust"] = {
+                "name": getattr(rust_mod, "__name__", None),
+                "file": f,
+                "ok": getattr(rust_mod, "__name__", None) == rust_import,
+                "outside_target": not (target_root and f.startswith(target_root)),
+            }
+        except Exception as e:  # noqa: BLE001
+            result["rust"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        os.environ[env] = "all"
+        try:
+            py_mod = mod._python()
+            name = getattr(py_mod, "__name__", None)
+            f = getattr(py_mod, "__file__", None)
+            result["python"] = {
+                "name": name, "file": f,
+                "ok": (name in candidates and f != result["module_file"]),
+                "shim_too": getattr(py_mod, "_ENV", None) == env,
+                "in_target": bool(target_root and f and f.startswith(target_root)),
+            }
+        except Exception as e:  # noqa: BLE001
+            result["python"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+print(json.dumps(result))
+'''
+
+
+def _probe_adoption_failure(probe: dict, rust_import: str) -> str | None:
+    """Why a live-probe result fails to prove adoption, or None when it
+    proves it: the module callers import is a state.py shim, its live side
+    is the recorded wheel module, and the env-var flip restores the
+    preserved Python original."""
+    if not probe.get("module"):
+        return ("no import candidate resolves: "
+                + "; ".join(f"{k}: {v}" for k, v in
+                            (probe.get("errors") or {}).items()))
+    if not probe.get("is_shim"):
+        return (f"{probe['module']} resolves to the Python original, not a "
+                f"state.py shim — the target runtime's imports are NOT "
+                f"routed to the wheel (the wicksmith failure, issue #85)")
+    if not probe.get("live"):
+        return (f"{probe['module']} is a shim generated while the unit was "
+                f"not rust-live (stale _RUST_LIVE) — regenerate with "
+                f"state.py shim")
+    if not (probe.get("rust") or {}).get("ok"):
+        return ("the shim's rust side is not the recorded wheel module "
+                f"{rust_import}: " + str(probe.get("rust")))
+    if not (probe.get("python") or {}).get("ok"):
+        return ("flipping the env var does not restore the preserved "
+                "Python original: " + str(probe.get("python")))
+    return None
+
+
+def _verify_unit_adoption(unit: dict, *, python: str, env_var: str,
+                          root: str | None, skip_live: bool) -> dict:
+    """One rust-live unit's adoption record: run the live probe in the
+    target interpreter and reduce it to ok + a human-readable detail."""
+    uid = unit.get("id")
+    candidates = import_candidates_of(unit.get("python_path") or "")
+    rust_import = state_tool.rust_import_of(unit)
+    record: dict = {"unit": uid,
+                    "module": candidates[0] if candidates else None,
+                    "live_side": "rust",
+                    "rust_import": rust_import,
+                    "python_imports": candidates}
+    ok, detail = False, ""
+    if not candidates or not rust_import:
+        detail = ("cannot derive the import candidates / rust module for "
+                  f"{uid} — pass --python-import via state.py shim and "
+                  f"record units[{uid}].rust_module")
+    elif skip_live:
+        detail = "live probe skipped — routing unproven without it"
+    else:
+        code, out, err = _probe(
+            [python, "-c", _LIVE_PROBE,
+             json.dumps(candidates), env_var, rust_import, str(root or "")],
+            cwd=str(root) if root else None, timeout=120.0)
+        if code != 0:
+            detail = f"live probe failed (rc={code}): {err[-400:]}"
+        else:
+            try:
+                probe = json.loads(out)
+            except json.JSONDecodeError:
+                probe = None
+                detail = f"live probe emitted no JSON: {out[-200:]}"
+            if probe:
+                record["probe"] = probe
+                detail = _probe_adoption_failure(probe, rust_import)
+                if detail is None:
+                    ok = True
+                    detail = (f"{probe['module']} -> shim -> wheel "
+                              f"{rust_import} (fallback flip restores the "
+                              f"Python original)")
+    record["ok"] = ok
+    record["detail"] = detail
+    return record
+
+
+def cmd_verify_adoption(args) -> int:
+    """Prove the target runtime runs the wheel (issue #85) and record the
+    `adoption` block through state.py's validated writer. verified=true is
+    the ONLY thing run_status=complete may rest on when a unit's live side
+    is Rust; a --skip-live run records what routing alone proved, never
+    verified."""
+    path = Path(args.state)
+    state = _load_state(path)
+    rust_live = [u for u in state.get("units", [])
+                 if u.get("status") in state_tool.RUST_LIVE_STATUSES]
+    env_var = state_tool.fallback_env_var(state)
+    root = (args.target_root
+            or ((state.get("preflight") or {}).get("target") or {}).get("root"))
+    python = (args.python
+              or ((state.get("preflight") or {}).get("target") or {}).get("python")
+              or sys.executable)
+    warnings: list[str] = []
+    if root is None and rust_live:
+        warnings.append("no target root recorded (preflight.target.root / "
+                        "--target-root): the outside-target wheel-identity "
+                        "half of the check is inconclusive")
+
+    unit_records: list[dict] = []
+    checks: dict[str, dict] = {}
+    if args.skip_live:
+        checks["live_identity"] = {
+            "id": "live_identity", "ok": None, "skipped": True,
+            "detail": "--skip live: no interpreter probe ran; the adoption "
+                      "block can never record verified=true from routing alone"}
+        warnings.append("live-side wheel identity SKIPPED — verified stays "
+                        "false (issue #85)")
+    for unit in rust_live:
+        record = _verify_unit_adoption(unit, python=python, env_var=env_var,
+                                       root=root, skip_live=args.skip_live)
+        unit_records.append(record)
+        checks[f"unit:{record['unit']}"] = {"id": f"unit:{record['unit']}",
+                                            "ok": record["ok"],
+                                            "skipped": False,
+                                            "detail": record["detail"]}
+
+    if not rust_live:
+        verified = True
+        note = ("no rust-live unit in the state file — nothing routes to the "
+                "wheel; vacuously adopted (every unit stays Python for a "
+                "recorded reason)")
+    elif args.skip_live:
+        verified = False
+        note = "live-side identity skipped — run verify-adoption without --skip live"
+    else:
+        verified = all(r["ok"] for r in unit_records)
+        note = (f"{len(unit_records)} rust-live unit(s) verified on the target "
+                f"runtime" if verified else
+                "adoption NOT verified — the target runtime is not (fully) on "
+                "the wheel; run_status=complete is refused by the terminal "
+                "invariant until this passes")
+    block = {
+        "verified": verified,
+        "timestamp": now_iso(),
+        "env_var": env_var,
+        "target_root": root,
+        "python": python,
+        "units": unit_records,
+        "checks": checks,
+        "note": note,
+    }
+    old = state.get("adoption")
+    state["adoption"] = block
+    try:
+        state_tool.save_validated(state, path, actor=TOOL,
+                                  changes=[(None, "adoption", old, block)])
+    except ValueError as e:
+        return _emit_refusal(f"adoption block rejected — resulting state "
+                             f"would be invalid: {e}", args.human,
+                             file=str(path), rolled_back=True)
+    code = EXIT_OK if verified else EXIT_FINDINGS
+    human = (f"adoption {'verified' if verified else 'NOT verified'}: "
+             f"{sum(1 for r in unit_records if r['ok'])}/{len(unit_records)} "
+             f"rust-live unit(s) on the wheel via {env_var} -> {path}"
+             + ("; " + "; ".join(warnings) if warnings else ""))
+    emit({"tool": TOOL, "version": VERSION, "file": str(path),
+          "verified": verified, "env_var": env_var,
+          "units": unit_records, "warnings": warnings,
+          "summary": {"exit_code": code, "human": human}},
+         human_flag=args.human)
+    return code
+
+
 # ----------------------------------------------------------------- report --
 
 def tokens_spent(state: dict) -> int:
@@ -1405,9 +1723,21 @@ def build_report(state: dict, policy: dict) -> str:
         + (f" / ceiling {ceiling}" if ceiling else ""),
         f"- units: {len(state.get('units', []))} — "
         + (", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "none"),
+    ]
+    # issue #85: the terminal invariant, in the operator-facing deliverable
+    adoption = state.get("adoption")
+    if adoption:
+        lines.append(
+            f"- adoption: **{'verified' if adoption.get('verified') else 'NOT verified'}**"
+            f" ({adoption.get('note') or 'see state file'})")
+    elif any(u.get("status") in state_tool.RUST_LIVE_STATUSES
+             for u in state.get("units", [])):
+        lines.append("- adoption: **unrecorded** — rust-live units with no "
+                     "verified adoption block; run_status=complete is refused "
+                     "by the terminal invariant (issue #85)")
+    lines += [
         "",
         "## Gate dossier",
-        "",
         "| gate | state | decided_by | evidence |",
         "|---|---|---|---|",
     ]
@@ -1849,6 +2179,19 @@ def cmd_run(args) -> int:
             f"(decided between runs). Pre-authorize autonomy BEFORE the run: "
             f"--autonomy L2|L3 here, or state.py init --autonomy-level "
             f"(default L2).", args.human, file=str(path))
+    # issue #85: a run that cannot ADOPT can never honestly terminate
+    # `complete` — refuse before Stage 0, not after seven stages
+    if not state_tool.adoption_preauthorized(state):
+        return _emit_refusal(
+            f"autonomy={level} with adopt_allowed="
+            f"{(state.get('autonomy') or {}).get('adopt_allowed')}: this run "
+            f"cannot legally terminate in an adopted state, so it can never "
+            f"honestly record run_status=complete — adoption (routing the "
+            f"target runtime's imports to the wheel) is the purpose of the "
+            f"run (issue #85). Pre-authorize adoption BEFORE the run "
+            f"(autonomy/policy.json levels.{level}.adopt_allowed / the "
+            f"state's autonomy block), or do not run.", args.human,
+            file=str(path))
     run_status = state.get("run_status")
     if run_status in ("complete", "no_go_measured"):
         return _emit_refusal(
@@ -2076,11 +2419,13 @@ def cmd_status(args) -> int:
     open_gates = [g for g in state.get("human_gates", []) if g.get("state") == "open"]
     human = (f"run={state.get('run_status', 'pending')} stage={state.get('stage')}/"
              f"{LAST_STAGE} autonomy={state_tool.autonomy_level(state)} "
+             f"adoption={'verified' if (state.get('adoption') or {}).get('verified') else 'not verified'} "
              f"tokens={tokens}/{ceiling or '∞'} open_gates="
              f"{[g.get('gate') for g in open_gates] or 'none'}")
     emit({"tool": TOOL, "version": VERSION, "file": args.state,
           "run_status": state.get("run_status", "pending"),
           "stage": state.get("stage"), "units": len(state.get("units", [])),
+          "adoption": (state.get("adoption") or {}).get("verified"),
           "tokens_spent": tokens, "token_ceiling": ceiling,
           "autonomy": state.get("autonomy"), "open_gates": open_gates,
           "summary": {"exit_code": EXIT_OK, "human": human}}, human_flag=args.human)
@@ -2192,6 +2537,23 @@ def main(argv=None) -> int:
     p.add_argument("--max-corpus-mb", type=int,
                    help="operator override of the pre-flight corpus budget (#75)")
     p.set_defaults(func=cmd_resolve_memory)
+
+    p = sub.add_parser("verify-adoption",
+                       help="prove the target runtime runs the wheel and "
+                            "record the adoption block (issue #85): import "
+                            "routing + live-side wheel identity + the env-var "
+                            "rollback flip, per rust-live unit")
+    p.add_argument("state")
+    p.add_argument("--target-root",
+                   help="the repo being migrated (default: "
+                        "preflight.target.root)")
+    p.add_argument("--python",
+                   help="the target interpreter for the live probe (default: "
+                        "preflight.target.python)")
+    p.add_argument("--skip-live", action="store_true",
+                   help="skip the interpreter probe (records verified=false — "
+                        "routing alone never verifies adoption)")
+    p.set_defaults(func=cmd_verify_adoption)
 
     p = sub.add_parser("report", help="emit the run report markdown")
     p.add_argument("state")

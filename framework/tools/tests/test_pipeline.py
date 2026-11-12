@@ -335,22 +335,63 @@ def test_scope_change_rule_conservatively_rejects():
     assert d["decision"] == "rejected" and "fresh run" in d["note"]
 
 
-def test_cutover_rule_publish_disabled_below_l3():
-    d = _decide({"autonomy": {"level": "L2", "publish_allowed": False}},
-                _gate("cutover"))
-    assert d["decision"] == "rejected" and "publish disabled" in d["note"]
+def test_cutover_rule_adopts_on_green_correctness_at_l2():
+    """Issue #85: CUT-1 is correctness-only and adoption is pre-authorized at
+    L2+ — a below-bar measured speedup rides the gate as EVIDENCE, it never
+    rejects the switch the run exists to make (wicksmith: 14.75%)."""
+    green = ["shadow_diff_rate=0.0", "shadow_samples=4800",
+             "rollback_tested=true", "end_to_end_saving_pct=14.75"]
+    l2 = {"autonomy": {"level": "L2", "publish_allowed": False,
+                       "adopt_allowed": True}}
+    d = _decide(l2, _gate("cutover", evidence=green))
+    assert d["decision"] == "approved", d["note"]
+    assert "ADOPT" in d["note"] and "14.75" in d["note"]
+    assert any("end_to_end_saving_pct=14.75" in e for e in d["evidence"])
+    assert any("never an adoption bar" in e for e in d["evidence"])
+    # publish_allowed stays irrelevant to the ADOPTION decision
+    d = _decide({"autonomy": {"level": "L2", "adopt_allowed": True}},
+                _gate("cutover", evidence=green))
+    assert d["decision"] == "approved"
 
 
-def test_cutover_rule_l3_green_evidence_approves_weak_rejects():
-    green = ["shadow_diff_rate=0.0", "shadow_samples=12000",
-             "canary_green_minutes=95", "rollback_tested=true"]
-    l3 = {"autonomy": {"level": "L3", "publish_allowed": True}}
-    assert _decide(l3, _gate("cutover", evidence=green))["decision"] == "approved"
-    no_rollback = green[:3] + ["rollback_tested=false"]
-    d = _decide(l3, _gate("cutover", evidence=no_rollback))
+def test_cutover_rule_unmeasured_speedup_does_not_block_adoption():
+    green = ["shadow_diff_rate=0.0", "shadow_samples=4800", "rollback_tested=true"]
+    d = _decide({"autonomy": {"level": "L2", "adopt_allowed": True}},
+                _gate("cutover", evidence=green))
+    assert d["decision"] == "approved"
+    assert any("end_to_end_saving_pct=unrecorded" in e for e in d["evidence"])
+
+
+def test_cutover_rule_regression_floor_rejects_a_materially_slower_port():
+    """The floor still protects against harmful ports — correctness evidence
+    green, but the port is > 5% slower end-to-end."""
+    green = ["shadow_diff_rate=0.0", "shadow_samples=4800",
+             "rollback_tested=true", "end_to_end_saving_pct=-12.0"]
+    d = _decide({"autonomy": {"level": "L2", "adopt_allowed": True}},
+                _gate("cutover", evidence=green))
+    assert d["decision"] == "rejected" and "regression_floor_pct" in d["note"]
+
+
+def test_cutover_rule_rejects_without_rollback_or_parity_evidence():
+    green = ["shadow_diff_rate=0.0", "shadow_samples=4800",
+             "rollback_tested=true"]
+    l2 = {"autonomy": {"level": "L2", "adopt_allowed": True}}
+    no_rollback = green[:2] + ["rollback_tested=false"]
+    d = _decide(l2, _gate("cutover", evidence=no_rollback))
     assert d["decision"] == "rejected" and "rollback_tested" in d["note"]
-    d = _decide(l3, _gate("cutover", evidence=[]))
-    assert d["decision"] == "rejected"  # missing evidence: no cutover, keep fallback
+    d = _decide(l2, _gate("cutover", evidence=[]))
+    assert d["decision"] == "rejected"  # missing evidence: no adoption, keep fallback
+
+
+def test_cutover_rule_rejected_when_adoption_is_not_preauthorized():
+    """L0/L1: the operator decides between runs; the gate keeps the evidence
+    and rejects (nothing publishes or adopts mid-run at supervised levels)."""
+    green = ["shadow_diff_rate=0.0", "shadow_samples=4800",
+             "rollback_tested=true", "end_to_end_saving_pct=14.75"]
+    d = _decide({"autonomy": {"level": "L0", "adopt_allowed": False}},
+                _gate("cutover", evidence=green))
+    assert d["decision"] == "rejected" and "not pre-authorized" in d["note"]
+    assert any("end_to_end_saving_pct=14.75" in e for e in d["evidence"])
 
 
 # ----------------------------------------------- DEP-1 descope side effect --
@@ -524,8 +565,26 @@ elif stage == 4:
 elif stage == 5:
     setf("units[u-parse-1].attribution",
          json.dumps({"header_preserved": True, "notice_ok": True}))
-# stages 6/7: the driver owns the cutover gate; at L2 CUT-1 rejects (publish
-# disabled) and Stage 7 maintenance completes the run
+elif stage == 6:
+    # the worker records the cutover EVIDENCE (shadow parity + tested
+    # rollback + the bench-ab measurement) on the gate — the driver resolves
+    # it via policy:CUT-1 — and proves adoption on the target (issue #85)
+    sp("set", state_path,
+       "--field", "human_gates[gate=cutover].gate=cutover",
+       "--field", "human_gates[gate=cutover].state=open",
+       "--field", "human_gates[gate=cutover].note=Stage-6 worker evidence: shadow window clean, rollback tested, bench-ab measured")
+    setf("human_gates[gate=cutover].evidence",
+         json.dumps(["shadow_diff_rate=0.0", "shadow_samples=4800",
+                     "rollback_tested=true", "end_to_end_saving_pct=14.75"]))
+    setf("adoption", json.dumps({
+        "verified": True, "timestamp": "2026-01-01T00:00:00Z",
+        "env_var": "DEMO_FALLBACK",
+        "units": [{"unit": "u-parse-1", "module": "demo.parse",
+                   "live_side": "rust", "rust_import": "demo_core.u_parse_1"}],
+        "note": "target runtime routes demo.parse through the shim to the wheel"}))
+# stages 6/7: the driver resolves CUT-1 from the recorded evidence —
+# correctness-only at L2+ (issue #85): adoption proceeds with the 14.75%
+# measurement recorded as gate evidence, and Stage 7 completes the run
 print(f"stub stage {stage} done")
 '''
 
@@ -552,9 +611,15 @@ def test_full_l2_run_reaches_complete_terminal_state(monkeypatch, capsys, tmp_pa
     gates = {g["gate"]: g for g in st["human_gates"]}
     assert gates["go_no_go"]["decided_by"] == "policy:GO-1"
     assert gates["go_no_go"]["state"] == "approved"
-    # publish is disabled at L2: cutover resolved (rejected), not skipped
-    assert gates["cutover"]["state"] == "rejected"
+    # issue #85: CUT-1 is correctness-only at L2+ — the gate APPROVES the
+    # switch with the below-bar 14.75% measurement recorded as evidence,
+    # and the run completes with the target ON the wheel (adoption verified)
+    assert gates["cutover"]["state"] == "approved"
     assert gates["cutover"]["decided_by"] == "policy:CUT-1"
+    assert any("end_to_end_saving_pct=14.75" in e
+               for e in gates["cutover"]["evidence"])
+    assert st["adoption"]["verified"] is True
+    assert {e["unit"] for e in st["adoption"]["units"]} == {"u-parse-1"}
     # every stage advance journaled, in order (init's None->0 first)
     stages = [e["to"] for e in st["journal"] if e["field"] == "stage"]
     assert stages == [0, 1, 2, 3, 4, 5, 6, 7]
@@ -967,8 +1032,26 @@ elif stage == 4:
 elif stage == 5:
     setf("units[u-parse-1].attribution",
          json.dumps({"header_preserved": True, "notice_ok": True}))
-# stages 6/7: the driver owns the cutover gate; at L2 CUT-1 rejects and
-# Stage 7 maintenance completes the run
+elif stage == 6:
+    # the worker records the cutover EVIDENCE + the adoption proof (issue
+    # #85); the driver resolves CUT-1 from the evidence — correctness-only
+    # at L2+, the 14.75% measurement rides the gate as evidence
+    sp("set", state_path,
+       "--field", "human_gates[gate=cutover].gate=cutover",
+       "--field", "human_gates[gate=cutover].state=open",
+       "--field", "human_gates[gate=cutover].note=Stage-6 worker evidence: shadow window clean, rollback tested, bench-ab measured")
+    setf("human_gates[gate=cutover].evidence",
+         json.dumps(["shadow_diff_rate=0.0", "shadow_samples=4800",
+                     "rollback_tested=true", "end_to_end_saving_pct=14.75"]))
+    setf("adoption", json.dumps({
+        "verified": True, "timestamp": "2026-01-01T00:00:00Z",
+        "env_var": "DEMO_FALLBACK",
+        "units": [{"unit": "u-parse-1", "module": "demo.parse",
+                   "live_side": "rust", "rust_import": "demo_core.u_parse_1"}],
+        "note": "target runtime routes demo.parse through the shim to the wheel"}))
+# stages 6/7: the driver resolves CUT-1 from the recorded evidence and
+# Stage 7 maintenance completes the run — with the target runtime ON the
+# wheel (adoption verified, issue #85), never over an uncompleted migration
 print(f"stub stage {stage} unit {unit!r} done")
 '''
 
@@ -1064,3 +1147,203 @@ def test_run_without_state_or_target_refuses(monkeypatch, capsys):
     code, out = run_tool(monkeypatch, capsys, "pipeline.py", ["run"])
     assert code == 2
     assert "--target" in out["error"]
+
+
+# ----------------------------------------------- adoption terminal (#85) ----
+
+def test_run_refuses_when_adoption_cannot_be_preauthorized(
+        monkeypatch, capsys, tmp_path):
+    """Issue #85: a run the pre-authorization makes unable to ADOPT fails
+    loudly BEFORE Stage 0 — it could never honestly record complete, so it
+    must not run seven stages to a hollow terminal state."""
+    p = _l2_state(tmp_path, monkeypatch, capsys,
+                  autonomy={"level": "L2", "policy_version": "1.5.0",
+                            "budget": {"max_tokens": 5_000_000,
+                                       "max_wall_clock_minutes": 720},
+                            "adopt_allowed": False,
+                            "publish_allowed": False})
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["run", str(p), "--dry-run"])
+    assert code == 2 and "cannot legally terminate" in out["error"]
+    st = _load(p)
+    assert st["stage"] == 0 and st["run_status"] == "pending"  # nothing ran
+
+
+def _adoption_target(tmp_path):
+    """A synthetic adopted target: the preserved Python original under
+    src/demo (importable as src.demo.parse), a stand-in 'wheel' module, and
+    the state.py shim installed where callers' imports resolve."""
+    repo = tmp_path / "repo"
+    (repo / "src" / "demo").mkdir(parents=True)
+    (repo / "src" / "demo" / "__init__.py").write_text("")
+    (repo / "src" / "demo" / "parse.py").write_text("def parse(s):\n    return list(s)\n")
+    sitepkg = tmp_path / "sitepkg"
+    (sitepkg / "demo").mkdir(parents=True)
+    (sitepkg / "demo" / "__init__.py").write_text("")
+    (sitepkg / "demo_core.py").write_text("def parse(s):\n    return ['r' + c for c in s]\n")
+    return repo, sitepkg
+
+
+def _adoption_state(tmp_path, monkeypatch, capsys):
+    p = tmp_path / "state.json"
+    run_tool(monkeypatch, capsys, "state.py",
+             ["init", str(p), "--name", "demo", "--python-path", "src/demo",
+              "--autonomy-level", "L2"])
+    run_tool(monkeypatch, capsys, "state.py", [
+        "set", str(p),
+        "--field", 'units=@json:[{"id": "u-parse-1", "python_path": '
+                   '"src/demo/parse.py", "rust_path": "crates/demo/src/'
+                   'u_parse_1.rs", "rust_module": "demo_core", "deps": [], '
+                   '"order": 1, "status": "ported"}]'])
+    return p
+
+
+def test_verify_adoption_proves_the_runtime_is_on_the_wheel(
+        monkeypatch, capsys, tmp_path):
+    """Issue #85's CI/checks invariant, executable: import routing + a
+    live-side wheel identity test + the env-var rollback flip, on the
+    target repo, through the target interpreter."""
+    repo, sitepkg = _adoption_target(tmp_path)
+    p = _adoption_state(tmp_path, monkeypatch, capsys)
+    shim_path = sitepkg / "demo" / "parse.py"
+    run_tool(monkeypatch, capsys, "state.py", [
+        "shim", str(p), "--unit", "u-parse-1", "--flat",
+        "--rust-import", "demo_core", "--python-import", "src.demo.parse",
+        "--names", "parse", "--write", str(shim_path)])
+    monkeypatch.setenv("PYTHONPATH", f"{sitepkg}:{repo / 'src'}")
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["verify-adoption", str(p),
+                          "--target-root", str(repo), "--python", sys.executable])
+    assert code == 0 and out["verified"] is True, out
+    st = _load(p)
+    adoption = st["adoption"]
+    assert adoption["verified"] is True and adoption["env_var"] == "DEMO_FALLBACK"
+    assert {e["unit"] for e in adoption["units"]} == {"u-parse-1"}
+    assert any(e["field"] == "adoption" for e in st["journal"])
+
+
+def test_verify_adoption_refused_while_the_runtime_still_imports_python(
+        monkeypatch, capsys, tmp_path):
+    """The wicksmith failure mode, caught: parity proven, gates green — but
+    the target's runtime imports still resolve to the Python originals, so
+    adoption is NOT verified and run_status=complete stays unreachable."""
+    repo, sitepkg = _adoption_target(tmp_path)
+    p = _adoption_state(tmp_path, monkeypatch, capsys)
+    monkeypatch.setenv("PYTHONPATH", f"{sitepkg}:{repo / 'src'}")
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["verify-adoption", str(p),
+                          "--target-root", str(repo), "--python", sys.executable])
+    assert code == 2 and out["verified"] is False
+    st = _load(p)
+    assert st["adoption"]["verified"] is False
+    assert any("not a state.py shim" in e["detail"]
+               or "no import candidate resolves" in e["detail"]
+               for e in st["adoption"]["units"])
+
+
+def test_verify_adoption_skip_live_never_verifies(monkeypatch, capsys, tmp_path):
+    repo, sitepkg = _adoption_target(tmp_path)
+    p = _adoption_state(tmp_path, monkeypatch, capsys)
+    shim_path = sitepkg / "demo" / "parse.py"
+    run_tool(monkeypatch, capsys, "state.py", [
+        "shim", str(p), "--unit", "u-parse-1", "--flat",
+        "--rust-import", "demo_core", "--python-import", "src.demo.parse",
+        "--names", "parse", "--write", str(shim_path)])
+    monkeypatch.setenv("PYTHONPATH", f"{sitepkg}:{repo / 'src'}")
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["verify-adoption", str(p),
+                          "--target-root", str(repo), "--skip-live"])
+    assert code == 2 and out["verified"] is False  # routing alone never verifies
+
+
+def test_cutover_rejection_keeps_python_and_still_completes_with_reasons(
+        monkeypatch, capsys, tmp_path):
+    """Issue #85, the other half: a port that fails the correctness bar is
+    NOT adopted (no rubber-stamp switch) — but when the run records the
+    unit-level reasons (ESC-1 deferral), `complete` honestly coexists with
+    Python serving those units. What it can never do is claim complete over
+    unclassified units."""
+    stub = tmp_path / "stub_reject.py"
+    stub.write_text('''
+import json, subprocess, sys
+STATE_PY, state_path, stage = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+def sp(*a):
+    r = subprocess.run([sys.executable, STATE_PY, *a], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+def setf(field, value):
+    sp("set", state_path, "--field", f"{field}={value}", "--json-value")
+
+if stage == 0:
+    setf("go_no_go", json.dumps({
+        "decision": "go", "scope": ["demo.parse", "demo.rank"],
+        "projection": {"scoped_loc": 900, "token_cost_usd": 153.0,
+                       "end_to_end_saving_pct": 58.0},
+        "no_equivalent_deps": []}))
+elif stage == 1:
+    setf("units", json.dumps([
+        {"id": "u-parse-1", "python_path": "src/demo/parse.py", "deps": [],
+         "order": 1, "status": "pending",
+         "contract": {"covering_tests": ["tests/test_parse.py::test_roundtrip"]}},
+        {"id": "u-rank-2", "python_path": "src/demo/rank.py",
+         "deps": ["u-parse-1"], "order": 2, "status": "pending",
+         "contract": {"covering_tests": ["tests/test_rank.py::test_order"]}}]))
+elif stage == 2:
+    setf("judge_validation", json.dumps({
+        "injected_bugs": 5, "caught": 5, "mutation_sample_killed": 90,
+        "normalization_rules": "contracts/normalization.md", "date": "2026-10-27"}))
+elif stage == 3:
+    setf("units[u-parse-1].rust_path", json.dumps("crates/demo/src/u_parse_1.rs"))
+    setf("units[u-rank-2].rust_path", json.dumps("crates/demo/src/u_rank_2.rs"))
+elif stage == 4:
+    # Stage 4/5 parity is green (wicksmith shape: the port passed every
+    # correctness gate) — the failure only shows at INTEGRATION
+    setf("units[u-parse-1].parity", json.dumps({
+        "runs": 30, "equivalent": 30, "divergent": 0, "incomparable": 0,
+        "last_verdict": "equivalent"}))
+    sp("mark", state_path, "--unit", "u-parse-1", "--status", "ported")
+    sp("mark", state_path, "--unit", "u-rank-2", "--status", "fallback_python",
+       "--note", "descoped: outside the hot tranche")
+elif stage == 5:
+    setf("units[u-parse-1].attribution",
+         json.dumps({"header_preserved": True, "notice_ok": True}))
+elif stage == 6:
+    # the correctness bar FAILS at integration: shadow diffs, no tested
+    # rollback — CUT-1 must reject and nothing adopts
+    sp("set", state_path,
+       "--field", "human_gates[gate=cutover].gate=cutover",
+       "--field", "human_gates[gate=cutover].state=open",
+       "--field", "human_gates[gate=cutover].note=shadow diffs above threshold")
+    setf("human_gates[gate=cutover].evidence",
+         json.dumps(["shadow_diff_rate=0.04", "shadow_samples=4800",
+                     "rollback_tested=false", "end_to_end_saving_pct=14.75"]))
+elif stage == 7:
+    # the rejection is classified the ESC-1 way: python fallback stays live
+    # with the reason recorded, draining into the dossier
+    sp("mark", state_path, "--unit", "u-parse-1", "--status", "escalated",
+       "--note", "cutover rejected: shadow diffs unexplained after Stage-5 re-run")
+print(f"stub stage {stage} done")
+''')
+    cmd = f"{sys.executable} {stub} {TOOLS / 'state.py'} {{state}} {{stage}}"
+    p = tmp_path / "state.json"
+    run_tool(monkeypatch, capsys, "state.py", [
+        "init", str(p), "--name", "demo", "--python-path", "src/demo",
+        "--autonomy-level", "L2"])
+    code, out = run_tool(monkeypatch, capsys, "pipeline.py",
+                         ["run", str(p), "--agent-cmd", cmd])
+    assert code == 0, out
+    assert out["run_status"] == "complete"
+    st = _load(p)
+    gates = {g["gate"]: g for g in st["human_gates"]}
+    # the failing port was NOT adopted — correctness holds its veto
+    assert gates["cutover"]["state"] == "rejected"
+    assert gates["cutover"]["decided_by"] == "policy:CUT-1"
+    assert "rollback_tested" in gates["cutover"]["note"]
+    # no adoption block: nothing routes to the wheel, and `complete` is
+    # still honest because EVERY python-staying unit carries its reason
+    assert "adoption" not in st or st["adoption"].get("verified") is not True
+    units = {u["id"]: u for u in st["units"]}
+    assert units["u-parse-1"]["status"] == "escalated"
+    assert gates["unit_escalation"]["state"] == "deferred"
+    assert "cutover rejected" in gates["unit_escalation"]["note"]

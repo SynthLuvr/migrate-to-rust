@@ -17,7 +17,7 @@ acceptance-test suite in `tests/` wired into CI. Shared plumbing lives in
 | 1 | `oracle.py` — equivalence oracle | 2,4,5,6 | unit + input corpus → per-run verdicts `equivalent/divergent/incomparable` + structured diff | catches 5/5 injected bugs; normalization rules documented; no LLM in the judging path |
 | 2 | `port_plan.py` — profiling→plan generator | 0,1 | profiler hotspots JSON (bare list or `from-cprofile` envelope) + stdlib-ast/mypy scan → ranked, dependency-ordered, portability-scored backlog | I/O-bound units ranked last; cycles detected; risk flags attached; profiler-noise paths skipped with a warning; only files under `--project-root` become units — stdlib/site-packages hotspots outside it are summarized as `system_time` |
 | 3 | `contract_extract.py` | 2 | pytest collection + mypy JSON → per-unit `contract.json` (tests, types, invariants) | 100% of scoped units covered — directly or transitively via consumer `deps[]` (issue #57); dangling-within-scope tests flagged; out-of-scope suite tests reported informationally |
-| 4 | `state.py` — dual-build state manager | 1–7 | validates/migrates `migration-state.json`; emits per-unit fallback switch shim (src-layout spellings + flat-wheel re-export, issue #53) | every state transition journaled (append to the state file's `journal[]`, per `../state/migration-state.schema.json`); Python fallback callable per unit |
+| 4 | `state.py` — dual-build state manager | 1–7 | validates/migrates `migration-state.json`; emits per-unit fallback switch shim (src-layout spellings + flat-wheel re-export, issue #53) | every state transition journaled (append to the state file's `journal[]`, per `../state/migration-state.schema.json`); Python fallback callable per unit; the terminal invariant (issue #85): `run_status=complete` requires a verified `adoption` block or recorded per-unit reasons |
 | 5 | `bench.py` — cross-language differential benchmark | 0,5 | matched corpus + both entry points → one verdict JSON + repro script + corpus commit | same inputs/coverage both sides; no number without repro |
 | 6 | `pyo3_review.py` — FFI linter | 4,5 | Rust diff → findings on refcounts, swallowed `PyErr`, `unwrap()` in exports, GIL `detach` misuse, free-threading hazards, Option-arg None-conflation | complements miri/clippy (they don't cover these classes); reviewer checklist encoded |
 | 7 | `attribution.py` — attribution checker | 4,5 | original tree + port tree → header/NOTICE diff report, fail on loss | byte-exact NOTICE check; provenance comment required per generated file |
@@ -165,8 +165,9 @@ loop:
 ```
 
 - **Autonomy levels** (`--autonomy L0..L3`, pre-authorized before the run):
-  L2 (the default for new runs) resolves every gate by policy, publish
-  disabled; L3 adds cutover/publish. L0/L1 stay with the agent-driven
+  L2 (the default for new runs) resolves every gate by policy, adoption
+  pre-authorized, publish disabled; L3 adds publishing the wheel to an
+  index. L0/L1 stay with the agent-driven
   mode, which never asks either: the gate stays open, the run ends with
   the dossier, and the operator decides between runs (the driver refuses
   these levels). Zero mid-run questions at any level.
@@ -174,6 +175,12 @@ loop:
   `no_go_measured` / `budget_exhausted` / `failed_safely` — never "awaiting
   input" — and every terminal state emits the same deliverable set (run
   report with the gate + escalation dossiers, state file, journal).
+  Issue #85: `complete` means the migration happened — CUT-1 is
+  correctness-only (parity + tested rollback + a regression floor, with
+  the measured speedup recorded as evidence and never an abort), adoption
+  is pre-authorized at L2+, and the terminal invariant refuses `complete`
+  without a verified `adoption` block (run `verify-adoption`); a run that
+  cannot legally terminate adopted fails loudly before Stage 0.
 - **Budget guard**: global token/wall-clock ceilings; over either, the run
   stops safely and resumably in `budget_exhausted`.
 - Agent retries per stage are bounded (`budget.max_agent_retries_per_stage`);
@@ -546,6 +553,11 @@ python framework/tools/pipeline.py run --target /abs/target \
 python framework/tools/pipeline.py run state.json \
   --agent-cmd '<any CLI agent> {stage} {state} {stage_file} {framework} {unit} {brief_file}' --autonomy L2
 python framework/tools/pipeline.py resolve-gates state.json   # policy only, no agent
+# prove the target runtime runs the wheel (issue #85) — the adoption block
+# run_status=complete rests on: import routing + live-side wheel identity
+# + the env-var rollback flip, per rust-live unit, through the target venv
+python framework/tools/pipeline.py verify-adoption state.json \
+  --target-root /abs/target --python /abs/target/.venv/bin/python
 python framework/tools/pipeline.py status|report state.json
 
 # the stage-4 candidate runner (issue #33): K translators (K from the
@@ -643,7 +655,9 @@ Design decisions worth knowing before you extend:
   (`--by human` or `--by policy:<rule-id>`, rule ids checked against
   `autonomy/policy.json`) with `policy_version` + `evidence[]`; validation
   enforces the resolution discipline (a resolved gate always records who
-  decided; a policy-approved cutover requires L3 + `publish_allowed`) and
+  decided; a policy-approved cutover is the ADOPTION decision, pre-authorized
+  at L2+ with `adopt_allowed`, while publishing to an index remains the
+  L3-only `publish_allowed` — issue #85) and
   terminal-`run_status` coherence. The
   fallback shim is reversible per unit via one env var
   (`<PROJECT>_FALLBACK=all|<unit-ids>|none`) — no state anywhere else.
@@ -663,7 +677,15 @@ Design decisions worth knowing before you extend:
   the draft-2020-12 subset the schema uses; cross-checked against the
   `jsonschema` package by the tests) plus coherence invariants the schema
   can't express: dangling deps, cycles, order inversions, unexplained
-  divergences, and out-of-band edits detected via journal coherence.
+  divergences, gate-resolution discipline (a resolved gate always records
+  who decided; a policy-approved cutover is the ADOPTION decision and
+  requires L2+ `adopt_allowed`, while publishing to an index stays the
+  L3-only `publish_allowed` flag — issue #85), the **terminal invariant**
+  (`run_status=complete` requires a verified `adoption` block covering
+  every rust-live unit, and a recorded reason — ESC-1 deferral, DEP-1
+  descope, or explicit human descope — for every unit that stays on
+  Python; a below-bar speedup is not a valid reason), and
+  out-of-band edits detected via journal coherence.
 - **attribution.py** scopes the port to the state file's units: each unit
   file must carry `// Ported from <python_path> [<@ sha>] [(<license>)]`
   naming exactly the unit's python_path — the path is the first

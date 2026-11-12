@@ -44,6 +44,11 @@ GO/NO-GO recommendation.
       the module stays Python; descope, don't stop)
 - [ ] GO recorded, or NO-GO recorded — NO-GO ends the run in the
       `no_go_measured` terminal state: a *successful* outcome, not a failure
+- [ ] The run can legally finish its job: adoption is pre-authorized for
+      this run's level (`adopt_allowed` at L2+, issue #85) — a run that
+      cannot legally terminate in an adopted state fails loudly HERE,
+      before any translation, because `run_status=complete` means the
+      target actually runs the wheel
 
 ## Escalate
 - Projection < 50% → recommend NO-GO in writing. An *optimized Python* is a

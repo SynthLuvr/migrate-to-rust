@@ -19,6 +19,12 @@ budgeted phase, not a surprise.
    window, retire its Python fallback from the dual-build state.
 5. Keep the benchmark + reproduction corpus alive in CI so performance
    regressions surface like correctness ones.
+6. The terminal invariant holds (issue #85): a run may only record
+   `run_status=complete` with every unit adopted (the `adoption` block
+   verifies the target runtime is on the wheel) or carrying a recorded
+   reason to stay on Python (ESC-1 deferral, DEP-1 descope, or an explicit
+   human descope). Maintenance reopening the backlog adds *new* pending
+   units without a rust side — that never un-adopts the shipped ones.
 
 ## Exit criteria
 - This stage never "completes" — success is: upstream changes propagate

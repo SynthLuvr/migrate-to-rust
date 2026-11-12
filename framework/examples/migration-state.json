@@ -1,5 +1,5 @@
 {
-  "$comment": "Worked example (issue #7): a filled migration-state.json for the fictional project 'duplifind', snapshot mid-Stage 7 of an L3 autopilot run (issue #22), deliberately showing one unit in each of the six statuses. The run reached Stage 5 chained: orchestrator session 1 exhausted its session budget mid-Stage-5 and tools/succession.py spawned the successor automatically (issue #25) — see session_chain and the 2026-08-20 run_status journal entries. Validates against migration-state.schema.json (CI: framework/state/check_examples.py) and passes the coherence checks of tools/state.py validate. Walkthrough: README.md next to this file.",
+  "$comment": "Worked example (issue #7): a filled migration-state.json for the fictional project 'duplifind', snapshot mid-Stage 7 of an L3 autopilot run (issue #22), deliberately showing one unit in each of the six statuses. The run reached Stage 5 chained: orchestrator session 1 exhausted its session budget mid-Stage-5 and tools/succession.py spawned the successor automatically (issue #25) — see session_chain and the 2026-08-20 run_status journal entries. The `adoption` block (issue #85) is the terminal-invariant evidence: run_status=complete means the target runtime actually routes the rust-live units' imports to the wheel (verified live both ways through DUPLIFIND_FALLBACK), and the python-staying units carry recorded reasons (u-index-4: ESC-1 deferral; u-score-5: a recorded human decision). Validates against migration-state.schema.json (CI: framework/state/check_examples.py) and passes the coherence checks of tools/state.py validate. Walkthrough: README.md next to this file.",
   "project": {
     "name": "duplifind",
     "python_path": "src/duplifind",
@@ -358,14 +358,15 @@
     {
       "gate": "cutover",
       "state": "approved",
-      "note": "Stage 6: clean shadow window 2026-09-05..09-08 (0 divergent / 0.4M sampled requests); rollback pin kept in the release notes",
+      "note": "Stage 6: clean shadow window 2026-09-05..09-08 (0 divergent / 0.4M sampled requests); measured E2E saving 31.4% (bench-ab, below the Stage-0 projection — recorded as evidence, never an adoption abort, issue #85); rollback pin kept in the release notes",
       "decided_by": "policy:CUT-1",
       "policy_version": "1.0.0",
       "evidence": [
         "shadow_diff_rate=0.0 (<= 0.0)",
         "shadow_samples=400000 (>= 1000)",
-        "canary_green_minutes=4320 (>= 60)",
-        "rollback_tested=true (deploys the old pin, verifies, returns)"
+        "rollback_tested=true (deploys the old pin, verifies, returns)",
+        "end_to_end_saving_pct=31.4 (measured, bench-ab — recorded as evidence, never an adoption bar; issue #85)",
+        "canary_green_minutes=4320 (operational evidence, not a decision input)"
       ]
     },
     {
@@ -488,6 +489,14 @@
       "actor": "orchestrator"
     },
     {
+      "timestamp": "2026-09-08T09:16:00Z",
+      "unit": null,
+      "field": "adoption",
+      "from": null,
+      "to": "<object:8 keys>",
+      "actor": "pipeline.py"
+    },
+    {
       "timestamp": "2026-09-22T07:45:00Z",
       "unit": null,
       "field": "stage",
@@ -541,6 +550,30 @@
     "hours_human_total": 15.5,
     "regression_triage_hours": 31.0
   },
+  "adoption": {
+    "verified": true,
+    "timestamp": "2026-09-08T09:10:00Z",
+    "env_var": "DUPLIFIND_FALLBACK",
+    "target_root": "/repos/duplifind",
+    "python": "/repos/duplifind/.venv/bin/python",
+    "units": [
+      {"unit": "u-tokenize-1", "module": "duplifind.tokenize", "live_side": "rust",
+       "rust_import": "duplifind_core", "python_imports": ["duplifind.tokenize", "src.duplifind.tokenize"]},
+      {"unit": "u-dedupe-2", "module": "duplifind.dedupe", "live_side": "rust",
+       "rust_import": "duplifind_core", "python_imports": ["duplifind.dedupe", "src.duplifind.dedupe"]},
+      {"unit": "u-shingle-3", "module": "duplifind.shingle", "live_side": "rust",
+       "rust_import": "duplifind_core", "python_imports": ["duplifind.shingle", "src.duplifind.shingle"]}
+    ],
+    "checks": {
+      "routing": {"id": "routing", "ok": true, "skipped": false,
+                  "detail": "duplifind.tokenize/dedupe/shingle resolve to state.py re-export shims (flat wheel duplifind_core)"},
+      "live_identity": {"id": "live_identity", "ok": true, "skipped": false,
+                        "detail": "DUPLIFIND_FALLBACK unset: impl() resolves the installed duplifind_core wheel (site-packages, outside the target repo)"},
+      "rollback_flip": {"id": "rollback_flip", "ok": true, "skipped": false,
+                        "detail": "DUPLIFIND_FALLBACK=all: the preserved Python originals come back — the tested rollback path, live"}
+    },
+    "note": "verified 2026-09-08 after the CUT-1 adoption (shadow window clean); re-verified 2026-10-15 when u-tokenize-1's fallback retired"
+  },
   "session_chain": {
     "depth": 1,
     "max_depth": 10,
@@ -583,6 +616,7 @@
       "max_tokens": 5000000,
       "max_wall_clock_minutes": 720
     },
+    "adopt_allowed": true,
     "publish_allowed": true
   },
   "run_status": "complete"
