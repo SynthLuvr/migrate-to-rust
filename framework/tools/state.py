@@ -1164,27 +1164,32 @@ _SHIM_SWITCHING = '''def _use_fallback() -> bool:
     return _UNIT in selected
 
 
-def _python():
+def _python() -> ModuleType:
     """The Python fallback module, trying every layout spelling in turn
     (issue #53: src-layout targets import as src.<pkg> too)."""
-    last = None
+    last: ImportError | None = None
     for name in _PYTHON_IMPORTS:
         try:
             return importlib.import_module(name)
         except ImportError as exc:
             last = exc
+    if last is None:
+        raise ImportError(
+            f"no import candidate resolved for this unit: {{_PYTHON_IMPORTS}}"
+        )
     raise last'''
 
 
 SHIM_TEMPLATE = (
     _SHIM_HEADER_DOC + _SHIM_DISCIPLINE_DOC
-    + "\n\nimport importlib\nimport os\n\n"
+    + "\n\nfrom __future__ import annotations\n\nimport importlib\nimport os\n"
+    + "from types import ModuleType\n\n"
     + _SHIM_CONSTANTS + "\n\n\n" + _SHIM_SWITCHING + "\n\n\n"
-    + '''def _rust():
+    + '''def _rust() -> ModuleType:
     return importlib.import_module(_RUST_IMPORT)
 
 
-def impl():
+def impl() -> ModuleType:
     """Return the live implementation module for this unit (python or rust)."""
     if _use_fallback() or not _RUST_LIVE:
         return _python()
@@ -1195,15 +1200,16 @@ def impl():
 
 SHIM_FLAT_TEMPLATE = (
     _SHIM_HEADER_DOC + _SHIM_FLAT_DOC + _SHIM_DISCIPLINE_DOC
-    + "\n\nimport importlib\nimport os\nimport types\n\n"
+    + "\n\nfrom __future__ import annotations\n\nimport importlib\nimport os\n"
+    + "from types import ModuleType, SimpleNamespace\nfrom typing import Any\n\n"
     + _SHIM_CONSTANTS + "\n" + _SHIM_NAMES_CONST
     + "\n\n\n" + _SHIM_SWITCHING + "\n\n\n"
-    + '''def _rust():
+    + '''def _rust() -> ModuleType:
     """The flat wheel module holding every unit's functions."""
     return importlib.import_module(_RUST_IMPORT)
 
 
-def _rust_namespace():
+def _rust_namespace() -> SimpleNamespace:
     """This unit's names lifted out of the flat wheel module; a name the
     wheel does not expose is name drift, not a fallback trigger."""
     mod = _rust()
@@ -1213,13 +1219,13 @@ def _rust_namespace():
             f"flat module {{_RUST_IMPORT!r}} does not expose "
             + ", ".join(missing)
             + " — rust-side name drift vs the recorded rust_names (issue #53)")
-    ns = types.SimpleNamespace()
+    ns = SimpleNamespace()
     for n in _NAMES:
         setattr(ns, n, getattr(mod, n))
     return ns
 
 
-def impl():
+def impl() -> ModuleType | SimpleNamespace:
     """Return a namespace exposing this unit's public names from the live
     side (python module or flat rust wheel)."""
     if _use_fallback() or not _RUST_LIVE:
@@ -1227,7 +1233,7 @@ def impl():
     return _rust_namespace()
 
 
-def __getattr__(name):
+def __getattr__(name: str) -> Any:
     """PEP 562 per-name dispatch: ``from <this shim> import <public name>``
     resolves against the live side, so the shim drops in where the original
     module was imported."""
