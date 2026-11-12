@@ -1,29 +1,33 @@
 {
-  "$comment": "The autonomy policy layer (issue #22, proposal C): each former human gate becomes a machine-decidable rule with a conservative default, journaled and non-blocking. Evaluated only in code (tools/pipeline.py resolve-gates / tools/state.py resolve-gate) — never by LLM self-approval. Every decision records decided_by='policy:<rule-id>' + policy_version + evidence[] in migration-state.json. Levels: L0 = supervised (gates are hard stops — the agent never asks; it leaves the gate open and ends the run with the dossier for the operator to decide between runs); L1 = agent proposes into the dossier, operator decides between runs; L2 = all gates policy-resolved, publish disabled (the default — never asks); L3 = full autopilot incl. cutover. Operators pre-authorize the level BEFORE the run: there are zero mid-run questions at any level. The dual-build design is what makes autonomy safe — per-unit Python fallback, one-env-var shim, rollback pin; every autonomous decision stays reversible per unit.",
-  "version": "1.4.0",
+  "$comment": "The autonomy policy layer (issue #22, proposal C): each former human gate becomes a machine-decidable rule with a conservative default, journaled and non-blocking. Evaluated only in code (tools/pipeline.py resolve-gates / tools/state.py resolve-gate) — never by LLM self-approval. Every decision records decided_by='policy:<rule-id>' + policy_version + evidence[] in migration-state.json. Levels: L0 = supervised (gates are hard stops — the agent never asks; it leaves the gate open and ends the run with the dossier for the operator to decide between runs); L1 = agent proposes into the dossier, operator decides between runs; L2 = all gates policy-resolved, adoption pre-authorized, publish disabled (the default — never asks); L3 = full autopilot incl. publish to an index. Operators pre-authorize the level BEFORE the run: there are zero mid-run questions at any level. The dual-build design is what makes autonomy safe — per-unit Python fallback, one-env-var shim, rollback pin; every autonomous decision stays reversible per unit. v1.5.0 (issue #85): adoption (routing the target runtime's imports to the wheel) is separated from publish (shipping the wheel to an external index) — CUT-1 is correctness-only and governs adoption at L2+; publish stays L3-only. A measured below-bar speedup is a value finding recorded as gate evidence, never an adoption abort: run_status=complete requires adoption (verified imports + live-side wheel identity, tools/pipeline.py verify-adoption) or a recorded per-unit descope.",
+  "version": "1.5.0",
   "default_level": "L2",
   "levels": {
     "L0": {
       "name": "supervised",
       "gates": "hard stops, never questions — the agent (the stage checklists / MIGRATION_PROMPT.md) drives, leaves the gate open with journaled evidence, and ends the run with the dossier; the operator decides between runs",
+      "adopt_allowed": false,
       "publish_allowed": false,
       "driver": false
     },
     "L1": {
       "name": "assisted",
       "gates": "agent proposes a resolution per gate into the dossier and ends the run; the operator applies or rejects it between runs — nothing asks mid-run",
+      "adopt_allowed": false,
       "publish_allowed": false,
       "driver": false
     },
     "L2": {
       "name": "autonomous",
       "gates": "all gates resolved by the rules below in code — journaled, non-blocking, conservative defaults",
+      "adopt_allowed": true,
       "publish_allowed": false,
       "driver": true
     },
     "L3": {
       "name": "autopilot",
-      "gates": "as L2, plus Stage-6 cutover/publish once CUT-1's evidence bar is met",
+      "gates": "as L2, plus publishing the wheel to an index (Stage-6 `maturin publish`) once CUT-1's correctness bar is met",
+      "adopt_allowed": true,
       "publish_allowed": true,
       "driver": true
     }
@@ -105,15 +109,15 @@
     {
       "id": "CUT-1",
       "gate": "cutover",
-      "title": "Stage-6 cutover/publish",
-      "decides": "approved iff shadow_diff_rate <= max_shadow_diff_rate over >= min_shadow_samples AND canary SLOs green for >= min_canary_green_minutes AND rollback actually tested (deploy the old pin, verify, return) — and only at L3 with autonomy.publish_allowed=true. At L2 the gate resolves rejected (publish disabled; the run completes without cutover, dual-build intact). A failed evidence bar at L3 also rejects: no cutover, run continues safely on the fallback.",
+      "title": "Stage-6 adoption/cutover — correctness-only (issue #85)",
+      "decides": "approved (ADOPT: route the target runtime's imports to the wheel — the reversible per-unit shim flip) iff the port is proven CORRECT and SAFE to flip: runtime shadow parity (shadow_diff_rate <= max_shadow_diff_rate over >= min_shadow_samples), rollback actually tested (deploy the old pin, verify, return), and the measured end-to-end delta is not below the regression floor (evidence end_to_end_saving_pct >= regression_floor_pct when a measurement is recorded; unmeasured does not block — it is surfaced to the operator). The measured speedup is ALWAYS recorded on this gate as evidence and never aborts adoption: a below-bar speedup (e.g. wicksmith's 14.75%) is a value finding, not a correctness failure — run_status=complete requires adoption or a recorded per-unit descope, and 'below-bar speedup' is not a valid descope reason (issue #85). Adoption is pre-authorized at L2+ (levels.<level>.adopt_allowed); publishing to an external index stays L3-only (publish_allowed) and is NOT this gate's decision. At L0/L1 the gate stays open for the operator between runs. A failed evidence bar rejects: no cutover, the port stays on its tested Python fallback.",
       "params": {
         "max_shadow_diff_rate": 0.0,
         "min_shadow_samples": 1000,
-        "min_canary_green_minutes": 60,
+        "regression_floor_pct": -5.0,
         "rollback_test_required": true
       },
-      "evidence_in": "shadow_diff_rate=<number>, shadow_samples=<int>, canary_green_minutes=<int>, rollback_tested=<true|false> in the gate evidence[]"
+      "evidence_in": "shadow_diff_rate=<number>, shadow_samples=<int>, rollback_tested=<true|false>, end_to_end_saving_pct=<number> (bench-ab measurement; recorded always, never gates), canary_green_minutes=<int> (recorded when measured — operational evidence, not a decision input)"
     }
   ]
 }

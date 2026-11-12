@@ -12,6 +12,7 @@ import state as state_tool
 from conftest import REPO_ROOT, run_tool
 
 EXAMPLE = REPO_ROOT / "framework" / "state" / "examples" / "stage4-mid-migration.json"
+WORKED = REPO_ROOT / "framework" / "examples" / "migration-state.json"
 
 
 def _load(path):
@@ -304,15 +305,29 @@ def test_resolve_gate_refuses_unknown_rules_and_non_policy_ids(
     assert code == 2 and "human" in out["error"]
 
 
-def test_policy_cutover_approval_requires_l3_publish_allowed(
+def test_policy_cutover_approval_is_adoption_preauthorized_at_l2(
         monkeypatch, capsys, mini_state):
+    """Issue #85: a policy-approved cutover is the ADOPTION decision — legal
+    at L2 with publish still disabled; refused only without adopt_allowed."""
     run_tool(monkeypatch, capsys, "state.py", [
         "set", str(mini_state), "--field",
-        'autonomy={"level": "L2", "publish_allowed": false}', "--json-value"])
+        'autonomy={"level": "L2", "publish_allowed": false, "adopt_allowed": true}',
+        "--json-value"])
     code, out = run_tool(monkeypatch, capsys, "state.py", [
         "resolve-gate", str(mini_state), "--gate", "cutover", "--create",
         "--decision", "approved", "--by", "policy:CUT-1"])
-    assert code == 2 and "L3" in out["error"]
+    assert code == 0 and out["decision"] == "approved"
+    # refused without the adoption pre-authorization — a fresh supervised
+    # state (the L2 approval above is journaled, so demoting THAT state to
+    # L0 is refused by the gate-discipline invariant, by design)
+    supervised = mini_state.with_name("supervised.json")
+    run_tool(monkeypatch, capsys, "state.py", [
+        "init", str(supervised), "--name", "demo", "--python-path",
+        "src/demo", "--autonomy-level", "L0"])
+    code, out = run_tool(monkeypatch, capsys, "state.py", [
+        "resolve-gate", str(supervised), "--gate", "cutover", "--create",
+        "--decision", "approved", "--by", "policy:CUT-1"])
+    assert code == 2 and "adopt_allowed" in out["error"]
 
 
 def test_validate_enforces_gate_resolution_discipline(monkeypatch, capsys, tmp_path):
@@ -345,12 +360,12 @@ def test_validate_enforces_gate_resolution_discipline(monkeypatch, capsys, tmp_p
 
 def test_validate_warns_on_resumed_terminal_run(monkeypatch, capsys, tmp_path):
     st = json.loads(EXAMPLE.read_text())
-    st["run_status"] = "complete"
+    st["run_status"] = "budget_exhausted"
     st["journal"].append({  # the terminal transition itself
         "timestamp": "2026-10-31T10:00:00Z", "unit": None,
-        "field": "run_status", "from": "running", "to": "complete",
+        "field": "run_status", "from": "running", "to": "budget_exhausted",
         "actor": "pipeline.py"})
-    st["journal"].append({  # work continued after run_status=complete
+    st["journal"].append({  # work continued after the terminal status
         "timestamp": "2026-11-01T10:00:00Z", "unit": None,
         "field": "stage", "from": 4, "to": 5, "actor": "orchestrator"})
     p = tmp_path / "resumed.json"
@@ -358,6 +373,58 @@ def test_validate_warns_on_resumed_terminal_run(monkeypatch, capsys, tmp_path):
     code, out = run_tool(monkeypatch, capsys, "state.py", ["validate", str(p)])
     assert code == 0  # warning, not error — resume can be legitimate
     assert any("resumed after finishing" in w for w in out["warnings"])
+
+
+def test_complete_requires_adoption_terminal_invariant(monkeypatch, capsys,
+                                                       tmp_path):
+    """Issue #85: run_status=complete means the migration HAPPENED — the
+    recorded adoption block must verify the target runtime routes the
+    rust-live units' imports to the wheel, and every python-staying unit
+    carries a recorded reason. 'Below-bar speedup' is never a reason."""
+    def mutated(mutator):
+        st = json.loads(WORKED.read_text())
+        mutator(st)
+        p = tmp_path / "complete.json"
+        p.write_text(json.dumps(st))
+        return run_tool(monkeypatch, capsys, "state.py", ["validate", str(p)])
+
+    code, _ = mutated(lambda s: None)  # the worked example is the valid shape
+    assert code == 0
+
+    code, out = mutated(lambda s: s.pop("adoption"))
+    assert code == 2
+    assert any("run_status=complete requires adoption" in e
+               for e in out["invariant_errors"])
+
+    code, out = mutated(lambda s: s["adoption"]["units"].pop(0))
+    assert code == 2
+    assert any("does not cover rust-live unit" in e
+               for e in out["invariant_errors"])
+
+    # translated-but-unclassified work at complete (the backlog may be
+    # pending, translated work may not)
+    code, out = mutated(lambda s: s["units"][5].update(
+        rust_path="crates/duplifind-core/src/units/u_featurize_6.rs"))
+    assert code == 2
+    assert any("translated-but-unclassified" in e
+               for e in out["invariant_errors"])
+
+    # escalated without its resolved ESC-1 gate: no recorded reason
+    code, out = mutated(lambda s: s["human_gates"].pop(3))  # unit_escalation
+    assert code == 2
+    assert any("escalated at complete requires a resolved" in e
+               for e in out["invariant_errors"])
+
+    # fallback_python with the reason scrubbed from the notes
+    code, out = mutated(lambda s: s["units"][4].pop("notes"))  # u-score-5
+    assert code == 2
+    assert any("fallback_python at complete requires a recorded reason" in e
+               for e in out["invariant_errors"])
+
+    # non-complete runs stay unrestricted by the terminal invariant
+    code, out = mutated(lambda s: (s.pop("adoption"),
+                                   s.update(run_status="running")))
+    assert code == 0
 
 
 def test_shim_emits_reversible_per_unit_switch(monkeypatch, capsys, mini_state):

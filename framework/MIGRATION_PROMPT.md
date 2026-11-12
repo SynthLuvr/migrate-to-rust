@@ -156,7 +156,7 @@ operate a pipeline; the gates decide, not you.
 | 3 Scaffold | [rust-template](https://github.com/SynthLuvr/rust-template) scaffold + PyO3; CI green on empty crate | `maturin develop` works; gates red-blocking |
 | 4 Translate | oracle-ranked repair loop per unit | every unit Equivalent, deferred (escalated + fallback live), or descoped |
 | 5 Gates | full suite, property/fuzz, Miri, benchmarks, attribution | green — or divergences classified & explained |
-| 6 Integrate | wheel, shadow/canary with production diffing | cutover gate resolved in code (`policy:CUT-1`; at L2 *rejected* — publish disabled; at L0/L1 the gate stays open and the run ends for operator review); rollback tested |
+| 6 Integrate | wheel, shadow/canary with production diffing | adoption gate resolved in code (`policy:CUT-1` — correctness-only: shadow parity + tested rollback + regression floor, issue #85; the measured speedup is recorded as evidence, never an abort); adoption verified on the target (`pipeline.py verify-adoption`) at L2+; at L0/L1 the gate stays open and the run ends for operator review; rollback tested |
 | 7 Maintain | upstream-tracking + regression budget | ongoing — this stage is never "done" |
 
 Detailed checklists: load `stages/<n>-<name>.md` on stage entry.
@@ -256,12 +256,12 @@ which now defaults to the never-ask L2, or `pipeline.py run --autonomy`) —
 there are **zero mid-run questions at any level**, and an agent can never
 raise its own level mid-run.
 
-| Level | Name | Gates | Publish |
+| Level | Name | Gates | Adopt / Publish |
 |---|---|---|---|
-| L0 | supervised | hard stops — the gate stays open and the run ends with a dossier; the operator decides between runs (the pre-policy behavior, minus mid-run questions) | no |
-| L1 | assisted | agent proposes a resolution per gate into the dossier; the operator applies or rejects it between runs | no |
-| L2 | autonomous | all gates resolved by `autonomy/policy.json` rules in code — journaled, conservative defaults | no |
-| L3 | autopilot | as L2, plus Stage-6 cutover once CUT-1's evidence bar is met | yes |
+| L0 | supervised | hard stops — the gate stays open and the run ends with a dossier; the operator decides between runs (the pre-policy behavior, minus mid-run questions) | no / no |
+| L1 | assisted | agent proposes a resolution per gate into the dossier; the operator applies or rejects it between runs | no / no |
+| L2 | autonomous | all gates resolved by `autonomy/policy.json` rules in code — journaled, conservative defaults | yes / no |
+| L3 | autopilot | as L2, plus publishing the wheel to an index once CUT-1's correctness bar is met | yes / yes |
 
 | Gate (former human stop) | Rule | Resolution |
 |---|---|---|
@@ -271,7 +271,7 @@ raise its own level mid-run.
 | No-equivalent dependency | `DEP-1` | **descope, don't stop**: the module stays Python (dual-build fallback), dependents drop from the tranche transitively; on the critical path the tranche is dropped and the run continues. "Never improvise a substitute" is unchanged |
 | Escalated unit | `ESC-1` | **defer, don't halt**: mark, keep the Python fallback live, continue the backlog; escalations drain into the end-of-run dossier |
 | Mid-run scope change | `SC-1` | conservative reject — recorded for the report; growing scope re-enters Stage 0 in a fresh run |
-| Stage-6 cutover/publish | `CUT-1` | approved iff shadow diff rate = 0 over ≥ N samples **and** canary green ≥ M minutes **and** rollback actually tested — and only at L3 (`publish_allowed`). At L2 the gate resolves *rejected*: publish disabled, run completes on the dual-build |
+| Stage-6 adoption/cutover | `CUT-1` | **correctness-only (issue #85)**: approved = ADOPT (route the runtime imports to the wheel) iff shadow diff rate = 0 over ≥ N samples **and** rollback actually tested **and** the measured E2E delta is not below the regression floor (adopt unless materially slower, e.g. > −5%). The measured speedup is recorded on the gate as evidence on every decision — a below-bar speedup never aborts adoption. Pre-authorized at L2+ (`adopt_allowed`); publish to an index stays the L3-only `publish_allowed`. At L0/L1 the gate stays open for the operator between runs |
 
 Rules of the rules:
 
@@ -286,7 +286,7 @@ Rules of the rules:
   input". Every terminal state emits the same deliverable set (run report
   with the gate + escalation dossiers, state file, journal). Global
   day-scale ceilings are enforced by the driver (design/0001: policy
-  v1.4.0 budgets are the only thing that can stop a healthy run — agent
+  v1.5.0 budgets are the only thing that can stop a healthy run — agent
   contexts are recycled per chunk, so no context window is a run limit).
   A context exhausting mid-chunk is a scheduling
   event, not a result: the driver starts a fresh context on the same
@@ -295,7 +295,14 @@ Rules of the rules:
   #25/#47). `budget_exhausted` stays final only when the run-level
   ceilings themselves are spent — the pre-authorized budget is gone, and
   raising it is the operator's between-runs decision, never a mid-run
-  ask.
+  ask. **And `complete` means it (issue #85):** every in-scope unit is
+  adopted — the `adoption` block verifies the target runtime's imports
+  route to the wheel (`pipeline.py verify-adoption`) — or carries a
+  recorded reason to stay on Python (an ESC-1 deferral, a DEP-1 descope,
+  or an explicit human descope). A below-bar measured speedup is a value
+  finding recorded on the CUT-1 gate; it is never an adoption abort and
+  never a valid descope reason. A run that cannot legally terminate
+  adopted fails loudly at Stage 0 instead of finishing hollow.
 - Undecidable-from-evidence gates (e.g. a substitution with no recorded
   module) stay open and drain into the report — they never block silently.
 - Safety rests on the dual-build design: per-unit Python fallback, the

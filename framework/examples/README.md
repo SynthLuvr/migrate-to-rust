@@ -100,10 +100,16 @@ Python is the documented success outcome, not a failure; the per-unit
 fallback switch (never deleted) keeps the Rust candidate one env var away.
 
 **Stage 6 — Integration** ([`../stages/6-integrate.md`](../stages/6-integrate.md))
-→ the `cutover` gate (approved by **policy rule CUT-1** — shadow diff 0.0
-over 400k sampled requests, canary green past the window, rollback tested;
-at L2 the same rule resolves *rejected*: publish disabled, the run
-completes on the dual-build) and the `stage` 5→6→7 journal entries. The
+→ the `cutover` gate (approved by **policy rule CUT-1** — correctness-only
+per issue #85: shadow diff 0.0 over 400k sampled requests, rollback tested,
+the measured 31.4% E2E saving **recorded as evidence** below the Stage-0
+projection yet never held against adoption; publish to an index stays the
+L3-only `publish_allowed` flag) and the `stage` 5→6→7 journal entries. The
+`adoption` block is the terminal invariant's proof (issue #85): the target
+runtime routes `duplifind.tokenize/dedupe/shingle` through the re-export
+shims to the installed `duplifind_core` wheel — verified live both ways
+through `DUPLIFIND_FALLBACK` (unset: wheel; `=all`: the preserved Python
+originals, the tested rollback path). The
 Python fallback stays callable per unit — that is what makes rollback a
 config change, not a rebuild.
 
@@ -197,9 +203,13 @@ these verdicts — never from model confidence.
 - `python framework/tools/state.py validate framework/examples/migration-state.json`
   (stdlib-only, also in CI) adds the coherence checks the schema can't
   express: dangling deps, cycles, leaf-first order, unexplained
-  divergences, journal-vs-current-state agreement, and the gate-resolution
+  divergences, journal-vs-current-state agreement, the gate-resolution
   discipline (a resolved gate always records `decided_by`; a policy-approved
-  cutover requires L3 + `publish_allowed`).
+  cutover is the ADOPTION decision — L2+ `adopt_allowed`, with publishing
+  the L3-only `publish_allowed`), and the **terminal invariant** (issue
+  #85): `run_status=complete` requires the verified `adoption` block
+  covering every rust-live unit and a recorded reason for every unit that
+  stays on Python.
 - The state file's `journal[]` is internally consistent: the last journaled
   status transition of every unit equals its current status — nothing was
   edited out-of-band.

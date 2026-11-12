@@ -119,6 +119,16 @@ def _set(field, unit, old, new):
     return unit, field, old, new
 
 
+def _minutes_ago_iso(minutes: float) -> str:
+    """A recent ISO timestamp — chain wall-clock sums settle_at - started_at,
+    so a live session's started_at must be near now() (a hardcoded date goes
+    stale and breaches the day-scale ceilings, as the 2026-10-29 fixtures
+    did two weeks later)."""
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)
+            ).isoformat().replace("+00:00", "Z")
+
+
 def _session_run(final_status, *, stage=None, ledger=None, unit_status=None,
                  parity_for=()):
     """A scripted session: real work (stage/units/ledger) journaled through
@@ -143,6 +153,29 @@ def _session_run(final_status, *, stage=None, ledger=None, unit_status=None,
                                   "last_verdict": "equivalent"}
                 changes.append(_set(f"units[{uid}].parity", uid, None,
                                     unit["parity"]))
+            if status == "fallback_python" and not unit.get("notes"):
+                # issue #85: a complete run's python-staying units need a
+                # recorded reason (the terminal invariant checks it)
+                unit["notes"] = "descoped: scripted session records the reason"
+                changes.append(_set(f"units[{uid}].notes", uid, None,
+                                    unit["notes"]))
+        if final_status == "complete":
+            # issue #85: complete requires adoption — a real finishing
+            # session records the verified adoption block; the scripted
+            # session mirrors that or the write is refused
+            rust_live = sorted(u["id"] for u in state.get("units", [])
+                               if u.get("status") in state_tool.RUST_LIVE_STATUSES)
+            adoption = {
+                "verified": True, "timestamp": "2026-11-12T00:00:00Z",
+                "env_var": "DEMO_FALLBACK",
+                "units": [{"unit": uid, "module": f"demo.{uid}",
+                           "live_side": "rust"} for uid in rust_live],
+                "note": "target runtime routes the rust-live units through "
+                        "the shims to the wheel",
+            }
+            old = state.get("adoption")
+            state["adoption"] = adoption
+            changes.append(_set("adoption", None, old, adoption))
         if ledger is not None:
             old = (state.get("budget_ledger") or {}).get("tokens_total", 0)
             state.setdefault("budget_ledger", {})["tokens_total"] = ledger
@@ -655,7 +688,7 @@ def test_handoff_refuses_a_live_session_then_adopt_rescues(
                                    "tokens_spent": 0}},
                               {"index": 2, "id": "sess_fake_s2",
                                "name": "run-demo-s2",
-                               "started_at": "2026-10-29T13:05:00Z"}]}})
+                               "started_at": _minutes_ago_iso(5)}]}})
     _live_work(p, stage=5, unit_status={"u1": "ported"})
     fake = FakeGlv(p, [])
     fake.statuses = {"sess_fake_s2": "running"}

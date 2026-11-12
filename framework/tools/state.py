@@ -10,7 +10,10 @@ is acceptance criterion #4.
 Subcommands
 -----------
   validate   schema + coherence invariants (duplicates, dangling deps, order,
-             parity/status coherence, out-of-band edit detection)
+             parity/status coherence, out-of-band edit detection, and the
+             terminal invariant (issue #85): run_status=complete requires
+             a verified adoption block covering every rust-live unit and a
+             recorded reason for every unit that stays on Python)
   init       create a minimal valid state file
   set        change fields via dotted paths — ``stage``,
              ``units[u-parse-1].status``, ``human_gates[gate=unit_escalation].state``
@@ -104,9 +107,22 @@ def autonomy_level(state: dict) -> str:
 
 
 def publish_preauthorized(state: dict) -> bool:
-    """Cutover/publish is pre-authorized at L3 only, with the explicit flag."""
+    """Publishing the wheel to an external index is pre-authorized at L3
+    only, with the explicit flag (adoption is the L2+ decision — see
+    adoption_preauthorized)."""
     auto = state.get("autonomy") or {}
     return auto.get("level") == "L3" and auto.get("publish_allowed") is True
+
+
+def adoption_preauthorized(state: dict) -> bool:
+    """Adoption — routing the target runtime's imports to the wheel — is
+    pre-authorized at L2+ (issue #85): it is the reversible per-unit shim
+    flip, not a publish. An absent flag on an L2+ block stays authorized
+    (the autonomy_block default), so in-flight pre-1.5.0 runs are not
+    muted by this fix."""
+    auto = state.get("autonomy") or {}
+    return (auto.get("level") in DRIVER_LEVELS
+            and auto.get("adopt_allowed") is not False)
 
 
 def find_gate(state: dict, name: str) -> dict | None:
@@ -226,8 +242,9 @@ def validate_schema(instance, schema: dict, path: str = "$", errors: list | None
 
 def _gate_discipline_errors(state: dict, policy: dict | None) -> list[str]:
     """A resolved gate records WHO decided — 'human' or 'policy:<rule-id>' —
-    plus the policy version it evaluated; a policy-approved cutover is
-    publish, which is pre-authorized at L3 only."""
+    plus the policy version it evaluated; a policy-approved cutover is an
+    ADOPTION decision pre-authorized at L2+ (issue #85 — publishing to an
+    index remains the L3-only publish_allowed flag)."""
     errors: list[str] = []
     rule_ids = ({r.get("id") for r in policy.get("rules", [])}
                 if policy else None)
@@ -235,6 +252,10 @@ def _gate_discipline_errors(state: dict, policy: dict | None) -> list[str]:
     if auto.get("publish_allowed") and not publish_preauthorized(state):
         errors.append("autonomy: publish_allowed=true requires level=L3 "
                       "(publish is an L3-only pre-authorization)")
+    if auto.get("adopt_allowed") is True and auto.get("level") not in DRIVER_LEVELS:
+        errors.append("autonomy: adopt_allowed=true requires level=L2+ "
+                      "(adoption is a policy-resolved decision; at L0/L1 the "
+                      "operator decides between runs)")
     for i, g in enumerate(state.get("human_gates", [])):
         label = f"human_gates[{i}] ({g.get('gate')})"
         if g.get("state") == "open":
@@ -258,11 +279,98 @@ def _gate_discipline_errors(state: dict, policy: dict | None) -> list[str]:
                               f"autonomy/policy.json does not define")
         if (g.get("gate") == "cutover" and g.get("state") == "approved"
                 and str(decided_by).startswith("policy:")
-                and not publish_preauthorized(state)):
+                and not adoption_preauthorized(state)):
             errors.append(
-                f"{label}: policy-approved cutover requires autonomy.level=L3 "
-                f"and autonomy.publish_allowed=true (got level={auto.get('level')!r}, "
-                f"publish_allowed={auto.get('publish_allowed')!r})")
+                f"{label}: policy-approved cutover (adoption) requires "
+                f"autonomy.level=L2+ with adopt_allowed (got "
+                f"level={auto.get('level')!r}, adopt_allowed="
+                f"{auto.get('adopt_allowed')!r})")
+    return errors
+
+
+def _gate_covers_unit(gate: dict, unit: dict) -> bool:
+    """Whether a resolved gate's recorded decision covers one unit: the
+    evidence names the unit (unit=<id>) or the module the unit lives under
+    (module=<package>, DEP-1's descope form)."""
+    for entry in gate.get("evidence") or []:
+        if not isinstance(entry, str) or "=" not in entry:
+            continue
+        key, _, value = entry.partition("=")
+        value = value.strip()
+        if key.strip() == "unit" and value == unit.get("id"):
+            return True
+        if key.strip() == "module" and value:
+            unit_parts = [p for p in re.split(r"[./]", unit.get("python_path") or "")
+                          if p and p != "src"]
+            mod_parts = [p for p in value.split(".") if p]
+            if mod_parts and unit_parts[:len(mod_parts)] == mod_parts:
+                return True
+    return False
+
+
+def complete_adoption_errors(state: dict) -> list[str]:
+    """The terminal invariant (issue #85): ``run_status=complete`` means the
+    migration HAPPENED. Every unit whose live side is the Rust implementation
+    must be adopted — the target runtime routes its imports to the wheel,
+    proven by the recorded `adoption` block (tools/pipeline.py
+    verify-adoption: import routing + live-side wheel identity) — and every
+    unit that stays on Python carries its recorded reason: an ESC-1 deferral
+    (escalated) or a recorded descope (fallback_python via DEP-1 / a human
+    decision). A below-bar speedup is NOT a valid reason: it is evidence on
+    the cutover gate, never a descope.
+
+    check_invariants applies this to run_status=complete; the driver also
+    uses it as Stage-7 exit criteria before recording complete."""
+    errors: list[str] = []
+    units = state.get("units", [])
+    rust_live = [u for u in units if u.get("status") in RUST_LIVE_STATUSES]
+    adoption = state.get("adoption") or {}
+    if rust_live:
+        covered = {e.get("unit") for e in adoption.get("units", [])
+                   if isinstance(e, dict)}
+        uncovered = sorted({u.get("id") for u in rust_live} - covered)
+        ids = ", ".join(str(u.get("id")) for u in rust_live)
+        if adoption.get("verified") is not True:
+            errors.append(
+                f"run_status=complete requires adoption: {len(rust_live)} unit(s) "
+                f"are rust-live ({ids}) but the adoption block does not verify "
+                f"the target runtime routes their imports to the wheel — run "
+                f"tools/pipeline.py verify-adoption, or classify the units "
+                f"(issue #85)")
+        elif uncovered:
+            errors.append(
+                f"adoption.units does not cover rust-live unit(s): "
+                f"{', '.join(uncovered)} — the recorded adoption block must "
+                f"cover every unit whose live side is the wheel (issue #85)")
+    for u in units:
+        uid, status = u.get("id"), u.get("status")
+        if status == "pending" and u.get("rust_path"):
+            errors.append(
+                f"units[{uid}]: translated-but-unclassified work at complete "
+                f"(rust_path recorded, status pending) — adopt, escalate "
+                f"(ESC-1 defer) or descope with a recorded reason, or do not "
+                f"record the run as complete (issue #85)")
+        if status == "escalated":
+            resolved = [g for g in state.get("human_gates", [])
+                        if g.get("gate") == "unit_escalation"
+                        and g.get("state") in ("deferred", "approved")]
+            if not resolved:
+                errors.append(
+                    f"units[{uid}]: escalated at complete requires a resolved "
+                    f"unit_escalation gate — the ESC-1 deferral is the "
+                    f"recorded reason this unit's Python side stays live")
+        if status == "fallback_python":
+            descoped = [g for g in state.get("human_gates", [])
+                        if g.get("gate") in ("no_equivalent_dependency",
+                                             "scope_change", "unit_escalation")
+                        and g.get("state") in ("approved", "deferred")
+                        and _gate_covers_unit(g, u)]
+            if not descoped and not str(u.get("notes") or "").strip():
+                errors.append(
+                    f"units[{uid}]: fallback_python at complete requires a "
+                    f"recorded reason — a resolved descope gate or the unit's "
+                    f"notes (a below-bar speedup is NOT a valid reason; it "
+                    f"belongs on the cutover gate as evidence, issue #85)")
     return errors
 
 
@@ -432,6 +540,8 @@ def check_invariants(state: dict) -> tuple[list[str], list[str]]:
 
     errors += _gate_discipline_errors(state, load_policy())
     errors += _session_chain_errors(state)
+    if state.get("run_status") == "complete":
+        errors += complete_adoption_errors(state)
 
     resumed = _resumed_after_terminal_warning(state)
     if resumed:
@@ -660,8 +770,10 @@ def cmd_validate(args) -> int:
 def autonomy_block(level: str) -> dict:
     """The pre-authorized autonomy block (issue #22) for `level`, filled from
     autonomy/policy.json defaults: the policy version in force, the run-level
-    budget ceilings, and the level's publish flag. L0 keeps the supervised
-    meaning of pre-policy state files."""
+    budget ceilings, and the level's adoption/publish flags. L0 keeps the
+    supervised meaning of pre-policy state files. Adoption (routing the
+    target runtime's imports to the wheel) is L2+; publishing to an index
+    stays L3-only (issue #85 separates the two)."""
     policy = load_policy() or {}
     block = {"level": level if level in POLICY_LEVELS else "L0"}
     if policy.get("version"):
@@ -672,8 +784,13 @@ def autonomy_block(level: str) -> dict:
         "max_wall_clock_minutes": budget.get("max_wall_clock_minutes", 720),
         "max_chain_depth": budget.get("max_chain_depth", 10),
     }
-    block["publish_allowed"] = bool(
-        (policy.get("levels") or {}).get(block["level"], {}).get("publish_allowed"))
+    level_policy = (policy.get("levels") or {}).get(block["level"], {})
+    # policy v1.4.0-and-older files have no adopt_allowed: the L2+ default is
+    # authorized (the issue-#85 fix must not mute already-authorized levels),
+    # L0/L1 keep the supervised meaning
+    block["adopt_allowed"] = bool(level_policy.get(
+        "adopt_allowed", block["level"] in DRIVER_LEVELS))
+    block["publish_allowed"] = bool(level_policy.get("publish_allowed"))
     return block
 
 
@@ -933,11 +1050,12 @@ def cmd_resolve_gate(args) -> int:
         return _refusal(error, args.human, file=str(path))
     if (args.gate == "cutover" and args.decision == "approved"
             and args.by.startswith("policy:")
-            and not publish_preauthorized(state)):
-        return _refusal("policy-approved cutover requires autonomy.level=L3 and "
-                        "autonomy.publish_allowed=true — publish is an L3-only "
-                        "pre-authorization (set the level BEFORE the run, never "
-                        "mid-run)", args.human, file=str(path))
+            and not adoption_preauthorized(state)):
+        return _refusal("policy-approved cutover (adoption) requires "
+                        "autonomy.level=L2+ with adopt_allowed — adoption is a "
+                        "policy-resolved decision at the autonomous levels; at "
+                        "L0/L1 the operator decides between runs (record the "
+                        "decision with --by human)", args.human, file=str(path))
 
     old = gate.get("state")
     updates = {"state": args.decision, "decided_by": args.by}
@@ -973,6 +1091,16 @@ def _module_from_rust_path(rust_path: str) -> str:
     if "src" in parts:
         parts = parts[parts.index("src") + 1:]
     return ".".join(parts)
+
+
+def rust_import_of(unit: dict) -> str | None:
+    """The unit's importable rust module: units[].rust_module wins, else it
+    is derived from rust_path. Shared by the shim generator and
+    pipeline.py verify-adoption so the two cannot drift."""
+    if unit.get("rust_module"):
+        return unit["rust_module"]
+    rust_path = unit.get("rust_path")
+    return _module_from_rust_path(rust_path) if rust_path else None
 
 
 def fallback_env_var(state: dict, env_prefix: str | None = None) -> str:
@@ -1223,6 +1351,16 @@ def cmd_migrate(args) -> int:
     # never-ask default L2).
     ensure(state, "autonomy", autonomy_block("L0"), "autonomy", None)
     ensure(state, "run_status", "pending", "run_status", None)
+    # issue #85 backfill: pre-1.5.0 autonomy blocks have no adopt_allowed —
+    # fill it from the level so the terminal invariant reads the same
+    # authorization everywhere (never flips an L0/L1 run to adoption)
+    auto = state.get("autonomy")
+    if isinstance(auto, dict) and "adopt_allowed" not in auto:
+        default = auto.get("level") in DRIVER_LEVELS
+        auto["adopt_allowed"] = default
+        migrations.append({"field": "autonomy.adopt_allowed", "from": None,
+                           "to": default})
+        changes.append((None, "autonomy.adopt_allowed", None, default))
     for i, g in enumerate(state.get("human_gates", [])):
         if g.get("state") != "open" and not g.get("decided_by"):
             g["decided_by"] = "human"

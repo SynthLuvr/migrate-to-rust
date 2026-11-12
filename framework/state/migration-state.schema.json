@@ -129,7 +129,7 @@
         "properties": {
           "gate": {
             "enum": ["go_no_go", "scope_change", "redesign_approval", "unit_escalation", "cutover", "crate_substitution", "no_equivalent_dependency"],
-            "$comment": "scope_change = MIGRATION_PROMPT.md mandatory gate 'any scope change later'; no_equivalent_dependency is resolved by policy DEP-1 (descope, never a substitution)"
+            "$comment": "scope_change = MIGRATION_PROMPT.md mandatory gate 'any scope change later'; no_equivalent_dependency is resolved by policy DEP-1 (descope, never a substitution); cutover = the Stage-6 ADOPTION decision (issue #85: correctness-only, resolved by policy CUT-1 at L2+ — routing runtime imports to the wheel; publishing to an index is the separate L3-only publish_allowed flag)"
           },
           "state": { "enum": ["open", "approved", "rejected", "deferred"], "$comment": "deferred = resolved by policy as defer-not-halt (ESC-1); a resolved gate is never blocking" },
           "note": { "type": "string" },
@@ -152,7 +152,7 @@
       "properties": {
         "level": {
           "enum": ["L0", "L1", "L2", "L3"],
-          "$comment": "L0 supervised (hard stops: the gate stays open, the run ends with the dossier — the operator decides between runs, nothing asks mid-run) · L1 agent proposes into the dossier, operator decides between runs · L2 all gates policy-resolved (the default), publish disabled · L3 full autopilot incl. cutover"
+          "$comment": "L0 supervised (hard stops: the gate stays open, the run ends with the dossier — the operator decides between runs, nothing asks mid-run) · L1 agent proposes into the dossier, operator decides between runs · L2 all gates policy-resolved (the default), adoption pre-authorized, publish disabled · L3 full autopilot incl. publishing to an index"
         },
         "policy_version": { "type": "string", "$comment": "autonomy/policy.json version in force for this run" },
         "budget": {
@@ -164,7 +164,8 @@
             "max_chain_depth": { "type": "integer", "minimum": 1, "$comment": "issue #25 — the successor-session chain cap: session-level budget_exhausted spawns a successor GLV session automatically (tools/succession.py); this is how many successions may chain before the run ends failed_safely. The run-level ceilings above bound the whole chain (sum over sessions); successors get a fresh session budget, never a fresh run budget. Policy default 10." }
           }
         },
-        "publish_allowed": { "type": "boolean", "$comment": "must be true (L3 only) for a policy-approved cutover; state.py rejects the combination otherwise" }
+        "adopt_allowed": { "type": "boolean", "$comment": "must be true (L2/L3 only) for a policy-approved cutover — adoption routes the target runtime's imports to the wheel, the reversible per-unit shim flip (issue #85); state.py rejects the combination otherwise. Publishing to an external index remains the L3-only publish_allowed flag" },
+        "publish_allowed": { "type": "boolean", "$comment": "must be true (L3 only) to publish the wheel to an external index (Stage-6 `maturin publish`); state.py rejects the combination otherwise" }
       }
     },
     "preflight": {
@@ -208,7 +209,47 @@
     },
     "run_status": {
       "enum": ["pending", "running", "complete", "no_go_measured", "budget_exhausted", "failed_safely"],
-      "$comment": "Terminal-state discipline (issue #22): a driver run ALWAYS ends in complete / no_go_measured / budget_exhausted / failed_safely — never 'awaiting input'. Every terminal state emits the same deliverable set (run report incl. the escalation dossier, state file, journal). Issue #25: session-level budget_exhausted never survives a successor chain — tools/succession.py spawns the successor automatically over the GLV transport it bootstraps itself (issue #47); budget_exhausted remains a final status only for the run-level ceilings."
+      "$comment": "Terminal-state discipline (issue #22): a driver run ALWAYS ends in complete / no_go_measured / budget_exhausted / failed_safely — never 'awaiting input'. Every terminal state emits the same deliverable set (run report incl. the escalation dossier, state file, journal). Issue #25: session-level budget_exhausted never survives a successor chain — tools/succession.py spawns the successor automatically over the GLV transport it bootstraps itself (issue #47); budget_exhausted remains a final status only for the run-level ceilings. Issue #85 terminal invariant: complete means the migration HAPPENED — every in-scope unit is adopted (the recorded adoption block verifies the target runtime routes its imports to the wheel) or carries a recorded reason to stay on Python (ESC-1 deferral, DEP-1 descope, or an explicit human descope). A below-bar speedup is never such a reason — it is evidence on the cutover gate."
+    },
+    "adoption": {
+      "type": "object",
+      "$comment": "Issue #85 — proof the migration actually happened on the TARGET repo: the runtime imports route to the wheel and the live side is the wheel's implementation. Recorded by tools/pipeline.py verify-adoption (import-routing probe + live-side wheel identity test through the target interpreter, with the shim env var flipped both ways to prove the tested rollback path). state.py's terminal invariant requires this block (verified=true, covering every rust-live unit) whenever run_status=complete and any unit's live side is Rust.",
+      "required": ["verified"],
+      "properties": {
+        "verified": { "type": "boolean", "$comment": "true only when the routing and live-identity checks all passed (a skipped live check is never verified)" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "env_var": { "type": "string", "$comment": "the per-unit fallback switch env var the verified shims read (<PROJECT>_FALLBACK, state.py fallback_env_var)" },
+        "target_root": { "type": ["string", "null"], "$comment": "absolute path of the verified target repo" },
+        "python": { "type": ["string", "null"], "$comment": "the target interpreter the live-side identity test ran under" },
+        "units": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["unit", "module", "live_side"],
+            "properties": {
+              "unit": { "type": "string", "$comment": "unit id" },
+              "module": { "type": "string", "$comment": "the import name callers use — the module the runtime must resolve to the shim" },
+              "live_side": { "enum": ["rust", "python"], "$comment": "which side the live identity test resolved with the env var unset" },
+              "rust_import": { "type": "string" },
+              "python_imports": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "checks": {
+          "type": "object",
+          "$comment": "per-check records keyed by id (routing, live_identity, rollback_flip) — same free-form shape as preflight.checks so evidence can grow without a schema change",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "ok": { "type": ["boolean", "null"] },
+              "skipped": { "type": "boolean" },
+              "detail": { "type": "string" }
+            }
+          }
+        },
+        "note": { "type": "string" }
+      }
     },
     "session_chain": {
       "type": "object",
