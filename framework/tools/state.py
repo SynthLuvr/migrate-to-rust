@@ -292,20 +292,56 @@ def _gate_covers_unit(gate: dict, unit: dict) -> bool:
     """Whether a resolved gate's recorded decision covers one unit: the
     evidence names the unit (unit=<id>) or the module the unit lives under
     (module=<package>, DEP-1's descope form)."""
+    unit_parts = [p for p in re.split(r"[./]", unit.get("python_path") or "")
+                  if p and p != "src"]
     for entry in gate.get("evidence") or []:
         if not isinstance(entry, str) or "=" not in entry:
             continue
         key, _, value = entry.partition("=")
-        value = value.strip()
-        if key.strip() == "unit" and value == unit.get("id"):
+        key, value = key.strip(), value.strip()
+        if key == "unit" and value == unit.get("id"):
             return True
-        if key.strip() == "module" and value:
-            unit_parts = [p for p in re.split(r"[./]", unit.get("python_path") or "")
-                          if p and p != "src"]
+        if key == "module" and value:
             mod_parts = [p for p in value.split(".") if p]
             if mod_parts and unit_parts[:len(mod_parts)] == mod_parts:
                 return True
     return False
+
+
+def _unit_completion_errors(state: dict, unit: dict) -> list[str]:
+    """Why one unit blocks run_status=complete (issue #85): translated work
+    must be classified, and a unit whose Python side stays live must carry
+    its recorded reason — a resolved ESC-1 unit_escalation gate, a resolved
+    descope gate covering the unit, or the unit's own notes."""
+    uid, status = unit.get("id"), unit.get("status")
+    if status == "pending" and unit.get("rust_path"):
+        return [
+            f"units[{uid}]: translated-but-unclassified work at complete "
+            f"(rust_path recorded, status pending) — adopt, escalate "
+            f"(ESC-1 defer) or descope with a recorded reason, or do not "
+            f"record the run as complete (issue #85)"]
+    if status == "escalated":
+        resolved = [g for g in state.get("human_gates", [])
+                    if g.get("gate") == "unit_escalation"
+                    and g.get("state") in ("deferred", "approved")]
+        if not resolved:
+            return [
+                f"units[{uid}]: escalated at complete requires a resolved "
+                f"unit_escalation gate — the ESC-1 deferral is the "
+                f"recorded reason this unit's Python side stays live"]
+    if status == "fallback_python":
+        descoped = [g for g in state.get("human_gates", [])
+                    if g.get("gate") in ("no_equivalent_dependency",
+                                         "scope_change", "unit_escalation")
+                    and g.get("state") in ("approved", "deferred")
+                    and _gate_covers_unit(g, unit)]
+        if not descoped and not str(unit.get("notes") or "").strip():
+            return [
+                f"units[{uid}]: fallback_python at complete requires a "
+                f"recorded reason — a resolved descope gate or the unit's "
+                f"notes (a below-bar speedup is NOT a valid reason; it "
+                f"belongs on the cutover gate as evidence, issue #85)"]
+    return []
 
 
 def complete_adoption_errors(state: dict) -> list[str]:
@@ -326,51 +362,25 @@ def complete_adoption_errors(state: dict) -> list[str]:
     rust_live = [u for u in units if u.get("status") in RUST_LIVE_STATUSES]
     adoption = state.get("adoption") or {}
     if rust_live:
-        covered = {e.get("unit") for e in adoption.get("units", [])
-                   if isinstance(e, dict)}
-        uncovered = sorted({u.get("id") for u in rust_live} - covered)
-        ids = ", ".join(str(u.get("id")) for u in rust_live)
         if adoption.get("verified") is not True:
+            ids = ", ".join(str(u.get("id")) for u in rust_live)
             errors.append(
                 f"run_status=complete requires adoption: {len(rust_live)} unit(s) "
                 f"are rust-live ({ids}) but the adoption block does not verify "
                 f"the target runtime routes their imports to the wheel — run "
                 f"tools/pipeline.py verify-adoption, or classify the units "
                 f"(issue #85)")
-        elif uncovered:
-            errors.append(
-                f"adoption.units does not cover rust-live unit(s): "
-                f"{', '.join(uncovered)} — the recorded adoption block must "
-                f"cover every unit whose live side is the wheel (issue #85)")
+        else:
+            covered = {e.get("unit") for e in adoption.get("units", [])
+                       if isinstance(e, dict)}
+            uncovered = sorted({u.get("id") for u in rust_live} - covered)
+            if uncovered:
+                errors.append(
+                    f"adoption.units does not cover rust-live unit(s): "
+                    f"{', '.join(uncovered)} — the recorded adoption block must "
+                    f"cover every unit whose live side is the wheel (issue #85)")
     for u in units:
-        uid, status = u.get("id"), u.get("status")
-        if status == "pending" and u.get("rust_path"):
-            errors.append(
-                f"units[{uid}]: translated-but-unclassified work at complete "
-                f"(rust_path recorded, status pending) — adopt, escalate "
-                f"(ESC-1 defer) or descope with a recorded reason, or do not "
-                f"record the run as complete (issue #85)")
-        if status == "escalated":
-            resolved = [g for g in state.get("human_gates", [])
-                        if g.get("gate") == "unit_escalation"
-                        and g.get("state") in ("deferred", "approved")]
-            if not resolved:
-                errors.append(
-                    f"units[{uid}]: escalated at complete requires a resolved "
-                    f"unit_escalation gate — the ESC-1 deferral is the "
-                    f"recorded reason this unit's Python side stays live")
-        if status == "fallback_python":
-            descoped = [g for g in state.get("human_gates", [])
-                        if g.get("gate") in ("no_equivalent_dependency",
-                                             "scope_change", "unit_escalation")
-                        and g.get("state") in ("approved", "deferred")
-                        and _gate_covers_unit(g, u)]
-            if not descoped and not str(u.get("notes") or "").strip():
-                errors.append(
-                    f"units[{uid}]: fallback_python at complete requires a "
-                    f"recorded reason — a resolved descope gate or the unit's "
-                    f"notes (a below-bar speedup is NOT a valid reason; it "
-                    f"belongs on the cutover gate as evidence, issue #85)")
+        errors += _unit_completion_errors(state, u)
     return errors
 
 

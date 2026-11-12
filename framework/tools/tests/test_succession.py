@@ -18,6 +18,7 @@ below pins that)."""
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -124,7 +125,6 @@ def _minutes_ago_iso(minutes: float) -> str:
     so a live session's started_at must be near now() (a hardcoded date goes
     stale and breaches the day-scale ceilings, as the 2026-10-29 fixtures
     did two weeks later)."""
-    from datetime import datetime, timedelta, timezone
     return (datetime.now(timezone.utc) - timedelta(minutes=minutes)
             ).isoformat().replace("+00:00", "Z")
 
